@@ -1,0 +1,19 @@
+pkgbase = repoman
+	pkgdesc = AUR package repository manager with containerized builds and web interface
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/yourusername/repoman
+	arch = x86_64
+	license = MIT
+	makedepends = cargo
+	makedepends = rust
+	depends = podman
+	depends = git
+	depends = pacman
+	optdepends = nginx: serve repository over HTTP
+	optdepends = nfs-utils: share repository over NFS
+	backup = etc/repoman/config.toml
+	source = repoman-0.1.0.tar.gz
+	sha256sums = SKIP
+
+pkgname = repoman

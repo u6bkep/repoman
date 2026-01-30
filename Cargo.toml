@@ -1,0 +1,69 @@
+[package]
+name = "repoman"
+version = "0.1.0"
+edition = "2024"
+description = "AUR package repository manager with containerized builds"
+license = "MIT"
+
+[dependencies]
+# Web framework
+axum = { version = "0.8", features = ["ws", "macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["fs", "cors", "trace"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Configuration
+confique = { version = "0.3", features = ["toml"] }
+
+# HTTP client (for AUR API)
+reqwest = { version = "0.12", features = ["json"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Utilities
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+directories = "6"
+dirs = "6"
+urlencoding = "2"
+
+# Syntax highlighting (server-side)
+syntect = "5"
+
+# Diff generation
+similar = "2"
+
+# Archive handling (for repo database parsing)
+tar = "0.4"
+flate2 = "1"
+zstd = "0.13"
+xz2 = "0.1"
+
+# Config file editing
+toml_edit = "0.22"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "repoman"
+path = "src/main.rs"

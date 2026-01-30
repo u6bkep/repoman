@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Repoman - AUR Repository Manager</title>
+    <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <a href="#/" class="logo">Repoman</a>
+            <div class="nav-links">
+                <a href="#/">Dashboard</a>
+                <a href="#/packages">Packages</a>
+                <a href="#/add">Add Package</a>
+                <a href="#/settings">Settings</a>
+            </div>
+        </nav>
+    </header>
+
+    <main id="app">
+        <div class="loading">Loading...</div>
+    </main>
+
+    <!-- Templates -->
+    <template id="tmpl-dashboard">
+        <div class="dashboard">
+            <h1>Dashboard</h1>
+
+            <section class="status-cards">
+                <div class="card" id="status-overview">
+                    <h2>Repository Status</h2>
+                    <div class="status-loading">Loading...</div>
+                </div>
+            </section>
+
+            <section class="attention-needed">
+                <h2>Needs Attention</h2>
+                <div id="attention-list" class="package-list">
+                    <div class="status-loading">Loading...</div>
+                </div>
+            </section>
+
+            <section class="recent-builds">
+                <h2>Recent Builds</h2>
+                <div id="recent-builds-list">
+                    <div class="status-loading">Loading...</div>
+                </div>
+            </section>
+        </div>
+    </template>
+
+    <template id="tmpl-package-list">
+        <div class="package-list-page">
+            <div class="page-header">
+                <h1>Packages</h1>
+                <div class="filters">
+                    <select id="status-filter">
+                        <option value="">All Statuses</option>
+                        <option value="pending_review">Pending Review</option>
+                        <option value="approved">Approved</option>
+                        <option value="building">Building</option>
+                        <option value="up_to_date">Up to Date</option>
+                        <option value="update_available">Update Available</option>
+                        <option value="failed">Failed</option>
+                    </select>
+                    <select id="reason-filter">
+                        <option value="">All Reasons</option>
+                        <option value="explicit">Explicit</option>
+                        <option value="dependency">Dependency</option>
+                        <option value="orphans">Orphans</option>
+                    </select>
+                    <button id="check-updates-btn" class="btn">Check Updates</button>
+                </div>
+            </div>
+            <div id="packages-table" class="package-list">
+                <div class="status-loading">Loading...</div>
+            </div>
+        </div>
+    </template>
+
+    <template id="tmpl-package-detail">
+        <div class="package-detail">
+            <div class="page-header">
+                <h1 id="pkg-name">Package</h1>
+                <div class="pkg-actions">
+                    <button id="btn-approve" class="btn btn-primary">Approve</button>
+                    <button id="btn-build" class="btn btn-success">Build</button>
+                    <button id="btn-check-update" class="btn">Check Update</button>
+                    <button id="btn-remove" class="btn btn-danger">Remove</button>
+                </div>
+            </div>
+
+            <div class="pkg-info-grid">
+                <div class="info-card">
+                    <h3>Status</h3>
+                    <div id="pkg-status" class="status-badge">-</div>
+                </div>
+                <div class="info-card">
+                    <h3>Version</h3>
+                    <div id="pkg-version">-</div>
+                </div>
+                <div class="info-card">
+                    <h3>Commit</h3>
+                    <div id="pkg-commit" class="mono">-</div>
+                </div>
+                <div class="info-card">
+                    <h3>Updated</h3>
+                    <div id="pkg-updated">-</div>
+                </div>
+                <div class="info-card">
+                    <h3>Install Reason</h3>
+                    <div id="pkg-reason-container">
+                        <span id="pkg-reason" class="reason-badge">-</span>
+                        <button id="btn-toggle-reason" class="btn btn-sm">Change</button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="tabs">
+                <button class="tab active" data-tab="pkgbuild">PKGBUILD</button>
+                <button class="tab" data-tab="diff">Diff</button>
+                <button class="tab" data-tab="deps">Dependencies</button>
+                <button class="tab" data-tab="builds">Build History</button>
+            </div>
+
+            <div class="tab-content">
+                <div id="tab-pkgbuild" class="tab-pane active">
+                    <pre id="pkgbuild-content" class="code-block"><code>Loading...</code></pre>
+                </div>
+                <div id="tab-diff" class="tab-pane">
+                    <pre id="diff-content" class="code-block diff"><code>Loading...</code></pre>
+                </div>
+                <div id="tab-deps" class="tab-pane">
+                    <div id="deps-content">Loading...</div>
+                </div>
+                <div id="tab-builds" class="tab-pane">
+                    <div id="builds-list">Loading...</div>
+                </div>
+            </div>
+        </div>
+    </template>
+
+    <template id="tmpl-add-package">
+        <div class="add-package">
+            <h1>Add Package</h1>
+
+            <div class="search-box">
+                <input type="text" id="aur-search" placeholder="Search AUR..." autofocus>
+                <button id="search-btn" class="btn btn-primary">Search</button>
+            </div>
+
+            <div class="add-options">
+                <label class="checkbox-label">
+                    <input type="checkbox" id="add-with-deps">
+                    <span>Also add missing AUR dependencies</span>
+                </label>
+            </div>
+
+            <div id="search-results" class="search-results">
+                <p class="hint">Enter a package name to search the AUR</p>
+            </div>
+        </div>
+    </template>
+
+    <template id="tmpl-build-log">
+        <div class="build-log-page">
+            <div class="page-header">
+                <h1>Build Log</h1>
+                <div class="build-info">
+                    <span id="build-pkg">-</span>
+                    <span id="build-status" class="status-badge">-</span>
+                    <span id="build-stage" class="stage-badge" style="display: none;">-</span>
+                </div>
+            </div>
+            <div class="stage-progress" id="stage-progress" style="display: none;">
+                <div class="stage-item" data-stage="starting">Starting</div>
+                <div class="stage-item" data-stage="syncing_db">Syncing DB</div>
+                <div class="stage-item" data-stage="preparing">Preparing</div>
+                <div class="stage-item" data-stage="building">Building</div>
+                <div class="stage-item" data-stage="moving_to_repo">Moving</div>
+                <div class="stage-item" data-stage="updating_index">Indexing</div>
+                <div class="stage-item" data-stage="complete">Complete</div>
+            </div>
+            <div class="log-container">
+                <pre id="log-content" class="log-output"></pre>
+            </div>
+        </div>
+    </template>
+
+    <template id="tmpl-settings">
+        <div class="settings-page">
+            <h1>Settings</h1>
+
+            <section class="settings-section">
+                <h2>System Status</h2>
+                <div id="system-status" class="status-grid">
+                    <div class="status-loading">Loading...</div>
+                </div>
+            </section>
+
+            <section class="settings-section">
+                <h2>Actions</h2>
+                <div class="action-buttons">
+                    <button id="btn-rebuild-image" class="btn">Rebuild Base Image</button>
+                    <button id="btn-clean-cache" class="btn">Clean Pacman Cache</button>
+                    <button id="btn-clean-sources" class="btn">Clean Source Cache</button>
+                    <button id="btn-clean-orphans" class="btn">Clean Orphaned Data</button>
+                    <button id="btn-rebuild-db" class="btn">Rebuild Repo Database</button>
+                </div>
+            </section>
+
+            <section class="settings-section">
+                <h2>Containers</h2>
+                <div id="containers-list">
+                    <div class="status-loading">Loading...</div>
+                </div>
+                <div class="action-buttons" style="margin-top: 1rem;">
+                    <button id="btn-prune-containers" class="btn">Prune Stopped Containers</button>
+                </div>
+            </section>
+
+            <section class="settings-section">
+                <h2>Images</h2>
+                <div id="images-list">
+                    <div class="status-loading">Loading...</div>
+                </div>
+                <div class="action-buttons" style="margin-top: 1rem;">
+                    <button id="btn-prune-images" class="btn">Prune Old Images</button>
+                </div>
+            </section>
+
+            <section class="settings-section">
+                <h2>Configuration</h2>
+                <div id="config-display" class="config-block">
+                    <div class="status-loading">Loading...</div>
+                </div>
+            </section>
+        </div>
+    </template>
+
+    <template id="tmpl-error">
+        <div class="error-page">
+            <h1>Error</h1>
+            <p id="error-message">Something went wrong.</p>
+            <a href="#/" class="btn">Go Home</a>
+        </div>
+    </template>
+
+    <script type="module" src="/js/main.js"></script>
+</body>
+</html>
