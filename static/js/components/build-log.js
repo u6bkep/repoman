@@ -6,12 +6,17 @@ let cleanup = null;
 let currentBuildId = null;
 let searchIndex = -1;
 let searchMatches = [];
+let isMounted = false;
 
 export async function init(params) {
-    const { id } = params;
-    currentBuildId = id;
+    cleanup = null;
+    currentBuildId = null;
     searchIndex = -1;
     searchMatches = [];
+    isMounted = true;
+
+    const { id } = params;
+    currentBuildId = id;
 
     setupLogControls(id);
     await loadBuildInfo(id);
@@ -19,6 +24,7 @@ export async function init(params) {
 
     // Return cleanup function
     return () => {
+        isMounted = false;
         if (cleanup) {
             cleanup();
             cleanup = null;
@@ -148,8 +154,10 @@ function navigateSearch(direction) {
 }
 
 async function loadBuildInfo(buildId) {
+    if (!isMounted) return;
     try {
         const build = await api.builds.get(buildId);
+        if (!isMounted) return;
 
         document.getElementById('build-pkg').textContent = build.pkgbase;
         document.getElementById('build-status').className = `status-badge ${build.status}`;
@@ -295,6 +303,7 @@ function startStreaming(buildId) {
         },
         // onClose
         () => {
+            if (!isMounted) return;
             // Flush remaining buffer
             if (buffer) {
                 container.insertAdjacentHTML('beforeend', highlightBuildLog(buffer));

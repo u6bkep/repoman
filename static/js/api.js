@@ -9,7 +9,7 @@ class ApiError extends Error {
     }
 }
 
-async function request(method, path, body = null) {
+async function request(method, path, body = null, signal = null) {
     const options = {
         method,
         headers: {},
@@ -18,6 +18,10 @@ async function request(method, path, body = null) {
     if (body) {
         options.headers['Content-Type'] = 'application/json';
         options.body = JSON.stringify(body);
+    }
+
+    if (signal) {
+        options.signal = signal;
     }
 
     const res = await fetch(`${API_BASE}${path}`, options);
@@ -43,7 +47,7 @@ export const del = (path) => request('DELETE', path);
 
 // Package operations
 export const packages = {
-    list: () => get('/packages'),
+    list: ({ signal } = {}) => request('GET', '/packages', null, signal),
     listOrphans: () => get('/packages/orphans'),
     get: (name) => get(`/packages/${encodeURIComponent(name)}`),
     add: (name, { asDependency = false, withDeps = false } = {}) => post('/packages', { name, as_dependency: asDependency, with_deps: withDeps }),

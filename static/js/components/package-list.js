@@ -1,12 +1,15 @@
 // Package List component
 import * as api from '../api.js';
 import { navigate } from '../router.js';
-import { showToast, formatStatus, formatRelativeTime } from './utils.js';
+import { showToast, formatStatus, formatRelativeTime, escapeHtml } from './utils.js';
 
 // Sort state
 let currentSort = { column: 'name', direction: 'asc' };
+let currentController = null;
 
 export async function init() {
+    currentSort = { column: 'name', direction: 'asc' };
+    currentController = null;
     const statusFilter = document.getElementById('status-filter');
     const reasonFilter = document.getElementById('reason-filter');
     const checkUpdatesBtn = document.getElementById('check-updates-btn');
@@ -68,6 +71,10 @@ function getSortIndicator(column) {
 }
 
 async function loadPackages() {
+    if (currentController) currentController.abort();
+    currentController = new AbortController();
+    const signal = currentController.signal;
+
     const container = document.getElementById('packages-table');
     const statusFilter = document.getElementById('status-filter').value;
     const reasonFilter = document.getElementById('reason-filter').value;
@@ -79,8 +86,10 @@ async function loadPackages() {
         if (reasonFilter === 'orphans') {
             packages = await api.packages.listOrphans();
         } else {
-            packages = await api.packages.list();
+            packages = await api.packages.list({ signal });
         }
+
+        if (signal.aborted) return;
 
         // Apply status filter
         if (statusFilter) {
@@ -111,17 +120,17 @@ async function loadPackages() {
                 <span class="actions-header">Actions</span>
             </div>
             ${packages.map(pkg => `
-                <div class="package-item" data-pkg="${pkg.pkgbase}">
-                    <span class="name">${pkg.pkgbase}${formatUpstreamBadge(pkg)}</span>
-                    <span class="version">${pkg.pkgver || '-'}</span>
-                    <span class="reason-badge ${pkg.install_reason}">${pkg.install_reason}</span>
+                <div class="package-item" data-pkg="${escapeHtml(pkg.pkgbase)}">
+                    <span class="name">${escapeHtml(pkg.pkgbase)}${formatUpstreamBadge(pkg)}</span>
+                    <span class="version">${escapeHtml(pkg.pkgver || '-')}</span>
+                    <span class="reason-badge ${pkg.install_reason}">${escapeHtml(pkg.install_reason)}</span>
                     <span class="status-badge ${pkg.status}">${formatStatus(pkg.status)}</span>
                     <span class="updated">${formatRelativeTime(pkg.updated_at)}</span>
                     <div class="actions">
                         ${canApprove(pkg.status) ?
-                            `<button class="btn btn-sm btn-primary" data-action="approve" data-pkg="${pkg.pkgbase}">Approve</button>` : ''}
+                            `<button class="btn btn-sm btn-primary" data-action="approve" data-pkg="${escapeHtml(pkg.pkgbase)}">Approve</button>` : ''}
                         ${canBuild(pkg.status) ?
-                            `<button class="btn btn-sm btn-success" data-action="build" data-pkg="${pkg.pkgbase}">Build</button>` : ''}
+                            `<button class="btn btn-sm btn-success" data-action="build" data-pkg="${escapeHtml(pkg.pkgbase)}">Build</button>` : ''}
                     </div>
                 </div>
             `).join('')}`;
@@ -171,6 +180,7 @@ async function loadPackages() {
             });
         });
     } catch (error) {
+        if (error.name === 'AbortError') return;
         container.innerHTML = `<p class="error">Failed to load packages: ${error.message}</p>`;
     }
 }
