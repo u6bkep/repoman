@@ -50,6 +50,7 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/packages/{pkgbase}/builds", get(list_builds))
         .route("/api/packages/{pkgbase}/mark", post(mark_package))
         .route("/api/packages/{pkgbase}/deps", get(get_package_deps))
+        .route("/api/packages/{pkgbase}/check-update", post(check_package_update))
         .route("/api/packages/check-updates", post(check_updates))
         .route("/api/packages/orphans", get(list_orphans))
         // AUR endpoints
@@ -336,6 +337,12 @@ pub struct CacheStats {
     pub path: String,
     pub package_count: u32,
     pub total_size: u64,
+}
+
+#[derive(Serialize)]
+pub struct CheckUpdatesResponse {
+    pub checked: usize,
+    pub updated: Vec<String>,
 }
 
 // ==================== Error handling ====================
@@ -1304,7 +1311,7 @@ async fn mark_package(
     Path(pkgbase): Path<String>,
     Json(req): Json<MarkRequest>,
 ) -> Result<Json<PackageResponse>, AppError> {
-    let state = state.read().await;
+    let state = state.write().await;
 
     let pkg = resolve_package(&state, &pkgbase).await?;
 
@@ -1331,7 +1338,7 @@ async fn update_package(
     Path(pkgbase): Path<String>,
     Json(req): Json<UpdatePackageRequest>,
 ) -> Result<Json<PackageResponse>, AppError> {
-    let state = state.read().await;
+    let state = state.write().await;
 
     let pkg = resolve_package(&state, &pkgbase).await?;
 
@@ -1499,10 +1506,13 @@ async fn get_package_deps(
     }))
 }
 
-async fn check_updates(State(state): State<SharedState>) -> Result<Json<Vec<String>>, AppError> {
-    let mut state = state.write().await;
+async fn check_updates(
+    State(state): State<SharedState>,
+) -> Result<Json<CheckUpdatesResponse>, AppError> {
+    let state = state.write().await;
 
     let packages = state.db.list_packages().await?;
+    let checked = packages.len();
     let mut updated = Vec::new();
 
     for pkg in packages {
@@ -1537,7 +1547,46 @@ async fn check_updates(State(state): State<SharedState>) -> Result<Json<Vec<Stri
         }
     }
 
-    Ok(Json(updated))
+    Ok(Json(CheckUpdatesResponse { checked, updated }))
+}
+
+async fn check_package_update(
+    State(state): State<SharedState>,
+    Path(pkgbase): Path<String>,
+) -> Result<Json<PackageResponse>, AppError> {
+    let state = state.write().await;
+
+    let pkg = resolve_package(&state, &pkgbase).await?;
+    let clone_path = std::path::Path::new(&pkg.local_path).to_path_buf();
+
+    if AurGit::has_updates(&clone_path)? {
+        AurGit::reset_to_remote(&clone_path)?;
+        let new_commit = AurGit::head_commit(&clone_path)?;
+
+        // Re-parse .SRCINFO
+        let srcinfo = read_srcinfo(&clone_path)?;
+        let pkgver = format!("{}-{}", srcinfo.pkgver, srcinfo.pkgrel);
+
+        state
+            .db
+            .update_package_commit(&pkg.pkgbase, &new_commit, Some(&pkgver))
+            .await?;
+
+        state
+            .db
+            .update_package_status(&pkg.pkgbase, PackageStatus::UpdateAvailable)
+            .await?;
+    }
+
+    // Reload package to get updated data
+    let pkg = state
+        .db
+        .get_package(&pkg.pkgbase)
+        .await?
+        .ok_or_else(|| AppError::internal("Package disappeared"))?;
+    let names = state.db.get_package_names(&pkg.pkgbase).await?;
+
+    Ok(Json(package_to_response(pkg, names)))
 }
 
 // ==================== AUR handlers ====================
@@ -2303,13 +2352,18 @@ async fn cancel_build(
         .await?
         .ok_or_else(|| AppError::not_found("Build not found"))?;
 
-    if build.status != crate::models::BuildStatus::Running {
-        return Err(AppError::bad_request("Build is not running"));
+    let is_running = build.status == crate::models::BuildStatus::Running;
+    let is_pending = build.status == crate::models::BuildStatus::Pending;
+
+    if !is_running && !is_pending {
+        return Err(AppError::bad_request("Build is not running or pending"));
     }
 
-    // Stop the container
-    let container_name = format!("repoman-build-{}-{}", build.pkgbase, build.id);
-    state.build.stop_build(&container_name)?;
+    // Only attempt to kill container for running builds
+    if is_running {
+        let container_name = format!("repoman-build-{}-{}", build.pkgbase, build.id);
+        state.build.stop_build(&container_name)?;
+    }
 
     state
         .db
@@ -2425,7 +2479,8 @@ async fn system_status(State(state): State<SharedState>) -> Result<Json<SystemSt
     let source_cache = calculate_source_cache_stats(&state.config.resolved_cache().sources);
 
     // Detect orphaned data
-    let orphaned_data = detect_orphaned_data(&state.config, &tracked_pkgbases);
+    let known_log_files = state.db.list_build_log_filenames().await.unwrap_or_default();
+    let orphaned_data = detect_orphaned_data(&state.config, &tracked_pkgbases, &known_log_files);
 
     Ok(Json(SystemStatusResponse {
         podman,
@@ -2654,6 +2709,7 @@ pub struct CleanSourcesResponse {
 fn detect_orphaned_data(
     config: &crate::config::Config,
     tracked_pkgbases: &std::collections::HashSet<String>,
+    known_log_files: &std::collections::HashSet<String>,
 ) -> Option<OrphanedData> {
     let mut orphaned = OrphanedData {
         clones: Vec::new(),
@@ -2702,14 +2758,12 @@ fn detect_orphaned_data(
                         orphaned.pkgdests.push(pkgbase.to_string());
                     }
                 }
-                // Check build logs
-                else if let Some(pkgbase) = name.strip_suffix("-build.log") {
-                    if !tracked_pkgbases.contains(pkgbase) {
-                        if let Ok(meta) = entry.metadata() {
-                            orphaned.total_size += meta.len();
-                        }
-                        orphaned.logs.push(pkgbase.to_string());
+                // Check build logs ({uuid}.log)
+                else if name.ends_with(".log") && !known_log_files.contains(name) {
+                    if let Ok(meta) = entry.metadata() {
+                        orphaned.total_size += meta.len();
                     }
+                    orphaned.logs.push(name.to_string());
                 }
             }
         }
@@ -2751,7 +2805,8 @@ async fn clean_orphans(State(state): State<SharedState>) -> Result<Json<CleanOrp
         .map(|p| p.pkgbase.clone())
         .collect();
 
-    let orphaned = detect_orphaned_data(&state.config, &tracked_pkgbases);
+    let known_log_files = state.db.list_build_log_filenames().await.unwrap_or_default();
+    let orphaned = detect_orphaned_data(&state.config, &tracked_pkgbases, &known_log_files);
 
     let mut cleaned = CleanOrphansResponse {
         clones_removed: 0,
@@ -2813,7 +2868,7 @@ async fn clean_orphans(State(state): State<SharedState>) -> Result<Json<CleanOrp
 
     // Clean orphaned logs
     for name in &orphaned.logs {
-        let path = state.config.resolved_cache().logs.join(format!("{}-build.log", name));
+        let path = state.config.resolved_cache().logs.join(name);
         if std::fs::remove_file(&path).is_ok() {
             cleaned.logs_removed += 1;
         }

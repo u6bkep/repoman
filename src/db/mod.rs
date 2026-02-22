@@ -560,6 +560,28 @@ impl Database {
             .await?;
         Ok(())
     }
+
+    /// List all build log file names (base names only) from the builds table
+    pub async fn list_build_log_filenames(&self) -> Result<std::collections::HashSet<String>> {
+        let rows: Vec<(Option<String>,)> =
+            sqlx::query_as("SELECT log_path FROM builds WHERE log_path IS NOT NULL")
+                .fetch_all(&self.pool)
+                .await?;
+
+        let names = rows
+            .into_iter()
+            .filter_map(|(path,)| {
+                path.and_then(|p| {
+                    std::path::Path::new(&p)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|s| s.to_string())
+                })
+            })
+            .collect();
+
+        Ok(names)
+    }
 }
 
 // ==================== Row types for sqlx ====================
