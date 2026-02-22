@@ -1501,6 +1501,11 @@ async fn check_updates(
     let mut updated = Vec::new();
 
     for pkg in packages {
+        // Don't touch the source directory while a build is actively using it
+        if pkg.status == PackageStatus::Building {
+            continue;
+        }
+
         let clone_path = std::path::Path::new(&pkg.local_path);
 
         if AurGit::has_updates(clone_path)? {

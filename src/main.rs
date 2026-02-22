@@ -1344,6 +1344,14 @@ async fn cmd_check_updates(state: SharedState, json_output: bool) -> Result<()> 
     let mut updates: Vec<serde_json::Value> = Vec::new();
 
     for pkg in packages {
+        // Don't touch the source directory while a build is actively using it
+        if pkg.status == models::PackageStatus::Building {
+            if !json_output {
+                println!("Skipping {} (build in progress)", pkg.pkgbase);
+            }
+            continue;
+        }
+
         let clone_path = std::path::Path::new(&pkg.local_path);
 
         if !json_output {
