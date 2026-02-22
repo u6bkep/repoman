@@ -612,7 +612,7 @@ async fn add_package_internal(
 }
 
 async fn cmd_remove(state: SharedState, name: &str, delete_files: bool, delete_clone: bool, recursive: bool) -> Result<()> {
-    let mut state = state.write().await;
+    let state = state.write().await;
 
     let pkg = state.db.get_package(name).await?
         .or({
@@ -901,7 +901,7 @@ async fn cmd_review(state: SharedState, name: &str, stdout: bool) -> Result<()> 
 }
 
 async fn cmd_approve(state: SharedState, name: &str) -> Result<()> {
-    let mut state = state.write().await;
+    let state = state.write().await;
 
     let pkg = state.db.get_package(name).await?
         .or({
@@ -1338,7 +1338,7 @@ async fn cmd_logs(state: SharedState, id: &str, follow: bool, lines: Option<usiz
 }
 
 async fn cmd_check_updates(state: SharedState, json_output: bool) -> Result<()> {
-    let mut state = state.write().await;
+    let state = state.write().await;
 
     let packages = state.db.list_packages().await?;
     let mut updates: Vec<serde_json::Value> = Vec::new();
@@ -1501,7 +1501,7 @@ async fn cmd_status(state: SharedState, json_output: bool) -> Result<()> {
 }
 
 async fn cmd_mark(state: SharedState, name: &str, explicit: bool, asdeps: bool) -> Result<()> {
-    let mut state = state.write().await;
+    let state = state.write().await;
 
     let pkg = state.db.get_package(name).await?
         .or({

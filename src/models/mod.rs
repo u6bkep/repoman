@@ -236,17 +236,6 @@ pub struct Build {
     pub error_message: Option<String>,
 }
 
-/// Approval audit record
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Approval {
-    pub id: i64,
-    pub pkgbase: String,
-    pub commit: String,
-    pub approved_at: DateTime<Utc>,
-    pub approved_by: Option<String>,
-    pub auto_approved: bool,
-}
-
 /// AUR package info from RPC API
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]

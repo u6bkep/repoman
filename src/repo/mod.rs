@@ -69,38 +69,6 @@ impl RepoManager {
         Ok(deleted)
     }
 
-    /// List all package files for a given pkgname
-    pub fn list_package_files(&self, pkgname: &str) -> Result<Vec<PackageFileInfo>> {
-        let mut files = Vec::new();
-
-        for entry in std::fs::read_dir(&self.config.repo.path)? {
-            let entry = entry?;
-            let path = entry.path();
-
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if (name.ends_with(".pkg.tar.zst") || name.ends_with(".pkg.tar.xz"))
-                    && package_name_matches(name, pkgname)
-                {
-                    let metadata = entry.metadata()?;
-                    if let Some(info) = parse_package_filename(name) {
-                        files.push(PackageFileInfo {
-                            filename: name.to_string(),
-                            pkgname: info.pkgname,
-                            version: info.version,
-                            arch: info.arch,
-                            size: metadata.len(),
-                        });
-                    }
-                }
-            }
-        }
-
-        // Sort by version (newest first) using vercmp
-        files.sort_by(|a, b| vercmp(&b.version, &a.version));
-
-        Ok(files)
-    }
-
     /// Clean old package versions, keeping only the newest N
     pub fn clean_old_versions(&self, keep: u32) -> Result<Vec<String>> {
         let mut deleted = Vec::new();

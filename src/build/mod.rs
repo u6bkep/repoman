@@ -4,8 +4,6 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::mpsc;
 
 use crate::config::{Config, ResolvedCacheConfig};
 use crate::models::SrcInfo;
@@ -395,118 +393,6 @@ CMD ["bash", "-c", "sudo pacman -Sy --noconfirm && makepkg -s --noconfirm --need
         Ok(packages)
     }
 
-    /// Run a build for a package (async version with channel for logs)
-    pub async fn run_build_async(
-        &self,
-        pkgbase: &str,
-        source_path: &Path,
-        log_sender: Option<mpsc::Sender<String>>,
-    ) -> Result<Vec<PathBuf>> {
-        let container_name = format!("repoman-build-{}", pkgbase);
-
-        // Clean up any previous pkgdest (may have permission issues from container subuids)
-        self.cleanup_pkgdest(pkgbase)?;
-
-        // Create output directory for packages
-        let pkgdest = self.cache.logs.join(format!("pkgdest-{}", pkgbase));
-        tokio::fs::create_dir_all(&pkgdest).await?;
-
-        // Create sources directory (SRCDEST) for this package
-        let sources_dir = self.sources_dir(pkgbase);
-        tokio::fs::create_dir_all(&sources_dir).await?;
-
-        // Prepare mount paths
-        // :z = shared SELinux label
-        // :U = chown to match container user (needed for rootless podman)
-        let source_mount = format!("{}:/build/src:z", source_path.display());
-        let repo_mount = format!("{}:/repo:z", self.config.repo.path.display());
-        let cache_mount = format!(
-            "{}:/var/cache/pacman/pkg:z,U",
-            self.cache.pacman_cache.display()
-        );
-        let pkgdest_mount = format!("{}:/pkgdest:z,U", pkgdest.display());
-        let srcdest_mount = format!("{}:/build/sources:z,U", sources_dir.display());
-
-        // Build podman args dynamically
-        let mut podman_args = vec![
-            "run".to_string(),
-            "--rm".to_string(),
-            "--name".to_string(),
-            container_name.clone(),
-            "-v".to_string(),
-            source_mount,
-            "-v".to_string(),
-            repo_mount,
-            "-v".to_string(),
-            cache_mount,
-            "-v".to_string(),
-            pkgdest_mount,
-            "-v".to_string(),
-            srcdest_mount,
-        ];
-
-        // Add tmpfs mount for build directory if configured
-        if self.config.container.tmpfs_build {
-            let tmpfs_opts = match &self.config.container.tmpfs_size {
-                Some(size) => format!("type=tmpfs,destination=/build/work,tmpfs-size={}", size),
-                None => "type=tmpfs,destination=/build/work".to_string(),
-            };
-            podman_args.push("--mount".to_string());
-            podman_args.push(tmpfs_opts);
-        }
-
-        podman_args.push(self.config.container.image.clone());
-        podman_args.push("bash".to_string());
-        podman_args.push("-c".to_string());
-        podman_args.push(BUILD_SCRIPT.to_string());
-
-        let mut cmd = tokio::process::Command::new("podman");
-        cmd.args(&podman_args);
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-
-        let mut child = cmd.spawn().context("Failed to start build container")?;
-
-        // Stream stdout
-        let stdout = child.stdout.take().expect("stdout");
-        let stderr = child.stderr.take().expect("stderr");
-
-        let log_tx = log_sender.clone();
-        let stdout_task = tokio::spawn(async move {
-            let reader = BufReader::new(stdout);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                if let Some(ref tx) = log_tx {
-                    let _ = tx.send(line).await;
-                }
-            }
-        });
-
-        let log_tx = log_sender;
-        let stderr_task = tokio::spawn(async move {
-            let reader = BufReader::new(stderr);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                if let Some(ref tx) = log_tx {
-                    let _ = tx.send(format!("[stderr] {}", line)).await;
-                }
-            }
-        });
-
-        let status = child.wait().await.context("Failed to wait for build")?;
-
-        stdout_task.await?;
-        stderr_task.await?;
-
-        if !status.success() {
-            anyhow::bail!("Build failed with exit code: {:?}", status.code());
-        }
-
-        // Find built packages
-        let packages = self.find_built_packages(&pkgdest)?;
-        Ok(packages)
-    }
-
     /// Find built package files in a directory
     pub fn find_built_packages(&self, pkgdest: &Path) -> Result<Vec<PathBuf>> {
         let mut packages = Vec::new();
@@ -806,45 +692,6 @@ CMD ["bash", "-c", "sudo pacman -Sy --noconfirm && makepkg -s --noconfirm --need
         Ok(())
     }
 
-    /// Clean old package versions in the repository
-    pub fn clean_old_versions(&self, keep: u32) -> Result<Vec<String>> {
-        use std::collections::HashMap;
-
-        let mut deleted = Vec::new();
-        let mut by_name: HashMap<String, Vec<(PathBuf, String)>> = HashMap::new();
-
-        // Group packages by name
-        for entry in std::fs::read_dir(&self.config.repo.path)? {
-            let entry = entry?;
-            let path = entry.path();
-
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.ends_with(".pkg.tar.zst") || name.ends_with(".pkg.tar.xz") {
-                    if let Some((pkgname, version)) = parse_pkg_filename(name) {
-                        by_name
-                            .entry(pkgname)
-                            .or_default()
-                            .push((path, version));
-                    }
-                }
-            }
-        }
-
-        // For each package, keep only the newest N versions
-        for (_name, mut versions) in by_name {
-            // Sort by version (newest first) using vercmp
-            versions.sort_by(|a, b| vercmp(&b.1, &a.1));
-
-            for (path, _) in versions.into_iter().skip(keep as usize) {
-                let filename = path.file_name().unwrap().to_string_lossy().to_string();
-                std::fs::remove_file(&path)?;
-                deleted.push(filename);
-            }
-        }
-
-        Ok(deleted)
-    }
-
     /// List repoman build containers (running or stopped)
     pub fn list_containers(&self) -> Result<Vec<ContainerInfo>> {
         let output = Command::new("podman")
@@ -1062,25 +909,3 @@ pub struct PruneResult {
     pub errors: Vec<String>,
 }
 
-/// Parse package filename into (pkgname, version)
-fn parse_pkg_filename(filename: &str) -> Option<(String, String)> {
-    let name = filename
-        .strip_suffix(".pkg.tar.zst")
-        .or_else(|| filename.strip_suffix(".pkg.tar.xz"))?;
-
-    // Split from the end: name-ver-rel-arch
-    let parts: Vec<&str> = name.rsplitn(4, '-').collect();
-    if parts.len() < 4 {
-        return None;
-    }
-
-    let _arch = parts[0];
-    let pkgrel = parts[1];
-    let pkgver = parts[2];
-    let pkgname = parts[3];
-
-    Some((
-        pkgname.to_string(),
-        format!("{}-{}", pkgver, pkgrel),
-    ))
-}

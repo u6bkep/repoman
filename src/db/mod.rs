@@ -221,22 +221,6 @@ impl Database {
         Ok(row.map(|r| r.into()))
     }
 
-    /// Get a package by any of its pkgnames
-    pub async fn get_package_by_pkgname(&self, pkgname: &str) -> Result<Option<Package>> {
-        let row = sqlx::query_as::<_, PackageRow>(
-            r#"
-            SELECT p.* FROM packages p
-            JOIN package_names pn ON p.pkgbase = pn.pkgbase
-            WHERE pn.pkgname = ?
-            "#,
-        )
-        .bind(pkgname)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        Ok(row.map(|r| r.into()))
-    }
-
     /// List all packages
     pub async fn list_packages(&self) -> Result<Vec<Package>> {
         let rows = sqlx::query_as::<_, PackageRow>("SELECT * FROM packages ORDER BY pkgbase")

@@ -259,21 +259,6 @@ pub struct QueueSkipped {
 }
 
 #[derive(Serialize)]
-pub struct QueueBuildResult {
-    pub pkgbase: String,
-    pub build_id: Option<String>,
-    pub reason: Option<String>,
-}
-
-#[derive(Serialize)]
-pub struct QueueStatusResponse {
-    pub completed: Vec<QueueBuildResult>,
-    pub failed: Vec<QueueBuildResult>,
-    pub skipped: Vec<QueueBuildResult>,
-    pub pending: Vec<String>,
-}
-
-#[derive(Serialize)]
 pub struct DependencyInfo {
     pub name: String,
     pub version_constraint: Option<String>,
@@ -952,7 +937,7 @@ async fn approve_package(
     Path(pkgbase): Path<String>,
     Query(query): Query<ApproveQuery>,
 ) -> Result<StatusCode, AppError> {
-    let mut state = state.write().await;
+    let state = state.write().await;
 
     let pkg = resolve_package(&state, &pkgbase).await?;
     state
@@ -968,7 +953,7 @@ async fn reject_package(
     Path(pkgbase): Path<String>,
     Json(req): Json<RejectRequest>,
 ) -> Result<StatusCode, AppError> {
-    let mut state = state.write().await;
+    let state = state.write().await;
 
     let pkg = resolve_package(&state, &pkgbase).await?;
     state
@@ -2344,7 +2329,7 @@ async fn cancel_build(
     State(state): State<SharedState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    let mut state = state.write().await;
+    let state = state.write().await;
 
     let build = state
         .db
@@ -2410,7 +2395,7 @@ async fn remove_from_repo(
     State(state): State<SharedState>,
     Path(name): Path<String>,
 ) -> Result<Json<RemoveFromRepoResponse>, AppError> {
-    let mut state = state.write().await;
+    let state = state.write().await;
 
     // Resolve pkgname -> pkgbase if needed
     let pkg = resolve_package(&state, &name).await?;
