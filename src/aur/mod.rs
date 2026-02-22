@@ -259,6 +259,19 @@ impl AurGit {
 
     /// Get diff between two commits
     pub fn diff(repo_path: &Path, from: &str, to: &str) -> Result<String> {
+        // Validate commit hashes to prevent flag injection
+        let is_valid_hash = |s: &str| {
+            s.len() >= 7
+                && s.len() <= 64
+                && s.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
+        };
+        if !is_valid_hash(from) {
+            anyhow::bail!("Invalid commit hash '{}': must be 7-64 lowercase hex characters", from);
+        }
+        if !is_valid_hash(to) {
+            anyhow::bail!("Invalid commit hash '{}': must be 7-64 lowercase hex characters", to);
+        }
+
         let output = Command::new("git")
             .args(["diff", from, to])
             .current_dir(repo_path)
@@ -405,7 +418,7 @@ impl DepResolver {
                 .args([
                     "run", "--rm", "-i",
                     container_image,
-                    "pacman", "-Sddp", "--noconfirm", dep,
+                    "pacman", "-Sddp", "--noconfirm", "--", dep,
                 ])
                 .output()
                 .context("Failed to run podman for dependency check")?;

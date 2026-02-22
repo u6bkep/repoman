@@ -170,6 +170,44 @@ impl Config {
             }
         })?;
 
+        // Validate repo name: only [a-zA-Z0-9_-] allowed
+        if config.repo.name.is_empty()
+            || !config
+                .repo
+                .name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+        {
+            anyhow::bail!(
+                "Invalid repo name '{}': only alphanumeric characters, underscores, and hyphens are allowed",
+                config.repo.name
+            );
+        }
+
+        // Validate tmpfs_size if set: must match \d+[KMGkmg]?[Bb]?
+        if let Some(ref size) = config.container.tmpfs_size {
+            let valid = {
+                let mut chars = size.chars().peekable();
+                // Must start with one or more digits
+                let has_digits = chars.by_ref().take_while(|c| c.is_ascii_digit()).count() > 0;
+                // Optionally followed by a unit letter (K, M, G, case-insensitive)
+                let has_unit = chars
+                    .next_if(|c| matches!(c, 'K' | 'M' | 'G' | 'k' | 'm' | 'g'))
+                    .is_some();
+                // Optionally followed by 'B' or 'b'
+                let _ = has_unit; // suppress unused warning
+                chars.next_if(|c| matches!(c, 'B' | 'b'));
+                // Must be fully consumed
+                has_digits && chars.next().is_none()
+            };
+            if !valid {
+                anyhow::bail!(
+                    "Invalid tmpfs_size '{}': expected a number followed by an optional unit (K, M, G) and optional 'B', e.g. '4G', '512M', '1024'",
+                    size
+                );
+            }
+        }
+
         Ok(config)
     }
 
