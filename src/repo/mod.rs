@@ -155,20 +155,11 @@ impl RepoManager {
             .path
             .join(format!("{}.db.tar.gz", self.config.repo.name));
 
-        // Remove old database
-        if db_path.exists() {
-            std::fs::remove_file(&db_path)?;
-        }
-
-        // Also remove .files database
         let files_db = self
             .config
             .repo
             .path
             .join(format!("{}.files.tar.gz", self.config.repo.name));
-        if files_db.exists() {
-            std::fs::remove_file(&files_db)?;
-        }
 
         // Find all packages
         let mut packages = Vec::new();
@@ -187,9 +178,21 @@ impl RepoManager {
             return Ok(());
         }
 
-        // Add all packages to database
+        // Write new DB to a temp file, then rename over the old one atomically
+        let tmp_db_path = self
+            .config
+            .repo
+            .path
+            .join(format!("{}.db.tar.gz.tmp", self.config.repo.name));
+
+        // Remove any leftover temp file
+        if tmp_db_path.exists() {
+            std::fs::remove_file(&tmp_db_path)?;
+        }
+
+        // Add all packages to the temp database
         let mut cmd = std::process::Command::new("repo-add");
-        cmd.arg(&db_path);
+        cmd.arg(&tmp_db_path);
         for pkg in &packages {
             cmd.arg(pkg);
         }
@@ -197,10 +200,20 @@ impl RepoManager {
         let output = cmd.output().context("Failed to execute repo-add")?;
 
         if !output.status.success() {
+            // Clean up temp file on failure
+            let _ = std::fs::remove_file(&tmp_db_path);
             anyhow::bail!(
                 "repo-add failed: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
+        }
+
+        // Atomically replace the old database
+        std::fs::rename(&tmp_db_path, &db_path)?;
+
+        // Also remove .files database (repo-add regenerates it alongside the main db)
+        if files_db.exists() {
+            std::fs::remove_file(&files_db)?;
         }
 
         Ok(())

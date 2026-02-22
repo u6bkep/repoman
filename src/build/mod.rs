@@ -117,6 +117,10 @@ pub fn vercmp(ver1: &str, ver2: &str) -> Ordering {
         }
         _ => {
             // Fallback to lexicographic comparison
+            tracing::warn!(
+                "vercmp not found or failed; falling back to lexicographic comparison \
+                 (version comparison may be incorrect)"
+            );
             ver1.cmp(ver2)
         }
     }
@@ -701,11 +705,13 @@ CMD ["bash", "-c", "sudo pacman -Sy --noconfirm && makepkg -s --noconfirm --need
             .repo
             .path
             .join(format!("{}.db", self.config.repo.name));
-        if !db_link.exists() {
-            std::os::unix::fs::symlink(
-                format!("{}.db.tar.gz", self.config.repo.name),
-                &db_link,
-            ).ok(); // Ignore errors on symlink
+        match std::os::unix::fs::symlink(
+            format!("{}.db.tar.gz", self.config.repo.name),
+            &db_link,
+        ) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.into()),
         }
 
         Ok(())
@@ -991,8 +997,9 @@ CMD ["bash", "-c", "sudo pacman -Sy --noconfirm && makepkg -s --noconfirm --need
 
         for image in &images {
             if kept_count < keep {
-                kept_ids.insert(image.id.clone());
-                kept_count += 1;
+                if kept_ids.insert(image.id.clone()) {
+                    kept_count += 1;
+                }
             }
         }
 
@@ -1067,13 +1074,13 @@ fn parse_pkg_filename(filename: &str) -> Option<(String, String)> {
         return None;
     }
 
-    let arch = parts[0];
+    let _arch = parts[0];
     let pkgrel = parts[1];
     let pkgver = parts[2];
     let pkgname = parts[3];
 
     Some((
         pkgname.to_string(),
-        format!("{}-{}-{}", pkgver, pkgrel, arch),
+        format!("{}-{}", pkgver, pkgrel),
     ))
 }

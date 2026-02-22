@@ -1174,20 +1174,34 @@ async fn cmd_build_single(state: SharedState, name: &str) -> Result<()> {
     match result {
         Ok(packages) => {
             println!("Moving packages to repository...");
-            let repo_packages = build_system.move_to_repo(&packages)?;
-            build_system.repo_add(&repo_packages)?;
+            let post_build_result = (|| -> Result<Vec<PathBuf>> {
+                let repo_packages = build_system.move_to_repo(&packages)?;
+                build_system.repo_add(&repo_packages)?;
+                Ok(repo_packages)
+            })();
 
-            {
-                let state_write = state.write().await;
-                state_write.db.update_package_status(&pkg.pkgbase, models::PackageStatus::UpToDate).await?;
-            }
+            match post_build_result {
+                Ok(repo_packages) => {
+                    {
+                        let state_write = state.write().await;
+                        state_write.db.update_package_status(&pkg.pkgbase, models::PackageStatus::UpToDate).await?;
+                    }
 
-            println!("\nBuild successful!");
-            println!("Packages added to repository:");
-            for pkg in &repo_packages {
-                println!("  - {}", pkg.file_name().unwrap_or_default().to_string_lossy());
+                    println!("\nBuild successful!");
+                    println!("Packages added to repository:");
+                    for pkg in &repo_packages {
+                        println!("  - {}", pkg.file_name().unwrap_or_default().to_string_lossy());
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    {
+                        let state_write = state.write().await;
+                        state_write.db.update_package_status(&pkg.pkgbase, models::PackageStatus::Failed).await?;
+                    }
+                    Err(e)
+                }
             }
-            Ok(())
         }
         Err(e) => {
             {
