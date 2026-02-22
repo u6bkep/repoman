@@ -222,6 +222,7 @@ async fn main() -> Result<()> {
         build: BuildSystem::new(config.clone()),
         repo: RepoManager::new(config.clone()),
         build_stages: std::collections::HashMap::new(),
+        repo_mutex: Arc::new(tokio::sync::Mutex::new(())),
     }));
 
     let json_output = cli.json;
@@ -283,6 +284,66 @@ async fn main() -> Result<()> {
 async fn run_server(state: SharedState, config: &Config) -> Result<()> {
     // Check podman availability
     BuildSystem::check_podman()?;
+
+    // Recover from stuck Building/Running states (server crash mid-build)
+    {
+        let state_read = state.read().await;
+
+        // Find packages stuck in Building status
+        let building_packages = state_read
+            .db
+            .list_packages_by_status(models::PackageStatus::Building)
+            .await?;
+        for pkg in &building_packages {
+            tracing::warn!(
+                "Recovering stuck package '{}' from Building to Failed (server restarted)",
+                pkg.pkgbase
+            );
+            if let Err(e) = state_read
+                .db
+                .update_package_status(&pkg.pkgbase, models::PackageStatus::Failed)
+                .await
+            {
+                tracing::error!("Failed to recover package '{}': {}", pkg.pkgbase, e);
+            }
+        }
+
+        // Find builds stuck in Running or Pending status
+        let all_packages = state_read.db.list_packages().await?;
+        for pkg in &all_packages {
+            let builds = state_read.db.list_builds(&pkg.pkgbase, 100, 0).await?;
+            for build in &builds {
+                if build.status == models::BuildStatus::Running
+                    || build.status == models::BuildStatus::Pending
+                {
+                    tracing::warn!(
+                        "Recovering stuck build '{}' for '{}' from {:?} to Failed (server restarted)",
+                        build.id,
+                        pkg.pkgbase,
+                        build.status
+                    );
+                    if let Err(e) = state_read
+                        .db
+                        .update_build_status(
+                            &build.id,
+                            models::BuildStatus::Failed,
+                            Some("Server restarted during build"),
+                        )
+                        .await
+                    {
+                        tracing::error!("Failed to recover build '{}': {}", build.id, e);
+                    }
+                }
+            }
+        }
+
+        if !building_packages.is_empty() {
+            tracing::info!(
+                "Recovered {} package(s) from stuck Building state",
+                building_packages.len()
+            );
+        }
+    }
 
     let app = api::router(state)
         .fallback_service(ServeDir::new("static"));

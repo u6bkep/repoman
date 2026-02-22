@@ -11,7 +11,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncSeekExt};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::aur::{AurClient, AurGit, read_srcinfo};
 use crate::build::{vercmp, BuildSystem};
@@ -29,6 +29,8 @@ pub struct AppState {
     pub repo: RepoManager,
     /// Current stage of running builds (in-memory tracking)
     pub build_stages: std::collections::HashMap<String, BuildStage>,
+    /// Mutex for serializing repo-add/repo-remove operations
+    pub repo_mutex: Arc<Mutex<()>>,
 }
 
 pub type SharedState = Arc<RwLock<AppState>>;
@@ -511,26 +513,26 @@ async fn add_package(
     State(state): State<SharedState>,
     Json(req): Json<AddPackageRequest>,
 ) -> Result<Json<AddPackageResponse>, AppError> {
-    let mut state = state.write().await;
-
-    // Check if package already exists (by pkgbase or pkgname)
-    if let Some(pkg) = state.db.get_package(&req.name).await? {
-        let names = state.db.get_package_names(&pkg.pkgbase).await?;
-        return Ok(Json(AddPackageResponse {
-            package: package_to_response(pkg, names),
-            missing_deps: vec![],
-            added_deps: vec![],
-        }));
-    }
-
-    if let Some(pkgbase) = state.db.resolve_pkgbase(&req.name).await? {
-        if let Some(pkg) = state.db.get_package(&pkgbase).await? {
-            let names = state.db.get_package_names(&pkg.pkgbase).await?;
+    // Check if package already exists under a brief read lock
+    {
+        let state_read = state.read().await;
+        if let Some(pkg) = state_read.db.get_package(&req.name).await? {
+            let names = state_read.db.get_package_names(&pkg.pkgbase).await?;
             return Ok(Json(AddPackageResponse {
                 package: package_to_response(pkg, names),
                 missing_deps: vec![],
                 added_deps: vec![],
             }));
+        }
+        if let Some(pkgbase) = state_read.db.resolve_pkgbase(&req.name).await? {
+            if let Some(pkg) = state_read.db.get_package(&pkgbase).await? {
+                let names = state_read.db.get_package_names(&pkg.pkgbase).await?;
+                return Ok(Json(AddPackageResponse {
+                    package: package_to_response(pkg, names),
+                    missing_deps: vec![],
+                    added_deps: vec![],
+                }));
+            }
         }
     }
 
@@ -541,22 +543,25 @@ async fn add_package(
         InstallReason::Explicit
     };
 
-    // Add the main package
-    let (pkg, _version) = add_package_internal(&mut state, &req.name, install_reason).await?;
+    // Do AUR lookup, git clone, SRCINFO parsing OUTSIDE the lock
+    let (pkg, _version) = add_package_outside_lock(&state, &req.name, install_reason).await?;
 
     // Track added dependencies
     let mut added_deps: Vec<AddedDependency> = Vec::new();
 
-    // Find missing AUR dependencies
+    // Find missing AUR dependencies (outside lock - uses AurClient and reads disk)
     let clone_path = std::path::Path::new(&pkg.local_path);
     let srcinfo = read_srcinfo(clone_path)?;
 
-    // Get currently tracked package names (for dep resolution)
-    let mut tracked_pkgnames = get_tracked_pkgnames(&state).await?;
+    let (container_image, tracked_pkgnames) = {
+        let state_read = state.read().await;
+        let image = state_read.config.container.image.clone();
+        let tracked = get_tracked_pkgnames(&state_read).await?;
+        (image, tracked)
+    };
 
-    let container_image = state.config.container.image.clone();
-    let missing_deps = state
-        .aur
+    let aur_client = AurClient::new();
+    let missing_deps = aur_client
         .find_missing_aur_deps(&srcinfo, &tracked_pkgnames, &container_image)
         .await
         .unwrap_or_else(|e| {
@@ -583,23 +588,25 @@ async fn add_package(
             }
             processed.insert(dep_pkgbase.clone());
 
-            // Add this dependency
-            match add_package_internal(&mut state, &dep_name, InstallReason::Dependency).await {
+            // Add this dependency (does AUR/git outside lock, DB inside lock)
+            match add_package_outside_lock(&state, &dep_name, InstallReason::Dependency).await {
                 Ok((dep_pkg, dep_version)) => {
                     added_deps.push(AddedDependency {
                         pkgbase: dep_pkg.pkgbase.clone(),
                         version: dep_version,
                     });
 
-                    // Check for this package's dependencies
+                    // Check for this package's dependencies (outside lock)
                     let dep_clone_path = std::path::Path::new(&dep_pkg.local_path);
                     if let Ok(dep_srcinfo) = read_srcinfo(dep_clone_path) {
-                        // Update tracked pkgnames
-                        tracked_pkgnames = get_tracked_pkgnames(&state).await?;
+                        // Update tracked pkgnames under brief read lock
+                        let current_tracked = {
+                            let state_read = state.read().await;
+                            get_tracked_pkgnames(&state_read).await?
+                        };
 
-                        if let Ok(dep_missing) = state
-                            .aur
-                            .find_missing_aur_deps(&dep_srcinfo, &tracked_pkgnames, &container_image)
+                        if let Ok(dep_missing) = aur_client
+                            .find_missing_aur_deps(&dep_srcinfo, &current_tracked, &container_image)
                             .await
                         {
                             for m in dep_missing {
@@ -626,7 +633,8 @@ async fn add_package(
         missing_deps
     };
 
-    let names = state.db.get_package_names(&pkg.pkgbase).await?;
+    let state_read = state.read().await;
+    let names = state_read.db.get_package_names(&pkg.pkgbase).await?;
     Ok(Json(AddPackageResponse {
         package: package_to_response(pkg, names),
         missing_deps: remaining_missing_deps,
@@ -650,46 +658,58 @@ async fn get_tracked_pkgnames(
     Ok(tracked_pkgnames)
 }
 
-/// Internal helper to add a single package
-async fn add_package_internal(
-    state: &mut AppState,
+/// Add a single package: does AUR lookup, git clone, SRCINFO parsing outside the lock,
+/// then acquires write lock only for DB inserts.
+async fn add_package_outside_lock(
+    state: &SharedState,
     name: &str,
     install_reason: InstallReason,
 ) -> Result<(Package, String), AppError> {
-    // Check if already exists
-    if let Some(pkg) = state.db.get_package(name).await? {
-        let version = pkg.pkgver.clone().unwrap_or_default();
-        return Ok((pkg, version));
+    // Check if already exists under brief read lock
+    {
+        let state_read = state.read().await;
+        if let Some(pkg) = state_read.db.get_package(name).await? {
+            let version = pkg.pkgver.clone().unwrap_or_default();
+            return Ok((pkg, version));
+        }
+        if let Some(pkgbase) = state_read.db.resolve_pkgbase(name).await? {
+            if let Some(pkg) = state_read.db.get_package(&pkgbase).await? {
+                let version = pkg.pkgver.clone().unwrap_or_default();
+                return Ok((pkg, version));
+            }
+        }
     }
-    if let Some(pkgbase) = state.db.resolve_pkgbase(name).await? {
-        if let Some(pkg) = state.db.get_package(&pkgbase).await? {
+
+    // Query AUR outside lock
+    let aur_client = AurClient::new();
+    let aur_info = aur_client
+        .info_single(name)
+        .await?
+        .ok_or_else(|| AppError::not_found(format!("Package '{}' not found in AUR", name)))?;
+
+    let pkgbase = aur_info.package_base.clone();
+
+    // Check again after AUR lookup (pkgbase may differ from name)
+    {
+        let state_read = state.read().await;
+        if let Some(pkg) = state_read.db.get_package(&pkgbase).await? {
             let version = pkg.pkgver.clone().unwrap_or_default();
             return Ok((pkg, version));
         }
     }
 
-    // Query AUR
-    let aur_info = state
-        .aur
-        .info_single(name)
-        .await?
-        .ok_or_else(|| AppError::not_found(format!("Package '{}' not found in AUR", name)))?;
+    // Get clone path under brief read lock
+    let clone_path = {
+        let state_read = state.read().await;
+        state_read.config.resolved_cache().aur_clones.join(&pkgbase)
+    };
 
-    let pkgbase = &aur_info.package_base;
-
-    // Check again after AUR lookup
-    if let Some(pkg) = state.db.get_package(pkgbase).await? {
-        let version = pkg.pkgver.clone().unwrap_or_default();
-        return Ok((pkg, version));
-    }
-
-    // Clone repository
-    let clone_path = state.config.resolved_cache().aur_clones.join(pkgbase);
+    // Clone repository outside lock (disk I/O + network)
     if !clone_path.exists() {
-        AurGit::clone(pkgbase, &clone_path)?;
+        AurGit::clone(&pkgbase, &clone_path)?;
     }
 
-    // Parse .SRCINFO
+    // Parse .SRCINFO outside lock (disk I/O)
     let srcinfo = read_srcinfo(&clone_path)?;
     let current_commit = AurGit::head_commit(&clone_path)?;
     let version = format!("{}-{}", srcinfo.pkgver, srcinfo.pkgrel);
@@ -698,7 +718,7 @@ async fn add_package_internal(
     let now = chrono::Utc::now();
     let pkg = Package {
         pkgbase: pkgbase.clone(),
-        aur_url: format!("https://aur.archlinux.org/{}.git", pkgbase),
+        aur_url: format!("https://aur.archlinux.org/{}.git", &pkgbase),
         local_path: clone_path.to_string_lossy().to_string(),
         approved_commit: None,
         current_commit: Some(current_commit),
@@ -713,7 +733,7 @@ async fn add_package_internal(
         updated_at: now,
     };
 
-    // Build package names list
+    // Build package names list outside lock
     let mut pkg_names = Vec::new();
     for sp in &srcinfo.packages {
         pkg_names.push(PackageName {
@@ -729,8 +749,18 @@ async fn add_package_internal(
         });
     }
 
-    // Insert package and its names atomically
-    state.db.insert_package_with_names(&pkg, &pkg_names).await?;
+    // Acquire write lock only for DB inserts
+    {
+        let state_write = state.write().await;
+
+        // Double-check: another request may have inserted this while we were cloning
+        if let Some(existing) = state_write.db.get_package(&pkgbase).await? {
+            let version = existing.pkgver.clone().unwrap_or_default();
+            return Ok((existing, version));
+        }
+
+        state_write.db.insert_package_with_names(&pkg, &pkg_names).await?;
+    }
 
     Ok((pkg, version))
 }
@@ -815,6 +845,7 @@ async fn remove_package(
     // Helper to remove a single package
     async fn do_remove(
         state: &mut AppState,
+        repo_mutex: &Mutex<()>,
         pkgbase: &str,
         delete_files: bool,
         delete_clone: bool,
@@ -828,7 +859,10 @@ async fn remove_package(
         if delete_files {
             let names = state.db.get_package_names(pkgbase).await?;
             let pkgnames: Vec<&str> = names.iter().map(|n| n.pkgname.as_str()).collect();
+            // Serialize repo-remove under repo mutex
+            let _repo_lock = repo_mutex.lock().await;
             let _ = state.build.repo_remove(&pkgnames); // Ignore errors
+            drop(_repo_lock);
             for name in &names {
                 let _ = state.repo.delete_package_files(&name.pkgname);
             }
@@ -849,9 +883,11 @@ async fn remove_package(
     let delete_clone = params.delete_clone.unwrap_or(false);
     let recursive = params.recursive.unwrap_or(false);
 
+    let repo_mutex = state.repo_mutex.clone();
+
     // Remove the main package
     let mut removed = vec![pkg.pkgbase.clone()];
-    do_remove(&mut state, &pkg.pkgbase, delete_files, delete_clone).await?;
+    do_remove(&mut state, &repo_mutex, &pkg.pkgbase, delete_files, delete_clone).await?;
 
     // If recursive, also remove orphaned dependencies
     if recursive {
@@ -862,7 +898,7 @@ async fn remove_package(
             }
             for orphan in orphans {
                 removed.push(orphan.pkgbase.clone());
-                do_remove(&mut state, &orphan.pkgbase, delete_files, delete_clone).await?;
+                do_remove(&mut state, &repo_mutex, &orphan.pkgbase, delete_files, delete_clone).await?;
             }
         }
     }
@@ -972,11 +1008,11 @@ async fn trigger_build(
     State(state): State<SharedState>,
     Path(pkgbase): Path<String>,
 ) -> Result<Json<BuildResponse>, AppError> {
-    // Get package info and config under read lock first
+    // Do status check AND status update under a single write lock to prevent TOCTOU race
     let (pkg, config, log_path, build_id) = {
-        let state_read = state.read().await;
+        let state_write = state.write().await;
 
-        let pkg = resolve_package(&state_read, &pkgbase).await?;
+        let pkg = resolve_package(&state_write, &pkgbase).await?;
 
         if pkg.status != PackageStatus::Approved && pkg.status != PackageStatus::UpdateAvailable {
             return Err(AppError::bad_request(
@@ -985,7 +1021,7 @@ async fn trigger_build(
         }
 
         // Check base image exists
-        match state_read.build.image_exists() {
+        match state_write.build.image_exists() {
             Ok(true) => {}
             Ok(false) => {
                 return Err(AppError::bad_request(
@@ -1000,20 +1036,13 @@ async fn trigger_build(
             }
         }
 
+        let commit = pkg
+            .current_commit
+            .clone()
+            .ok_or_else(|| AppError::bad_request("Package has no current commit"))?;
+
         let build_id = uuid::Uuid::new_v4().to_string();
-        let log_path = state_read.config.resolved_cache().logs.join(format!("{}.log", build_id));
-
-        (pkg, state_read.config.clone(), log_path, build_id)
-    };
-
-    let commit = pkg
-        .current_commit
-        .clone()
-        .ok_or_else(|| AppError::bad_request("Package has no current commit"))?;
-
-    // Create build record and update package status
-    {
-        let state_write = state.write().await;
+        let log_path = state_write.config.resolved_cache().logs.join(format!("{}.log", build_id));
         let now = chrono::Utc::now();
 
         let build = crate::models::Build {
@@ -1033,7 +1062,10 @@ async fn trigger_build(
             .db
             .update_package_status(&pkg.pkgbase, PackageStatus::Building)
             .await?;
-    }
+
+        let config = state_write.config.clone();
+        (pkg, config, log_path, build_id)
+    };
 
     // Spawn background task to run the build
     let state_clone = state.clone();
@@ -1136,6 +1168,12 @@ async fn run_build_task(
     })
     .await;
 
+    // Get repo_mutex for serializing repo operations
+    let repo_mutex = {
+        let state_read = state.read().await;
+        state_read.repo_mutex.clone()
+    };
+
     match build_result {
         Ok(Ok(packages)) => {
             // Build succeeded - move packages to repo
@@ -1151,10 +1189,15 @@ async fn run_build_task(
 
             match build_system.move_to_repo(&packages) {
                 Ok(repo_packages) => {
-                    // Add to repo database
+                    // Add to repo database under repo mutex
                     set_build_stage(&state, &build_id, BuildStage::UpdatingIndex).await;
 
-                    if let Err(e) = build_system.repo_add(&repo_packages) {
+                    let repo_add_result = {
+                        let _repo_lock = repo_mutex.lock().await;
+                        build_system.repo_add(&repo_packages)
+                    };
+
+                    if let Err(e) = repo_add_result {
                         tracing::error!("repo-add failed: {}", e);
                         set_build_stage(&state, &build_id, BuildStage::Failed).await;
                         update_build_failed(
@@ -1503,29 +1546,35 @@ async fn get_package_deps(
 async fn check_updates(
     State(state): State<SharedState>,
 ) -> Result<Json<CheckUpdatesResponse>, AppError> {
-    let state = state.write().await;
+    // Collect package list under brief read lock
+    let packages = {
+        let state_read = state.read().await;
+        state_read.db.list_packages().await?
+    };
 
-    let packages = state.db.list_packages().await?;
     let checked = packages.len();
     let mut updated = Vec::new();
 
+    // Do all git fetch/has_updates operations outside the lock (read-only on disk)
     for pkg in packages {
         // Don't touch the source directory while a build is actively using it
         if pkg.status == PackageStatus::Building {
             continue;
         }
 
-        let clone_path = std::path::Path::new(&pkg.local_path);
+        let clone_path = std::path::Path::new(&pkg.local_path).to_path_buf();
 
-        if AurGit::has_updates(clone_path)? {
-            AurGit::reset_to_remote(clone_path)?;
-            let new_commit = AurGit::head_commit(clone_path)?;
+        if AurGit::has_updates(&clone_path)? {
+            AurGit::reset_to_remote(&clone_path)?;
+            let new_commit = AurGit::head_commit(&clone_path)?;
 
-            // Re-parse .SRCINFO
-            let srcinfo = read_srcinfo(clone_path)?;
+            // Re-parse .SRCINFO (disk I/O, no lock needed)
+            let srcinfo = read_srcinfo(&clone_path)?;
             let pkgver = format!("{}-{}", srcinfo.pkgver, srcinfo.pkgrel);
 
-            state
+            // Re-acquire write lock only for the brief DB updates
+            let state_write = state.write().await;
+            state_write
                 .db
                 .update_package_commit(&pkg.pkgbase, &new_commit, Some(&pkgver))
                 .await?;
@@ -1534,16 +1583,18 @@ async fn check_updates(
             // (i.e. status is UpdateAvailable, not PendingReview).
             // PendingReview packages must be reviewed by a human first.
             let new_status = if pkg.auto_approve && pkg.status == PackageStatus::UpdateAvailable {
-                state.db.approve_package(&pkg.pkgbase, true, None).await?;
+                state_write.db.approve_package(&pkg.pkgbase, true, None).await?;
                 PackageStatus::Approved
             } else {
                 PackageStatus::UpdateAvailable
             };
 
-            state
+            state_write
                 .db
                 .update_package_status(&pkg.pkgbase, new_status)
                 .await?;
+            drop(state_write);
+
             updated.push(pkg.pkgbase);
         }
     }
@@ -1555,37 +1606,44 @@ async fn check_package_update(
     State(state): State<SharedState>,
     Path(pkgbase): Path<String>,
 ) -> Result<Json<PackageResponse>, AppError> {
-    let state = state.write().await;
+    // Resolve package under brief read lock
+    let pkg = {
+        let state_read = state.read().await;
+        resolve_package(&state_read, &pkgbase).await?
+    };
 
-    let pkg = resolve_package(&state, &pkgbase).await?;
     let clone_path = std::path::Path::new(&pkg.local_path).to_path_buf();
 
+    // Do git fetch/has_updates outside the lock (network I/O)
     if AurGit::has_updates(&clone_path)? {
         AurGit::reset_to_remote(&clone_path)?;
         let new_commit = AurGit::head_commit(&clone_path)?;
 
-        // Re-parse .SRCINFO
+        // Re-parse .SRCINFO (disk I/O, no lock needed)
         let srcinfo = read_srcinfo(&clone_path)?;
         let pkgver = format!("{}-{}", srcinfo.pkgver, srcinfo.pkgrel);
 
-        state
+        // Re-acquire write lock only for brief DB updates
+        let state_write = state.write().await;
+        state_write
             .db
             .update_package_commit(&pkg.pkgbase, &new_commit, Some(&pkgver))
             .await?;
 
-        state
+        state_write
             .db
             .update_package_status(&pkg.pkgbase, PackageStatus::UpdateAvailable)
             .await?;
     }
 
-    // Reload package to get updated data
-    let pkg = state
+    // Reload package to get updated data under read lock
+    let state_read = state.read().await;
+    let pkg = state_read
         .db
         .get_package(&pkg.pkgbase)
         .await?
         .ok_or_else(|| AppError::internal("Package disappeared"))?;
-    let names = state.db.get_package_names(&pkg.pkgbase).await?;
+    let names = state_read.db.get_package_names(&pkg.pkgbase).await?;
 
     Ok(Json(package_to_response(pkg, names)))
 }
@@ -2183,6 +2241,12 @@ async fn run_queued_builds(
 
     let mut failed_pkgbases: HashSet<String> = HashSet::new();
 
+    // Get repo_mutex once for the entire queue
+    let repo_mutex = {
+        let state_read = state.read().await;
+        state_read.repo_mutex.clone()
+    };
+
     for (pkgbase, build_id, local_path, log_path) in builds {
         // Check if any of this package's dependencies failed
         let should_skip = if let Some(pkg_deps) = deps_graph.get(&pkgbase) {
@@ -2256,7 +2320,13 @@ async fn run_queued_builds(
                     Ok(repo_packages) => {
                         set_build_stage(&state, &build_id, BuildStage::UpdatingIndex).await;
 
-                        if let Err(e) = build_system.repo_add(&repo_packages) {
+                        // Serialize repo-add under repo mutex
+                        let repo_add_result = {
+                            let _repo_lock = repo_mutex.lock().await;
+                            build_system.repo_add(&repo_packages)
+                        };
+
+                        if let Err(e) = repo_add_result {
                             tracing::error!("repo-add failed for {}: {}", pkgbase, e);
                             set_build_stage(&state, &build_id, BuildStage::Failed).await;
                             failed_pkgbases.insert(pkgbase.clone());
@@ -2361,8 +2431,9 @@ async fn cancel_build(
     }
 
     // Only attempt to kill container for running builds
+    // Container name must match run_build_sync which uses "repoman-build-{pkgbase}"
     if is_running {
-        let container_name = format!("repoman-build-{}-{}", build.pkgbase, build.id);
+        let container_name = format!("repoman-build-{}", build.pkgbase);
         state.build.stop_build(&container_name)?;
     }
 
@@ -2389,10 +2460,12 @@ async fn repo_info(
 }
 
 async fn clean_repo(State(state): State<SharedState>) -> Result<Json<CleanResponse>, AppError> {
-    let state = state.read().await;
-    let deleted = state
+    let state_read = state.read().await;
+    let repo_mutex = state_read.repo_mutex.clone();
+    let _repo_lock = repo_mutex.lock().await;
+    let deleted = state_read
         .repo
-        .clean_old_versions(state.config.repo.keep_versions)?;
+        .clean_old_versions(state_read.config.repo.keep_versions)?;
     Ok(Json(CleanResponse {
         deleted_count: deleted.len() as u32,
         deleted_files: deleted,
@@ -2400,8 +2473,10 @@ async fn clean_repo(State(state): State<SharedState>) -> Result<Json<CleanRespon
 }
 
 async fn rebuild_repo_db(State(state): State<SharedState>) -> Result<StatusCode, AppError> {
-    let state = state.read().await;
-    state.repo.rebuild_database()?;
+    let state_read = state.read().await;
+    let repo_mutex = state_read.repo_mutex.clone();
+    let _repo_lock = repo_mutex.lock().await;
+    state_read.repo.rebuild_database()?;
     Ok(StatusCode::OK)
 }
 
@@ -2417,9 +2492,13 @@ async fn remove_from_repo(
     let pkg = resolve_package(&state, &name).await?;
     let pkg_names = state.db.get_package_names(&pkg.pkgbase).await?;
 
-    // Remove from repo database and delete files
+    // Remove from repo database and delete files (serialize under repo mutex)
+    let repo_mutex = state.repo_mutex.clone();
     let pkgnames: Vec<&str> = pkg_names.iter().map(|n| n.pkgname.as_str()).collect();
-    let _ = state.build.repo_remove(&pkgnames); // Ignore errors if not in repo
+    {
+        let _repo_lock = repo_mutex.lock().await;
+        let _ = state.build.repo_remove(&pkgnames); // Ignore errors if not in repo
+    }
 
     let mut deleted_files = Vec::new();
     for pkg_name in &pkg_names {
