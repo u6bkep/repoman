@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
+use std::collections::HashMap;
 use std::path::Path;
 
 use crate::models::{Build, BuildStatus, InstallReason, Package, PackageName, PackageStatus};
@@ -183,8 +184,10 @@ impl Database {
 
     // ==================== Package operations ====================
 
-    /// Insert a new package
-    pub async fn insert_package(&self, pkg: &Package) -> Result<()> {
+    /// Insert a package and its names atomically in a single transaction
+    pub async fn insert_package_with_names(&self, pkg: &Package, names: &[PackageName]) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+
         sqlx::query(
             r#"
             INSERT INTO packages (pkgbase, aur_url, local_path, approved_commit, current_commit, pkgver, status, install_reason, auto_approve, has_upstream, in_official_repos, added_at, updated_at)
@@ -204,8 +207,31 @@ impl Database {
         .bind(pkg.in_official_repos)
         .bind(pkg.added_at.to_rfc3339())
         .bind(pkg.updated_at.to_rfc3339())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+
+        for name in names {
+            sqlx::query(
+                r#"
+                INSERT OR REPLACE INTO package_names
+                (pkgname, pkgbase, pkgdesc, pkgver, depends, optdepends, provides, conflicts, repo_version)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(&name.pkgname)
+            .bind(&name.pkgbase)
+            .bind(&name.pkgdesc)
+            .bind(&name.pkgver)
+            .bind(&name.depends)
+            .bind(&name.optdepends)
+            .bind(&name.provides)
+            .bind(&name.conflicts)
+            .bind(&name.repo_version)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
         Ok(())
     }
 
@@ -281,23 +307,23 @@ impl Database {
     /// - It has install_reason = 'dependency'
     /// - No explicitly installed package depends on it (directly or transitively)
     pub async fn list_orphans(&self) -> Result<Vec<Package>> {
-        // Get all packages
+        // Get all packages and all package names in two queries (not N+1)
         let all_packages = self.list_packages().await?;
-
-        // Get all package names with their dependencies
-        let mut all_deps: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let all_names_by_pkgbase = self.list_all_package_names().await?;
 
         // Collect dependencies of all explicit packages
+        let mut all_deps: std::collections::HashSet<String> = std::collections::HashSet::new();
         for pkg in &all_packages {
             if pkg.install_reason == InstallReason::Explicit {
-                let names = self.get_package_names(&pkg.pkgbase).await?;
-                for name in names {
-                    if let Some(deps_json) = &name.depends {
-                        if let Ok(deps) = serde_json::from_str::<Vec<String>>(deps_json) {
-                            for dep in deps {
-                                // Extract package name from versioned dependency (e.g., "foo>=1.0" -> "foo")
-                                let dep_name = dep.split(|c| c == '>' || c == '<' || c == '=').next().unwrap_or(&dep);
-                                all_deps.insert(dep_name.to_string());
+                if let Some(names) = all_names_by_pkgbase.get(&pkg.pkgbase) {
+                    for name in names {
+                        if let Some(deps_json) = &name.depends {
+                            if let Ok(deps) = serde_json::from_str::<Vec<String>>(deps_json) {
+                                for dep in deps {
+                                    // Extract package name from versioned dependency (e.g., "foo>=1.0" -> "foo")
+                                    let dep_name = dep.split(|c| c == '>' || c == '<' || c == '=').next().unwrap_or(&dep);
+                                    all_deps.insert(dep_name.to_string());
+                                }
                             }
                         }
                     }
@@ -309,7 +335,7 @@ impl Database {
         let mut orphans = Vec::new();
         for pkg in all_packages {
             if pkg.install_reason == InstallReason::Dependency {
-                let names = self.get_package_names(&pkg.pkgbase).await?;
+                let names = all_names_by_pkgbase.get(&pkg.pkgbase).map(|v| v.as_slice()).unwrap_or(&[]);
                 let is_needed = names.iter().any(|n| all_deps.contains(&n.pkgname));
                 if !is_needed {
                     orphans.push(pkg);
@@ -376,15 +402,19 @@ impl Database {
                 .ok_or_else(|| anyhow::anyhow!("Package has no current commit"))?,
         };
 
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let mut tx = self.pool.begin().await?;
+
         // Update package
         sqlx::query(
             "UPDATE packages SET approved_commit = ?, status = ?, updated_at = ? WHERE pkgbase = ?",
         )
         .bind(&commit)
         .bind(PackageStatus::Approved.to_string())
-        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(&now)
         .bind(pkgbase)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
 
         // Record approval
@@ -393,11 +423,12 @@ impl Database {
         )
         .bind(pkgbase)
         .bind(&commit)
-        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(&now)
         .bind(auto)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
 
+        tx.commit().await?;
         Ok(())
     }
 
@@ -412,31 +443,6 @@ impl Database {
 
     // ==================== Package names operations ====================
 
-    /// Insert package names for a pkgbase
-    pub async fn insert_package_names(&self, names: &[PackageName]) -> Result<()> {
-        for name in names {
-            sqlx::query(
-                r#"
-                INSERT OR REPLACE INTO package_names
-                (pkgname, pkgbase, pkgdesc, pkgver, depends, optdepends, provides, conflicts, repo_version)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                "#,
-            )
-            .bind(&name.pkgname)
-            .bind(&name.pkgbase)
-            .bind(&name.pkgdesc)
-            .bind(&name.pkgver)
-            .bind(&name.depends)
-            .bind(&name.optdepends)
-            .bind(&name.provides)
-            .bind(&name.conflicts)
-            .bind(&name.repo_version)
-            .execute(&self.pool)
-            .await?;
-        }
-        Ok(())
-    }
-
     /// Get all package names for a pkgbase
     pub async fn get_package_names(&self, pkgbase: &str) -> Result<Vec<PackageName>> {
         let rows = sqlx::query_as::<_, PackageNameRow>(
@@ -447,6 +453,23 @@ impl Database {
         .await?;
 
         Ok(rows.into_iter().map(|r| r.into()).collect())
+    }
+
+    /// Fetch all package names in a single query and group them by pkgbase.
+    /// Use this instead of calling get_package_names in a loop to avoid N+1 queries.
+    pub async fn list_all_package_names(&self) -> Result<HashMap<String, Vec<PackageName>>> {
+        let rows = sqlx::query_as::<_, PackageNameRow>(
+            "SELECT * FROM package_names ORDER BY pkgbase, pkgname",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut map: HashMap<String, Vec<PackageName>> = HashMap::new();
+        for row in rows {
+            let name: PackageName = row.into();
+            map.entry(name.pkgbase.clone()).or_default().push(name);
+        }
+        Ok(map)
     }
 
     /// Resolve pkgname to pkgbase

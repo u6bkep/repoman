@@ -582,9 +582,7 @@ async fn add_package_internal(
         updated_at: now,
     };
 
-    state.db.insert_package(&pkg).await?;
-
-    // Insert package names
+    // Build package names list
     let mut pkg_names = Vec::new();
     for sp in &srcinfo.packages {
         pkg_names.push(models::PackageName {
@@ -600,7 +598,8 @@ async fn add_package_internal(
         });
     }
 
-    state.db.insert_package_names(&pkg_names).await?;
+    // Insert package and its names atomically
+    state.db.insert_package_with_names(&pkg, &pkg_names).await?;
 
     added_packages.push(AddedPackage {
         pkgbase: pkgbase.clone(),
@@ -1867,8 +1866,7 @@ async fn cmd_import(state: SharedState, db_path: &std::path::Path, dry_run: bool
     {
         let state_write = state.write().await;
         for imp in &imported {
-            state_write.db.insert_package(&imp.pkg).await?;
-            state_write.db.insert_package_names(&imp.pkg_names).await?;
+            state_write.db.insert_package_with_names(&imp.pkg, &imp.pkg_names).await?;
         }
     }
 

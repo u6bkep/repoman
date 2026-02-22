@@ -493,11 +493,16 @@ async fn list_packages(
         (None, None) => state.db.list_packages().await?,
     };
 
-    let mut responses = Vec::new();
-    for pkg in packages {
-        let names = state.db.get_package_names(&pkg.pkgbase).await?;
-        responses.push(package_to_response(pkg, names));
-    }
+    // Fetch all package names in a single query to avoid N+1
+    let mut all_names = state.db.list_all_package_names().await?;
+
+    let responses = packages
+        .into_iter()
+        .map(|pkg| {
+            let names = all_names.remove(&pkg.pkgbase).unwrap_or_default();
+            package_to_response(pkg, names)
+        })
+        .collect();
 
     Ok(Json(responses))
 }
@@ -708,9 +713,7 @@ async fn add_package_internal(
         updated_at: now,
     };
 
-    state.db.insert_package(&pkg).await?;
-
-    // Insert package names
+    // Build package names list
     let mut pkg_names = Vec::new();
     for sp in &srcinfo.packages {
         pkg_names.push(PackageName {
@@ -726,7 +729,8 @@ async fn add_package_internal(
         });
     }
 
-    state.db.insert_package_names(&pkg_names).await?;
+    // Insert package and its names atomically
+    state.db.insert_package_with_names(&pkg, &pkg_names).await?;
 
     Ok((pkg, version))
 }
@@ -1353,11 +1357,16 @@ async fn list_orphans(
 
     let orphans = state.db.list_orphans().await?;
 
-    let mut responses = Vec::new();
-    for pkg in orphans {
-        let names = state.db.get_package_names(&pkg.pkgbase).await?;
-        responses.push(package_to_response(pkg, names));
-    }
+    // Fetch all package names in a single query to avoid N+1
+    let mut all_names = state.db.list_all_package_names().await?;
+
+    let responses = orphans
+        .into_iter()
+        .map(|pkg| {
+            let names = all_names.remove(&pkg.pkgbase).unwrap_or_default();
+            package_to_response(pkg, names)
+        })
+        .collect();
 
     Ok(Json(responses))
 }
@@ -1521,8 +1530,10 @@ async fn check_updates(
                 .update_package_commit(&pkg.pkgbase, &new_commit, Some(&pkgver))
                 .await?;
 
-            // Update status based on auto_approve
-            let new_status = if pkg.auto_approve {
+            // Auto-approve only if the package already had an initial human review
+            // (i.e. status is UpdateAvailable, not PendingReview).
+            // PendingReview packages must be reviewed by a human first.
+            let new_status = if pkg.auto_approve && pkg.status == PackageStatus::UpdateAvailable {
                 state.db.approve_package(&pkg.pkgbase, true, None).await?;
                 PackageStatus::Approved
             } else {
