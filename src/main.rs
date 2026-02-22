@@ -305,6 +305,18 @@ struct AddedPackage {
 }
 
 async fn cmd_add(state: SharedState, name: &str, asdeps: bool, with_deps: bool, json_output: bool) -> Result<()> {
+    // Validate pkgbase format: only [a-zA-Z0-9@._+-] allowed
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '@' | '.' | '_' | '+' | '-'))
+    {
+        anyhow::bail!(
+            "Invalid package name '{}': only alphanumeric characters and @._+- are allowed",
+            name
+        );
+    }
+
     let mut added_packages: Vec<AddedPackage> = Vec::new();
     let mut failed_deps: Vec<(String, String)> = Vec::new(); // (name, reason)
 
