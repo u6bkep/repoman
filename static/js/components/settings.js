@@ -1,6 +1,6 @@
 // Settings component
 import * as api from '../api.js';
-import { showToast, formatBytes } from './utils.js';
+import { showToast, formatBytes, escapeHtml } from './utils.js';
 
 export async function init() {
     await Promise.all([
@@ -150,13 +150,6 @@ function formatConfigToml(config) {
     }
 
     return escapeHtml(lines.join('\n'));
-}
-
-function escapeHtml(text) {
-    return text
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;');
 }
 
 async function loadContainers() {
