@@ -15,7 +15,10 @@ pub struct AurClient {
 impl AurClient {
     pub fn new() -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("Failed to build reqwest client"),
         }
     }
 
@@ -167,6 +170,9 @@ impl AurGit {
         let output = Command::new("git")
             .args(["clone", &url])
             .arg(dest)
+            // Abort if transfer speed drops below 1000 bytes/sec for 30 seconds
+            .env("GIT_HTTP_LOW_SPEED_LIMIT", "1000")
+            .env("GIT_HTTP_LOW_SPEED_TIME", "30")
             .output()
             .with_context(|| format!("Failed to execute 'git clone' for package '{}'", pkgbase))?;
 
@@ -190,6 +196,9 @@ impl AurGit {
         let output = Command::new("git")
             .args(["fetch", "origin"])
             .current_dir(repo_path)
+            // Abort if transfer speed drops below 1000 bytes/sec for 30 seconds
+            .env("GIT_HTTP_LOW_SPEED_LIMIT", "1000")
+            .env("GIT_HTTP_LOW_SPEED_TIME", "30")
             .output()
             .context("Failed to execute git fetch")?;
 
@@ -402,30 +411,43 @@ impl DepResolver {
     }
 
     /// Check if dependencies are satisfied by repos (official + our local repo)
-    /// Runs inside a podman container to use the correct pacman configuration.
+    /// Runs inside a single podman container to use the correct pacman configuration.
     /// Returns the list of deps NOT satisfied by any configured repos.
     pub fn filter_foreign_deps(deps: &[String], container_image: &str) -> Result<Vec<String>> {
         if deps.is_empty() {
             return Ok(vec![]);
         }
 
-        // Check each dep using pacman -Sddp inside the container
-        // -Sddp: sync, skip all deps, print-only (doesn't install, just checks if available)
-        // We use pacman instead of pacsift since it's always available
-        let mut foreign = Vec::new();
-        for dep in deps {
-            let output = Command::new("podman")
-                .args([
-                    "run", "--rm", "-i",
-                    container_image,
-                    "pacman", "-Sddp", "--noconfirm", "--", dep,
-                ])
-                .output()
-                .context("Failed to run podman for dependency check")?;
+        // Run all deps in a single container using pacman -Sddp
+        // -Sddp: sync, skip all deps, print-only (doesn't install, just checks availability)
+        // When a dep is not found, pacman prints to stderr: "error: target not found: <name>"
+        let dep_names: Vec<&str> = deps.iter().map(|d| Self::dep_name(d)).collect();
 
-            // pacman -Sddp returns non-zero if package not found
-            if !output.status.success() {
-                foreign.push(dep.clone());
+        let mut cmd = Command::new("podman");
+        cmd.args(["run", "--rm", "-i", container_image, "pacman", "-Sddp", "--noconfirm", "--"]);
+        cmd.args(&dep_names);
+
+        let output = match cmd.output() {
+            Ok(o) => o,
+            Err(e) => {
+                // If we can't start the container at all, treat all deps as unknown (not foreign)
+                // rather than crashing the whole add operation.
+                eprintln!("Warning: failed to start podman for dep check: {e}");
+                return Ok(vec![]);
+            }
+        };
+
+        // Parse stderr for "error: target not found: <name>" messages
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let mut foreign = Vec::new();
+        for line in stderr.lines() {
+            if let Some(rest) = line.strip_prefix("error: target not found: ") {
+                let not_found_name = rest.trim();
+                // Find the original dep string (which may have version constraints) that
+                // corresponds to this package name.
+                if let Some(dep) = deps.iter().find(|d| Self::dep_name(d) == not_found_name) {
+                    foreign.push(dep.clone());
+                }
             }
         }
 
