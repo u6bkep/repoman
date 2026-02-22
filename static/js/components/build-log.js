@@ -10,6 +10,8 @@ let searchMatches = [];
 export async function init(params) {
     const { id } = params;
     currentBuildId = id;
+    searchIndex = -1;
+    searchMatches = [];
 
     setupLogControls(id);
     await loadBuildInfo(id);
@@ -283,10 +285,10 @@ function startStreaming(buildId) {
 
                 // Append highlighted content
                 const highlighted = highlightBuildLog(completedLines);
-                container.innerHTML += highlighted;
+                container.insertAdjacentHTML('beforeend', highlighted);
             } else if (!data.includes('\n')) {
                 // No newline - append as-is for partial lines
-                container.innerHTML += highlightBuildLog(data);
+                container.insertAdjacentHTML('beforeend', highlightBuildLog(data));
             }
 
             scrollToBottom(container);
@@ -295,7 +297,7 @@ function startStreaming(buildId) {
         () => {
             // Flush remaining buffer
             if (buffer) {
-                container.innerHTML += highlightBuildLog(buffer);
+                container.insertAdjacentHTML('beforeend', highlightBuildLog(buffer));
                 buffer = '';
             }
             // Connection closed - refresh build info

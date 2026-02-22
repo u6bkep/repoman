@@ -1,7 +1,7 @@
 // Package List component
 import * as api from '../api.js';
 import { navigate } from '../router.js';
-import { showToast, formatRelativeTime } from './utils.js';
+import { showToast, formatStatus, formatRelativeTime } from './utils.js';
 
 // Sort state
 let currentSort = { column: 'name', direction: 'asc' };
@@ -19,7 +19,7 @@ export async function init() {
         checkUpdatesBtn.textContent = 'Checking...';
         try {
             const result = await api.system.checkUpdates();
-            showToast(`Checked ${result.checked || 0} packages`, 'success');
+            showToast(`Checked ${result.checked} packages`, 'success');
             await loadPackages();
         } catch (error) {
             showToast(`Error: ${error.message}`, 'error');
@@ -181,10 +181,6 @@ function canApprove(status) {
 
 function canBuild(status) {
     return ['approved', 'update_available'].includes(status);
-}
-
-function formatStatus(status) {
-    return status.replace(/_/g, ' ');
 }
 
 function formatUpstreamBadge(pkg) {

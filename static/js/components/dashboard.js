@@ -1,6 +1,7 @@
 // Dashboard component
 import * as api from '../api.js';
 import { navigate } from '../router.js';
+import { showToast, formatStatus } from './utils.js';
 
 export async function init() {
     await Promise.all([
@@ -116,30 +117,10 @@ async function loadAttentionNeeded() {
     }
 }
 
-function formatStatus(status) {
-    return status.replace(/_/g, ' ');
-}
-
 function formatBytes(bytes) {
     if (bytes === 0) return '0 B';
     const k = 1024;
     const sizes = ['B', 'KB', 'MB', 'GB'];
     const i = Math.floor(Math.log(bytes) / Math.log(k));
     return `${(bytes / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`;
-}
-
-function showToast(message, type = 'info') {
-    let container = document.querySelector('.toast-container');
-    if (!container) {
-        container = document.createElement('div');
-        container.className = 'toast-container';
-        document.body.appendChild(container);
-    }
-
-    const toast = document.createElement('div');
-    toast.className = `toast ${type}`;
-    toast.textContent = message;
-    container.appendChild(toast);
-
-    setTimeout(() => toast.remove(), 3000);
 }

@@ -58,7 +58,7 @@ async function handleRoute() {
     // Update active nav link
     document.querySelectorAll('.nav-links a').forEach(link => {
         const href = link.getAttribute('href');
-        if (href === hash || (href !== '#/' && hash.startsWith(href))) {
+        if (href === hash || (href !== '#/' && (hash === href || hash.startsWith(href + '/')))) {
             link.classList.add('active');
         } else {
             link.classList.remove('active');

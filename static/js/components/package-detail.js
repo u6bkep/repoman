@@ -280,8 +280,8 @@ async function handleBuild() {
     try {
         const result = await api.packages.build(currentPkg);
         showToast(`Build started for ${currentPkg}`, 'success');
-        if (result.build_id) {
-            navigate(`/builds/${result.build_id}`);
+        if (result.id) {
+            navigate(`/builds/${result.id}`);
         } else {
             await loadPackageInfo(currentPkg);
             await loadBuilds(currentPkg);
