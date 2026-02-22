@@ -380,6 +380,12 @@ h3 {
     color: var(--text-secondary);
 }
 
+.attention-header {
+    display: flex;
+    justify-content: flex-end;
+    margin-bottom: 0.75rem;
+}
+
 .package-item .actions {
     display: flex;
     gap: 0.5rem;

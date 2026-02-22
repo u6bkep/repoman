@@ -38,12 +38,8 @@ check() {
 package() {
     cd "$pkgname-$pkgver"
 
-    # Install binary
+    # Install binary (static assets are embedded)
     install -Dm755 "target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
-
-    # Install static files for web UI
-    install -dm755 "$pkgdir/usr/share/$pkgname/static"
-    cp -r static/* "$pkgdir/usr/share/$pkgname/static/"
 
     # Install default config
     install -Dm644 /dev/stdin "$pkgdir/etc/repoman/config.toml" << 'EOF'

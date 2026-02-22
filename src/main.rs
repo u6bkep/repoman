@@ -1,4 +1,5 @@
 mod api;
+mod assets;
 mod aur;
 mod build;
 mod config;
@@ -11,7 +12,6 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tower_http::services::ServeDir;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::api::{AppState, SharedState};
@@ -346,7 +346,7 @@ async fn run_server(state: SharedState, config: &Config) -> Result<()> {
     }
 
     let app = api::router(state)
-        .fallback_service(ServeDir::new("static"));
+        .fallback(assets::static_handler);
 
     let listener = tokio::net::TcpListener::bind(&config.server.listen).await?;
     tracing::info!("Server listening on {}", config.server.listen);

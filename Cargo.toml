@@ -9,7 +9,10 @@ license = "MIT"
 # Web framework
 axum = { version = "0.8", features = ["ws", "macros"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["fs", "cors", "trace"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# Embedded static assets
+rust-embed = { version = "8", features = ["mime-guess"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

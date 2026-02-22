@@ -54,6 +54,7 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/packages/{pkgbase}/deps", get(get_package_deps))
         .route("/api/packages/{pkgbase}/check-update", post(check_package_update))
         .route("/api/packages/check-updates", post(check_updates))
+        .route("/api/packages/approve-and-build", post(approve_and_build_updates))
         .route("/api/packages/orphans", get(list_orphans))
         // AUR endpoints
         .route("/api/aur/search", get(search_aur))
@@ -258,6 +259,14 @@ pub struct QueueBuildsResponse {
 pub struct QueueSkipped {
     pub pkgbase: String,
     pub reason: String,
+}
+
+#[derive(Serialize)]
+pub struct ApproveAndBuildResponse {
+    pub approved: Vec<String>,
+    pub build_order: Vec<String>,
+    pub build_ids: Vec<String>,
+    pub skipped: Vec<QueueSkipped>,
 }
 
 #[derive(Serialize)]
@@ -986,6 +995,52 @@ async fn approve_package(
         .await?;
 
     Ok(StatusCode::OK)
+}
+
+/// Approve all update_available/pending_review packages and queue builds
+async fn approve_and_build_updates(
+    State(state): State<SharedState>,
+) -> Result<Json<ApproveAndBuildResponse>, AppError> {
+    let mut approved_pkgbases: Vec<String> = Vec::new();
+
+    // Approve all updatable packages under one write lock
+    {
+        let state_write = state.write().await;
+        let packages = state_write.db.list_packages().await?;
+        for pkg in &packages {
+            if pkg.status == PackageStatus::UpdateAvailable
+                || pkg.status == PackageStatus::PendingReview
+            {
+                state_write
+                    .db
+                    .approve_package(&pkg.pkgbase, false, None)
+                    .await?;
+                approved_pkgbases.push(pkg.pkgbase.clone());
+            }
+        }
+    }
+
+    if approved_pkgbases.is_empty() {
+        return Ok(Json(ApproveAndBuildResponse {
+            approved: vec![],
+            build_order: vec![],
+            build_ids: vec![],
+            skipped: vec![],
+        }));
+    }
+
+    // Queue builds using the existing queue_builds logic
+    let queue_req = QueueBuildsRequest {
+        packages: approved_pkgbases.clone(),
+    };
+    let queue_resp = queue_builds_inner(&state, queue_req).await?;
+
+    Ok(Json(ApproveAndBuildResponse {
+        approved: approved_pkgbases,
+        build_order: queue_resp.build_order,
+        build_ids: queue_resp.build_ids,
+        skipped: queue_resp.skipped,
+    }))
 }
 
 async fn reject_package(
@@ -2007,6 +2062,13 @@ async fn queue_builds(
     State(state): State<SharedState>,
     Json(req): Json<QueueBuildsRequest>,
 ) -> Result<Json<QueueBuildsResponse>, AppError> {
+    queue_builds_inner(&state, req).await.map(Json)
+}
+
+async fn queue_builds_inner(
+    state: &SharedState,
+    req: QueueBuildsRequest,
+) -> Result<QueueBuildsResponse, AppError> {
     if req.packages.is_empty() {
         return Err(AppError::bad_request("No packages specified"));
     }
@@ -2060,11 +2122,11 @@ async fn queue_builds(
     }
 
     if packages_to_build.is_empty() {
-        return Ok(Json(QueueBuildsResponse {
+        return Ok(QueueBuildsResponse {
             build_order: vec![],
             build_ids: vec![],
             skipped,
-        }));
+        });
     }
 
     // Build dependency graph for topological sort
@@ -2162,11 +2224,11 @@ async fn queue_builds(
         run_queued_builds(state_clone, pkg_info, deps_graph_clone, config).await;
     });
 
-    Ok(Json(QueueBuildsResponse {
+    Ok(QueueBuildsResponse {
         build_order,
         build_ids,
         skipped,
-    }))
+    })
 }
 
 /// Topological sort using Kahn's algorithm

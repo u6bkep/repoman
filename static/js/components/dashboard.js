@@ -32,7 +32,7 @@ async function loadStatus() {
                     <div class="stat-label">In Repo</div>
                 </div>
                 <div class="stat-item">
-                    <div class="stat-value">${formatBytes(status.repo?.size || 0)}</div>
+                    <div class="stat-value">${formatBytes(status.repo?.total_size || 0)}</div>
                     <div class="stat-label">Repo Size</div>
                 </div>
                 <div class="stat-item ${orphanCount > 0 ? 'warning' : ''}">
@@ -68,7 +68,14 @@ async function loadAttentionNeeded() {
             return;
         }
 
-        container.innerHTML = attention.map(pkg => `
+        const updatable = attention.filter(pkg => pkg.status === 'update_available' || pkg.status === 'pending_review');
+        const headerHtml = updatable.length > 0 ? `
+            <div class="attention-header">
+                <button class="btn btn-primary" id="approve-build-all">Approve &amp; Build All (${updatable.length})</button>
+            </div>
+        ` : '';
+
+        container.innerHTML = headerHtml + attention.map(pkg => `
             <div class="package-item" data-pkg="${escapeHtml(pkg.pkgbase)}">
                 <span class="name">${escapeHtml(pkg.pkgbase)}</span>
                 <span class="version">${escapeHtml(pkg.pkgver || '-')}</span>
@@ -89,6 +96,22 @@ async function loadAttentionNeeded() {
                 navigate(`/packages/${item.dataset.pkg}`);
             });
         });
+
+        const approveAllBtn = document.getElementById('approve-build-all');
+        if (approveAllBtn) {
+            approveAllBtn.addEventListener('click', async () => {
+                approveAllBtn.disabled = true;
+                approveAllBtn.textContent = 'Approving & building...';
+                try {
+                    const result = await api.packages.approveAndBuild();
+                    const msg = `Approved ${result.approved.length}, queued ${result.build_order.length} builds`;
+                    showToast(result.skipped.length ? `${msg} (${result.skipped.length} skipped)` : msg, 'success');
+                } catch (error) {
+                    showToast(`Error: ${error.message}`, 'error');
+                }
+                await loadAttentionNeeded();
+            });
+        }
 
         container.querySelectorAll('[data-action]').forEach(btn => {
             btn.addEventListener('click', async (e) => {

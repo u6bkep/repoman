@@ -60,6 +60,7 @@ export const packages = {
     checkUpdate: (name) => post(`/packages/${encodeURIComponent(name)}/check-update`),
     mark: (name, installReason) => post(`/packages/${encodeURIComponent(name)}/mark`, { install_reason: installReason }),
     deps: (name) => get(`/packages/${encodeURIComponent(name)}/deps`),
+    approveAndBuild: () => post('/packages/approve-and-build'),
 };
 
 // Build operations
