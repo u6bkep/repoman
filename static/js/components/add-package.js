@@ -1,7 +1,7 @@
 // Add Package component
 import * as api from '../api.js';
 import { navigate } from '../router.js';
-import { showToast } from './utils.js';
+import { showToast, escapeHtml } from './utils.js';
 
 export async function init() {
     const searchInput = document.getElementById('aur-search');
@@ -39,10 +39,10 @@ async function searchAur(query) {
         container.innerHTML = results.map(pkg => `
             <div class="search-result-item">
                 <div class="info">
-                    <h4>${pkg.Name}</h4>
-                    <p>${pkg.Description || 'No description'}</p>
+                    <h4>${escapeHtml(pkg.Name)}</h4>
+                    <p>${escapeHtml(pkg.Description || 'No description')}</p>
                     <div class="meta">
-                        <span>v${pkg.Version}</span>
+                        <span>v${escapeHtml(pkg.Version)}</span>
                         <span>${pkg.NumVotes} votes</span>
                         ${pkg.OutOfDate ? '<span style="color: var(--warning)">Out of date</span>' : ''}
                         ${pkg.tracked ? '<span style="color: var(--success)">Already tracked</span>' : ''}
@@ -50,8 +50,8 @@ async function searchAur(query) {
                 </div>
                 <div>
                     ${pkg.tracked ?
-                        `<button class="btn" data-action="view" data-pkg="${pkg.PackageBase}">View</button>` :
-                        `<button class="btn btn-primary" data-action="add" data-pkg="${pkg.Name}">Add</button>`
+                        `<button class="btn" data-action="view" data-pkg="${escapeHtml(pkg.PackageBase)}">View</button>` :
+                        `<button class="btn btn-primary" data-action="add" data-pkg="${escapeHtml(pkg.Name)}">Add</button>`
                     }
                 </div>
             </div>

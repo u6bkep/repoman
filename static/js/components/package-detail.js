@@ -7,6 +7,9 @@ let currentPkg = null;
 let currentReason = null;
 
 export async function init(params) {
+    currentPkg = null;
+    currentReason = null;
+
     const { name } = params;
     currentPkg = name;
 

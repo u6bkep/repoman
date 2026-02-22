@@ -958,6 +958,34 @@ a.dep-external::after {
     color: var(--bg-primary);
 }
 
+/* Tables */
+.builds-table,
+.data-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1rem 0;
+}
+
+.builds-table th,
+.builds-table td,
+.data-table th,
+.data-table td {
+    padding: 0.5rem 0.75rem;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+}
+
+.builds-table th,
+.data-table th {
+    font-weight: 600;
+    color: var(--text-secondary);
+}
+
+.builds-table tr:hover,
+.data-table tr:hover {
+    background: var(--bg-tertiary);
+}
+
 /* Responsive */
 @media (max-width: 768px) {
     nav {

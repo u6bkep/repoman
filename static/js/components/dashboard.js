@@ -1,7 +1,7 @@
 // Dashboard component
 import * as api from '../api.js';
 import { navigate } from '../router.js';
-import { showToast, formatStatus } from './utils.js';
+import { showToast, formatStatus, formatBytes, escapeHtml } from './utils.js';
 
 export async function init() {
     await Promise.all([
@@ -69,15 +69,15 @@ async function loadAttentionNeeded() {
         }
 
         container.innerHTML = attention.map(pkg => `
-            <div class="package-item" data-pkg="${pkg.pkgbase}">
-                <span class="name">${pkg.pkgbase}</span>
-                <span class="version">${pkg.pkgver || '-'}</span>
+            <div class="package-item" data-pkg="${escapeHtml(pkg.pkgbase)}">
+                <span class="name">${escapeHtml(pkg.pkgbase)}</span>
+                <span class="version">${escapeHtml(pkg.pkgver || '-')}</span>
                 <span class="status-badge ${pkg.status}">${formatStatus(pkg.status)}</span>
                 <div class="actions">
                     ${pkg.status === 'pending_review' || pkg.status === 'update_available' ?
-                        `<button class="btn btn-sm btn-primary" data-action="approve" data-pkg="${pkg.pkgbase}">Approve</button>` : ''}
+                        `<button class="btn btn-sm btn-primary" data-action="approve" data-pkg="${escapeHtml(pkg.pkgbase)}">Approve</button>` : ''}
                     ${pkg.status === 'approved' || pkg.status === 'update_available' ?
-                        `<button class="btn btn-sm btn-success" data-action="build" data-pkg="${pkg.pkgbase}">Build</button>` : ''}
+                        `<button class="btn btn-sm btn-success" data-action="build" data-pkg="${escapeHtml(pkg.pkgbase)}">Build</button>` : ''}
                 </div>
             </div>
         `).join('');
@@ -105,10 +105,11 @@ async function loadAttentionNeeded() {
                         await api.packages.build(pkg);
                         showToast(`Build started for ${pkg}`, 'success');
                     }
-                    await loadAttentionNeeded();
                 } catch (error) {
                     showToast(`Error: ${error.message}`, 'error');
                     btn.disabled = false;
+                } finally {
+                    await loadAttentionNeeded();
                 }
             });
         });
@@ -117,10 +118,3 @@ async function loadAttentionNeeded() {
     }
 }
 
-function formatBytes(bytes) {
-    if (bytes === 0) return '0 B';
-    const k = 1024;
-    const sizes = ['B', 'KB', 'MB', 'GB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return `${(bytes / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`;
-}
