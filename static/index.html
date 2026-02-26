@@ -87,6 +87,7 @@
                 <div class="pkg-actions">
                     <button id="btn-approve" class="btn btn-primary">Approve</button>
                     <button id="btn-build" class="btn btn-success">Build</button>
+                    <button id="btn-approve-build-all" class="btn btn-success" style="display: none;">Approve &amp; Build All Pending</button>
                     <button id="btn-check-update" class="btn">Check Update</button>
                     <button id="btn-remove" class="btn btn-danger">Remove</button>
                 </div>
@@ -153,7 +154,7 @@
 
             <div class="add-options">
                 <label class="checkbox-label">
-                    <input type="checkbox" id="add-with-deps">
+                    <input type="checkbox" id="add-with-deps" checked>
                     <span>Also add missing AUR dependencies</span>
                 </label>
             </div>

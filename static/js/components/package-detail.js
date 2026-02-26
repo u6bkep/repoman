@@ -28,6 +28,7 @@ export async function init(params) {
     // Setup action buttons
     document.getElementById('btn-approve').addEventListener('click', handleApprove);
     document.getElementById('btn-build').addEventListener('click', handleBuild);
+    document.getElementById('btn-approve-build-all').addEventListener('click', handleApproveAndBuildAll);
     document.getElementById('btn-check-update').addEventListener('click', handleCheckUpdate);
     document.getElementById('btn-remove').addEventListener('click', handleRemove);
     document.getElementById('btn-toggle-reason').addEventListener('click', handleToggleReason);
@@ -97,9 +98,11 @@ async function loadPackageInfo(name) {
         // Update button visibility
         const canApprove = ['pending_review', 'update_available', 'failed'].includes(pkg.status);
         const canBuild = ['approved', 'update_available'].includes(pkg.status);
+        const showApproveAndBuildAll = pkg.status === 'pending_review';
 
         document.getElementById('btn-approve').style.display = canApprove ? '' : 'none';
         document.getElementById('btn-build').style.display = canBuild ? '' : 'none';
+        document.getElementById('btn-approve-build-all').style.display = showApproveAndBuildAll ? '' : 'none';
     } catch (error) {
         showToast(`Error loading package: ${error.message}`, 'error');
     }
@@ -146,6 +149,15 @@ async function loadDeps(name) {
     const container = document.getElementById('deps-content');
     try {
         const deps = await api.packages.deps(name);
+
+        // Check for untracked AUR deps across all dep types
+        const allDeps = [
+            ...(deps.depends || []),
+            ...(deps.makedepends || []),
+            ...(deps.checkdepends || []),
+        ];
+        const untrackedAurDeps = allDeps.filter(d => d.source === 'aur' && d.in_repo === false);
+        showMissingDepsBanner(name, untrackedAurDeps);
 
         const renderDepList = (title, depList, showSource = true) => {
             if (!depList || depList.length === 0) return '';
@@ -342,4 +354,62 @@ async function handleToggleReason() {
     } finally {
         btn.disabled = false;
     }
+}
+
+async function handleApproveAndBuildAll() {
+    const btn = document.getElementById('btn-approve-build-all');
+    btn.disabled = true;
+    btn.textContent = 'Starting builds...';
+    try {
+        await api.packages.approveAndBuild();
+        showToast('Approved and queued builds for all pending packages', 'success');
+        await loadPackageInfo(currentPkg);
+    } catch (error) {
+        showToast(`Error: ${error.message}`, 'error');
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Approve & Build All Pending';
+    }
+}
+
+function showMissingDepsBanner(pkgbase, untrackedDeps) {
+    // Remove any existing banner
+    const existing = document.getElementById('missing-deps-banner');
+    if (existing) existing.remove();
+
+    if (!untrackedDeps || untrackedDeps.length === 0) return;
+
+    const banner = document.createElement('div');
+    banner.id = 'missing-deps-banner';
+    banner.className = 'upstream-warning local-only';
+    banner.innerHTML = `
+        <strong>Info:</strong> This package has ${untrackedDeps.length} untracked AUR ${untrackedDeps.length === 1 ? 'dependency' : 'dependencies'}
+        <span style="color: var(--text-muted); font-size: 0.85em;">(${untrackedDeps.map(d => escapeHtml(d.name)).join(', ')})</span>
+        <div style="margin-top: 0.5rem;">
+            <button id="btn-add-missing-deps" class="btn btn-primary btn-sm">Add Missing Dependencies</button>
+        </div>
+    `;
+
+    // Insert above the tabs
+    const tabs = document.querySelector('.tabs');
+    if (tabs) {
+        tabs.parentNode.insertBefore(banner, tabs);
+    }
+
+    banner.querySelector('#btn-add-missing-deps').addEventListener('click', async () => {
+        const btn = banner.querySelector('#btn-add-missing-deps');
+        btn.disabled = true;
+        btn.textContent = 'Adding...';
+        try {
+            await api.packages.add(pkgbase, { withDeps: true });
+            showToast('Added missing dependencies', 'success');
+            // Refresh the page to show newly added deps
+            await loadDeps(pkgbase);
+            await loadPackageInfo(pkgbase);
+        } catch (error) {
+            showToast(`Error: ${error.message}`, 'error');
+            btn.disabled = false;
+            btn.textContent = 'Add Missing Dependencies';
+        }
+    });
 }
