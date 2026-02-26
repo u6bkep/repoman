@@ -26,7 +26,14 @@
     <!-- Templates -->
     <template id="tmpl-dashboard">
         <div class="dashboard">
-            <h1>Dashboard</h1>
+            <div class="page-header">
+                <h1>Dashboard</h1>
+                <div class="header-actions">
+                    <button id="check-and-build-btn" class="btn btn-primary">Check &amp; Build Updates</button>
+                    <button id="check-updates-btn" class="btn">Check Updates</button>
+                </div>
+            </div>
+            <div id="check-progress" class="check-progress" style="display:none"></div>
 
             <section class="status-cards">
                 <div class="card" id="status-overview">

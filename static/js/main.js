@@ -1,5 +1,6 @@
 // Repoman - Main entry point
 import { register, init as initRouter, render } from './router.js';
+import { connect } from './events.js';
 import * as dashboard from './components/dashboard.js';
 import * as packageList from './components/package-list.js';
 import * as packageDetail from './components/package-detail.js';
@@ -40,5 +41,8 @@ register('/settings', async () => {
 
 // Initialize router
 initRouter();
+
+// Connect SSE event bus — fire and forget; components opt in via window.addEventListener('repoman:status', ...)
+connect();
 
 console.log('Repoman UI initialized');
