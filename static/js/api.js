@@ -86,6 +86,7 @@ export const system = {
     cleanOrphans: () => post('/system/orphans/clean'),
     rebuildDb: () => post('/repo/rebuild-db'),
     checkUpdates: () => post('/packages/check-updates'),
+    checkAndBuild: () => post('/packages/check-and-build'),
     // Container management
     listContainers: () => get('/system/containers'),
     pruneContainers: () => post('/system/containers/prune'),

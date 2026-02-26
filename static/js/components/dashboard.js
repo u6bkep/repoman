@@ -7,11 +7,89 @@ export async function init() {
     await Promise.all([
         loadStatus(),
         loadAttentionNeeded(),
+        loadRecentBuilds(),
     ]);
+
+    // Wire up header action buttons
+    const checkAndBuildBtn = document.getElementById('check-and-build-btn');
+    const checkUpdatesBtn = document.getElementById('check-updates-btn');
+
+    if (checkAndBuildBtn) {
+        checkAndBuildBtn.addEventListener('click', async () => {
+            checkAndBuildBtn.disabled = true;
+            checkAndBuildBtn.textContent = 'Running...';
+            try {
+                const result = await api.system.checkAndBuild();
+                const msg = `Checked ${result.checked}, updated ${result.updated?.length ?? 0}, queued ${result.build_order?.length ?? 0} builds`;
+                showToast(result.skipped?.length ? `${msg} (${result.skipped.length} skipped)` : msg, 'success');
+            } catch (error) {
+                showToast(`Error: ${error.message}`, 'error');
+            } finally {
+                checkAndBuildBtn.disabled = false;
+                checkAndBuildBtn.textContent = 'Check & Build Updates';
+                clearProgress();
+            }
+            await Promise.all([loadAttentionNeeded(), loadStatus()]);
+        });
+    }
+
+    if (checkUpdatesBtn) {
+        checkUpdatesBtn.addEventListener('click', async () => {
+            checkUpdatesBtn.disabled = true;
+            checkUpdatesBtn.textContent = 'Checking...';
+            try {
+                await api.system.checkUpdates();
+                showToast('Update check complete', 'success');
+            } catch (error) {
+                showToast(`Error: ${error.message}`, 'error');
+            } finally {
+                checkUpdatesBtn.disabled = false;
+                checkUpdatesBtn.textContent = 'Check Updates';
+                clearProgress();
+            }
+            await Promise.all([loadAttentionNeeded(), loadStatus()]);
+        });
+    }
+
+    // SSE event handler
+    const handler = (e) => {
+        const event = e.detail;
+        if (event.type === 'build_completed' || event.type === 'package_status_changed') {
+            loadAttentionNeeded();
+            loadRecentBuilds();
+        }
+        if (event.type === 'check_updates_progress') {
+            updateProgress(event.checked, event.total, event.current);
+        }
+        if (event.type === 'check_updates_complete') {
+            clearProgress();
+            loadAttentionNeeded();
+            loadStatus();
+        }
+    };
+    window.addEventListener('repoman:status', handler);
+
+    // Return cleanup function
+    return () => window.removeEventListener('repoman:status', handler);
+}
+
+function updateProgress(checked, total, current) {
+    const el = document.getElementById('check-progress');
+    if (!el) return;
+    el.style.display = '';
+    el.textContent = `Checking ${checked}/${total}${current ? `: ${current}` : ''}...`;
+}
+
+function clearProgress() {
+    const el = document.getElementById('check-progress');
+    if (!el) return;
+    el.style.display = 'none';
+    el.textContent = '';
 }
 
 async function loadStatus() {
     const container = document.getElementById('status-overview');
+    if (!container) return;
     try {
         const [status, orphans] = await Promise.all([
             api.system.status(),
@@ -56,6 +134,7 @@ async function loadStatus() {
 
 async function loadAttentionNeeded() {
     const container = document.getElementById('attention-list');
+    if (!container) return;
     try {
         const packages = await api.packages.list();
 
@@ -89,7 +168,7 @@ async function loadAttentionNeeded() {
             </div>
         `).join('');
 
-        // Add click handlers
+        // Click to navigate
         container.querySelectorAll('.package-item').forEach(item => {
             item.addEventListener('click', (e) => {
                 if (e.target.tagName === 'BUTTON') return;
@@ -141,3 +220,38 @@ async function loadAttentionNeeded() {
     }
 }
 
+async function loadRecentBuilds() {
+    const container = document.getElementById('recent-builds-list');
+    if (!container) return;
+    try {
+        const packages = await api.packages.list();
+
+        // Show packages that are currently building or recently failed — they have active build history
+        const active = packages.filter(pkg => ['building', 'failed'].includes(pkg.status));
+
+        if (active.length === 0) {
+            container.innerHTML = '<p class="empty-state">No recent builds. See each package\'s detail page for build history.</p>';
+            return;
+        }
+
+        container.innerHTML = active.map(pkg => `
+            <div class="package-item" data-pkg="${escapeHtml(pkg.pkgbase)}">
+                <span class="name">${escapeHtml(pkg.pkgbase)}</span>
+                <span class="version">${escapeHtml(pkg.pkgver || '-')}</span>
+                <span class="status-badge ${pkg.status}">${formatStatus(pkg.status)}</span>
+                <div class="actions">
+                    <a href="#/packages/${escapeHtml(pkg.pkgbase)}" class="btn btn-sm">View</a>
+                </div>
+            </div>
+        `).join('');
+
+        container.querySelectorAll('.package-item').forEach(item => {
+            item.addEventListener('click', (e) => {
+                if (e.target.tagName === 'A' || e.target.tagName === 'BUTTON') return;
+                navigate(`/packages/${item.dataset.pkg}`);
+            });
+        });
+    } catch (error) {
+        container.innerHTML = `<p class="error">Failed to load builds: ${error.message}</p>`;
+    }
+}
