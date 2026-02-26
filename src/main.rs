@@ -214,6 +214,9 @@ async fn main() -> Result<()> {
 
     let db = Database::connect(&db_path).await?;
 
+    // Create broadcast channel for SSE events
+    let (events_tx, _events_rx) = tokio::sync::broadcast::channel(256);
+
     // Create shared state
     let state: SharedState = Arc::new(RwLock::new(AppState {
         db,
@@ -223,6 +226,7 @@ async fn main() -> Result<()> {
         repo: RepoManager::new(config.clone()),
         build_stages: std::collections::HashMap::new(),
         repo_mutex: Arc::new(tokio::sync::Mutex::new(())),
+        events: events_tx,
     }));
 
     let json_output = cli.json;

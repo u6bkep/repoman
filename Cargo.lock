@@ -1741,6 +1741,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-stream",
  "toml 0.8.23",
  "toml_edit",
  "tower",
@@ -2620,6 +2621,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

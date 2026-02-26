@@ -4,14 +4,19 @@ use axum::{
         Path, Query, State, WebSocketUpgrade,
     },
     http::StatusCode,
-    response::IntoResponse,
+    response::{
+        sse::{Event as SseEvent, KeepAlive, Sse},
+        IntoResponse,
+    },
     routing::{delete, get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncSeekExt};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::StreamExt;
 
 use crate::aur::{AurClient, AurGit, read_srcinfo};
 use crate::build::{vercmp, BuildSystem};
@@ -19,6 +24,39 @@ use crate::config::Config;
 use crate::db::Database;
 use crate::models::{BuildStage, InstallReason, Package, PackageName, PackageStatus};
 use crate::repo::RepoManager;
+
+/// Server-sent event for real-time status updates
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ServerEvent {
+    PackageStatusChanged {
+        pkgbase: String,
+        new_status: String,
+    },
+    BuildStarted {
+        build_id: String,
+        pkgbase: String,
+    },
+    BuildStageChanged {
+        build_id: String,
+        pkgbase: String,
+        stage: String,
+    },
+    BuildCompleted {
+        build_id: String,
+        pkgbase: String,
+        status: String,
+    },
+    CheckUpdatesProgress {
+        checked: usize,
+        total: usize,
+        current: String,
+    },
+    CheckUpdatesComplete {
+        checked: usize,
+        updated: Vec<String>,
+    },
+}
 
 /// Shared application state
 pub struct AppState {
@@ -31,6 +69,8 @@ pub struct AppState {
     pub build_stages: std::collections::HashMap<String, BuildStage>,
     /// Mutex for serializing repo-add/repo-remove operations
     pub repo_mutex: Arc<Mutex<()>>,
+    /// Broadcast channel for SSE events
+    pub events: broadcast::Sender<ServerEvent>,
 }
 
 pub type SharedState = Arc<RwLock<AppState>>;
@@ -80,7 +120,40 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/system/images", get(list_images))
         .route("/api/system/images/prune", post(prune_images))
         .route("/api/system/config/template", get(config_template))
+        // SSE event stream
+        .route("/api/events", get(sse_events))
+        // Combined check-and-build endpoint
+        .route("/api/packages/check-and-build", post(check_and_build))
         .with_state(state)
+}
+
+// ==================== SSE handler ====================
+
+async fn sse_events(
+    State(state): State<SharedState>,
+) -> Sse<impl tokio_stream::Stream<Item = Result<SseEvent, std::convert::Infallible>>> {
+    let rx = {
+        let state_read = state.read().await;
+        state_read.events.subscribe()
+    };
+
+    let stream = BroadcastStream::new(rx).filter_map(|result| match result {
+        Ok(event) => {
+            let json = serde_json::to_string(&event).ok()?;
+            Some(Ok(SseEvent::default().data(json)))
+        }
+        Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+            tracing::warn!("SSE client lagged, skipped {} events", n);
+            None
+        }
+    });
+
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// Emit a server event on the broadcast channel. Ignores send errors (no receivers).
+fn emit_event(tx: &broadcast::Sender<ServerEvent>, event: ServerEvent) {
+    let _ = tx.send(event);
 }
 
 // ==================== Request/Response types ====================
@@ -263,6 +336,16 @@ pub struct QueueSkipped {
 
 #[derive(Serialize)]
 pub struct ApproveAndBuildResponse {
+    pub approved: Vec<String>,
+    pub build_order: Vec<String>,
+    pub build_ids: Vec<String>,
+    pub skipped: Vec<QueueSkipped>,
+}
+
+#[derive(Serialize)]
+pub struct CheckAndBuildResponse {
+    pub checked: usize,
+    pub updated: Vec<String>,
     pub approved: Vec<String>,
     pub build_order: Vec<String>,
     pub build_ids: Vec<String>,
@@ -545,6 +628,25 @@ async fn add_package(
         }
     }
 
+    // Validate base image when with_deps=true (dep detection requires the container)
+    if req.with_deps {
+        let state_read = state.read().await;
+        match state_read.build.image_exists() {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(AppError::bad_request(
+                    "Base container image required for dependency detection. Run rebuild-image first.",
+                ));
+            }
+            Err(e) => {
+                return Err(AppError::internal(format!(
+                    "Failed to check base image: {}. Is Podman installed and running?",
+                    e
+                )));
+            }
+        }
+    }
+
     // Determine install reason for the main package
     let install_reason = if req.as_dependency {
         InstallReason::Dependency
@@ -769,6 +871,13 @@ async fn add_package_outside_lock(
         }
 
         state_write.db.insert_package_with_names(&pkg, &pkg_names).await?;
+        emit_event(
+            &state_write.events,
+            ServerEvent::PackageStatusChanged {
+                pkgbase: pkgbase.clone(),
+                new_status: "pending_review".to_string(),
+            },
+        );
     }
 
     Ok((pkg, version))
@@ -1015,6 +1124,13 @@ async fn approve_and_build_updates(
                     .db
                     .approve_package(&pkg.pkgbase, false, None)
                     .await?;
+                emit_event(
+                    &state_write.events,
+                    ServerEvent::PackageStatusChanged {
+                        pkgbase: pkg.pkgbase.clone(),
+                        new_status: "approved".to_string(),
+                    },
+                );
                 approved_pkgbases.push(pkg.pkgbase.clone());
             }
         }
@@ -1036,6 +1152,65 @@ async fn approve_and_build_updates(
     let queue_resp = queue_builds_inner(&state, queue_req).await?;
 
     Ok(Json(ApproveAndBuildResponse {
+        approved: approved_pkgbases,
+        build_order: queue_resp.build_order,
+        build_ids: queue_resp.build_ids,
+        skipped: queue_resp.skipped,
+    }))
+}
+
+/// Combined check-updates + approve-and-build endpoint
+async fn check_and_build(
+    State(state): State<SharedState>,
+) -> Result<Json<CheckAndBuildResponse>, AppError> {
+    // Step 1: Check for updates
+    let check_result = check_updates_inner(&state).await?;
+
+    // Step 2: Approve and build (reuse approve_and_build logic)
+    let mut approved_pkgbases: Vec<String> = Vec::new();
+
+    {
+        let state_write = state.write().await;
+        let packages = state_write.db.list_packages().await?;
+        for pkg in &packages {
+            if pkg.status == PackageStatus::UpdateAvailable
+                || pkg.status == PackageStatus::PendingReview
+            {
+                state_write
+                    .db
+                    .approve_package(&pkg.pkgbase, false, None)
+                    .await?;
+                emit_event(
+                    &state_write.events,
+                    ServerEvent::PackageStatusChanged {
+                        pkgbase: pkg.pkgbase.clone(),
+                        new_status: "approved".to_string(),
+                    },
+                );
+                approved_pkgbases.push(pkg.pkgbase.clone());
+            }
+        }
+    }
+
+    if approved_pkgbases.is_empty() {
+        return Ok(Json(CheckAndBuildResponse {
+            checked: check_result.checked,
+            updated: check_result.updated,
+            approved: vec![],
+            build_order: vec![],
+            build_ids: vec![],
+            skipped: vec![],
+        }));
+    }
+
+    let queue_req = QueueBuildsRequest {
+        packages: approved_pkgbases.clone(),
+    };
+    let queue_resp = queue_builds_inner(&state, queue_req).await?;
+
+    Ok(Json(CheckAndBuildResponse {
+        checked: check_result.checked,
+        updated: check_result.updated,
         approved: approved_pkgbases,
         build_order: queue_resp.build_order,
         build_ids: queue_resp.build_ids,
@@ -1117,6 +1292,20 @@ async fn trigger_build(
             .db
             .update_package_status(&pkg.pkgbase, PackageStatus::Building)
             .await?;
+        emit_event(
+            &state_write.events,
+            ServerEvent::BuildStarted {
+                build_id: build_id.clone(),
+                pkgbase: pkg.pkgbase.clone(),
+            },
+        );
+        emit_event(
+            &state_write.events,
+            ServerEvent::PackageStatusChanged {
+                pkgbase: pkg.pkgbase.clone(),
+                new_status: "building".to_string(),
+            },
+        );
 
         let config = state_write.config.clone();
         (pkg, config, log_path, build_id)
@@ -1146,10 +1335,19 @@ async fn trigger_build(
     }))
 }
 
-/// Helper to update build stage in memory
-async fn set_build_stage(state: &SharedState, build_id: &str, stage: BuildStage) {
+/// Helper to update build stage in memory and emit SSE event
+async fn set_build_stage(state: &SharedState, build_id: &str, pkgbase: &str, stage: BuildStage) {
     let mut state_write = state.write().await;
+    let stage_str = stage.to_string();
     state_write.build_stages.insert(build_id.to_string(), stage);
+    emit_event(
+        &state_write.events,
+        ServerEvent::BuildStageChanged {
+            build_id: build_id.to_string(),
+            pkgbase: pkgbase.to_string(),
+            stage: stage_str,
+        },
+    );
 }
 
 /// Helper to remove build stage from memory (when build completes)
@@ -1170,7 +1368,7 @@ async fn run_build_task(
     tracing::info!("Starting build task for {} (build {})", pkgbase, build_id);
 
     // Initialize stage tracking
-    set_build_stage(&state, &build_id, BuildStage::Starting).await;
+    set_build_stage(&state, &build_id, &pkgbase, BuildStage::Starting).await;
 
     // Update status to Running
     {
@@ -1238,14 +1436,14 @@ async fn run_build_task(
                 packages.len()
             );
 
-            set_build_stage(&state, &build_id, BuildStage::MovingToRepo).await;
+            set_build_stage(&state, &build_id, &pkgbase, BuildStage::MovingToRepo).await;
 
             let build_system = BuildSystem::new(config.clone());
 
             match build_system.move_to_repo(&packages) {
                 Ok(repo_packages) => {
                     // Add to repo database under repo mutex
-                    set_build_stage(&state, &build_id, BuildStage::UpdatingIndex).await;
+                    set_build_stage(&state, &build_id, &pkgbase, BuildStage::UpdatingIndex).await;
 
                     let repo_add_result = {
                         let _repo_lock = repo_mutex.lock().await;
@@ -1254,7 +1452,7 @@ async fn run_build_task(
 
                     if let Err(e) = repo_add_result {
                         tracing::error!("repo-add failed: {}", e);
-                        set_build_stage(&state, &build_id, BuildStage::Failed).await;
+                        set_build_stage(&state, &build_id, &pkgbase, BuildStage::Failed).await;
                         update_build_failed(
                             &state,
                             &build_id,
@@ -1280,7 +1478,7 @@ async fn run_build_task(
                         }
                     };
 
-                    set_build_stage(&state, &build_id, BuildStage::Complete).await;
+                    set_build_stage(&state, &build_id, &pkgbase, BuildStage::Complete).await;
 
                     let state_write = state.write().await;
                     if let Err(e) = state_write
@@ -1312,13 +1510,28 @@ async fn run_build_task(
                             e
                         );
                     }
+                    emit_event(
+                        &state_write.events,
+                        ServerEvent::BuildCompleted {
+                            build_id: build_id.clone(),
+                            pkgbase: pkgbase.clone(),
+                            status: "success".to_string(),
+                        },
+                    );
+                    emit_event(
+                        &state_write.events,
+                        ServerEvent::PackageStatusChanged {
+                            pkgbase: pkgbase.clone(),
+                            new_status: "up_to_date".to_string(),
+                        },
+                    );
                     drop(state_write);
 
                     clear_build_stage(&state, &build_id).await;
                     tracing::info!("Build {} completed successfully", build_id);
                 }
                 Err(e) => {
-                    set_build_stage(&state, &build_id, BuildStage::Failed).await;
+                    set_build_stage(&state, &build_id, &pkgbase, BuildStage::Failed).await;
                     update_build_failed(
                         &state,
                         &build_id,
@@ -1333,14 +1546,14 @@ async fn run_build_task(
         Ok(Err(e)) => {
             // Build command failed
             tracing::error!("Build failed for {}: {}", pkgbase, e);
-            set_build_stage(&state, &build_id, BuildStage::Failed).await;
+            set_build_stage(&state, &build_id, &pkgbase, BuildStage::Failed).await;
             update_build_failed(&state, &build_id, &pkgbase, &e.to_string()).await;
             clear_build_stage(&state, &build_id).await;
         }
         Err(e) => {
             // Task panicked
             tracing::error!("Build task panicked for {}: {}", pkgbase, e);
-            set_build_stage(&state, &build_id, BuildStage::Failed).await;
+            set_build_stage(&state, &build_id, &pkgbase, BuildStage::Failed).await;
             update_build_failed(
                 &state,
                 &build_id,
@@ -1375,6 +1588,21 @@ async fn update_build_failed(state: &SharedState, build_id: &str, pkgbase: &str,
             e
         );
     }
+    emit_event(
+        &state_write.events,
+        ServerEvent::BuildCompleted {
+            build_id: build_id.to_string(),
+            pkgbase: pkgbase.to_string(),
+            status: "failed".to_string(),
+        },
+    );
+    emit_event(
+        &state_write.events,
+        ServerEvent::PackageStatusChanged {
+            pkgbase: pkgbase.to_string(),
+            new_status: "failed".to_string(),
+        },
+    );
 }
 
 async fn list_builds(
@@ -1601,60 +1829,176 @@ async fn get_package_deps(
 async fn check_updates(
     State(state): State<SharedState>,
 ) -> Result<Json<CheckUpdatesResponse>, AppError> {
-    // Collect package list under brief read lock
-    let packages = {
+    check_updates_inner(&state).await.map(Json)
+}
+
+/// Inner check_updates logic, reusable for the combined check-and-build endpoint
+async fn check_updates_inner(
+    state: &SharedState,
+) -> Result<CheckUpdatesResponse, AppError> {
+    // Collect package list and event sender under brief read lock
+    let (packages, events_tx) = {
         let state_read = state.read().await;
-        state_read.db.list_packages().await?
+        let pkgs = state_read.db.list_packages().await?;
+        let tx = state_read.events.clone();
+        (pkgs, tx)
     };
 
-    let checked = packages.len();
-    let mut updated = Vec::new();
+    let total = packages.len();
+    let checked_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-    // Do all git fetch/has_updates operations outside the lock (read-only on disk)
+    // Use a semaphore to limit concurrent git fetches
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(8));
+    let mut join_set = tokio::task::JoinSet::new();
+
     for pkg in packages {
         // Don't touch the source directory while a build is actively using it
         if pkg.status == PackageStatus::Building {
+            let n = checked_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            emit_event(
+                &events_tx,
+                ServerEvent::CheckUpdatesProgress {
+                    checked: n,
+                    total,
+                    current: pkg.pkgbase.clone(),
+                },
+            );
             continue;
         }
 
-        let clone_path = std::path::Path::new(&pkg.local_path).to_path_buf();
+        let semaphore = semaphore.clone();
+        let state = state.clone();
+        let events_tx = events_tx.clone();
+        let checked_counter = checked_counter.clone();
+        let pkgbase = pkg.pkgbase.clone();
+        let local_path = pkg.local_path.clone();
+        let auto_approve = pkg.auto_approve;
+        let pkg_status = pkg.status;
 
-        if AurGit::has_updates(&clone_path)? {
-            AurGit::reset_to_remote(&clone_path)?;
-            let new_commit = AurGit::head_commit(&clone_path)?;
+        // Each task returns Option<String> — Some(pkgbase) if updated
+        join_set.spawn(async move {
+            let _permit = semaphore.acquire().await.unwrap();
 
-            // Re-parse .SRCINFO (disk I/O, no lock needed)
-            let srcinfo = read_srcinfo(&clone_path)?;
-            let pkgver = format!("{}-{}", srcinfo.pkgver, srcinfo.pkgrel);
+            let clone_path = std::path::PathBuf::from(&local_path);
 
-            // Re-acquire write lock only for the brief DB updates
-            let state_write = state.write().await;
-            state_write
-                .db
-                .update_package_commit(&pkg.pkgbase, &new_commit, Some(&pkgver))
-                .await?;
+            // Wrap blocking git operations in spawn_blocking
+            let clone_path_fetch = clone_path.clone();
+            let pkgbase_for_err = pkgbase.clone();
+            let has_updates = tokio::task::spawn_blocking(move || {
+                AurGit::has_updates(&clone_path_fetch)
+            })
+            .await
+            .map_err(|e| AppError::internal(format!("Task join error: {}", e)))?
+            .map_err(|e| AppError::internal(format!("git fetch failed for {}: {}", pkgbase_for_err, e)))?;
 
-            // Auto-approve only if the package already had an initial human review
-            // (i.e. status is UpdateAvailable, not PendingReview).
-            // PendingReview packages must be reviewed by a human first.
-            let new_status = if pkg.auto_approve && pkg.status == PackageStatus::UpdateAvailable {
-                state_write.db.approve_package(&pkg.pkgbase, true, None).await?;
-                PackageStatus::Approved
+            let result = if has_updates {
+                let clone_path_reset = clone_path.clone();
+                let pkgbase_for_err = pkgbase.clone();
+                tokio::task::spawn_blocking(move || {
+                    AurGit::reset_to_remote(&clone_path_reset)
+                })
+                .await
+                .map_err(|e| AppError::internal(format!("Task join error: {}", e)))?
+                .map_err(|e| AppError::internal(format!("git reset failed for {}: {}", pkgbase_for_err, e)))?;
+
+                let clone_path_head = clone_path.clone();
+                let pkgbase_for_err = pkgbase.clone();
+                let new_commit = tokio::task::spawn_blocking(move || {
+                    AurGit::head_commit(&clone_path_head)
+                })
+                .await
+                .map_err(|e| AppError::internal(format!("Task join error: {}", e)))?
+                .map_err(|e| AppError::internal(format!("git head_commit failed for {}: {}", pkgbase_for_err, e)))?;
+
+                // Re-parse .SRCINFO (disk I/O)
+                let clone_path_srcinfo = clone_path.clone();
+                let pkgbase_for_err = pkgbase.clone();
+                let srcinfo = tokio::task::spawn_blocking(move || {
+                    read_srcinfo(&clone_path_srcinfo)
+                })
+                .await
+                .map_err(|e| AppError::internal(format!("Task join error: {}", e)))?
+                .map_err(|e| AppError::internal(format!("srcinfo parse failed for {}: {}", pkgbase_for_err, e)))?;
+
+                let pkgver = format!("{}-{}", srcinfo.pkgver, srcinfo.pkgrel);
+
+                // Acquire write lock briefly for DB updates
+                let state_write = state.write().await;
+                state_write
+                    .db
+                    .update_package_commit(&pkgbase, &new_commit, Some(&pkgver))
+                    .await
+                    .map_err(|e| AppError::internal(format!("DB error: {}", e)))?;
+
+                let new_status = if auto_approve && pkg_status == PackageStatus::UpdateAvailable {
+                    state_write.db.approve_package(&pkgbase, true, None).await
+                        .map_err(|e| AppError::internal(format!("DB error: {}", e)))?;
+                    PackageStatus::Approved
+                } else {
+                    PackageStatus::UpdateAvailable
+                };
+
+                state_write
+                    .db
+                    .update_package_status(&pkgbase, new_status)
+                    .await
+                    .map_err(|e| AppError::internal(format!("DB error: {}", e)))?;
+
+                emit_event(
+                    &state_write.events,
+                    ServerEvent::PackageStatusChanged {
+                        pkgbase: pkgbase.clone(),
+                        new_status: new_status.to_string(),
+                    },
+                );
+                drop(state_write);
+
+                Some(pkgbase.clone())
             } else {
-                PackageStatus::UpdateAvailable
+                None
             };
 
-            state_write
-                .db
-                .update_package_status(&pkg.pkgbase, new_status)
-                .await?;
-            drop(state_write);
+            let n = checked_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            emit_event(
+                &events_tx,
+                ServerEvent::CheckUpdatesProgress {
+                    checked: n,
+                    total,
+                    current: pkgbase,
+                },
+            );
 
-            updated.push(pkg.pkgbase);
+            Ok::<Option<String>, AppError>(result)
+        });
+    }
+
+    // Collect results
+    let mut updated = Vec::new();
+    while let Some(result) = join_set.join_next().await {
+        match result {
+            Ok(Ok(Some(pkgbase))) => updated.push(pkgbase),
+            Ok(Ok(None)) => {}
+            Ok(Err(e)) => {
+                tracing::warn!("check_updates task failed: {}", e.message);
+            }
+            Err(e) => {
+                tracing::warn!("check_updates task panicked: {}", e);
+            }
         }
     }
 
-    Ok(Json(CheckUpdatesResponse { checked, updated }))
+    emit_event(
+        &events_tx,
+        ServerEvent::CheckUpdatesComplete {
+            checked: total,
+            updated: updated.clone(),
+        },
+    );
+
+    Ok(CheckUpdatesResponse {
+        checked: total,
+        updated,
+    })
 }
 
 async fn check_package_update(
@@ -1798,7 +2142,7 @@ async fn stream_build_logs(
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, AppError> {
     // Validate build exists and get log path
-    let (log_path, build_id) = {
+    let (log_path, build_id, pkgbase) = {
         let state_read = state.read().await;
         let build = state_read
             .db
@@ -1810,10 +2154,10 @@ async fn stream_build_logs(
             .log_path
             .ok_or_else(|| AppError::not_found("No log file for this build"))?;
 
-        (std::path::PathBuf::from(log_path), build.id)
+        (std::path::PathBuf::from(log_path), build.id, build.pkgbase)
     };
 
-    Ok(ws.on_upgrade(move |socket| handle_log_stream(socket, state, build_id, log_path)))
+    Ok(ws.on_upgrade(move |socket| handle_log_stream(socket, state, build_id, pkgbase, log_path)))
 }
 
 /// WebSocket message for stage changes
@@ -1842,6 +2186,7 @@ async fn handle_log_stream(
     mut socket: WebSocket,
     state: SharedState,
     build_id: String,
+    pkgbase: String,
     log_path: std::path::PathBuf,
 ) {
     tracing::info!("WebSocket connected for build {} logs", build_id);
@@ -1899,7 +2244,7 @@ async fn handle_log_stream(
                     // Check for stage change markers in the log line
                     if let Some(new_stage) = BuildStage::from_log_line(&line_buf) {
                         // Update in-memory stage tracking
-                        set_build_stage(&state, &build_id, new_stage).await;
+                        set_build_stage(&state, &build_id, &pkgbase, new_stage).await;
 
                         // Send stage change to WebSocket client if different from last sent
                         if last_sent_stage != Some(new_stage) {
@@ -2333,6 +2678,14 @@ async fn run_queued_builds(
                     Some("Skipped: dependency build failed"),
                 )
                 .await;
+            emit_event(
+                &state_write.events,
+                ServerEvent::BuildCompleted {
+                    build_id: build_id.clone(),
+                    pkgbase: pkgbase.clone(),
+                    status: "skipped".to_string(),
+                },
+            );
             drop(state_write);
 
             failed_pkgbases.insert(pkgbase);
@@ -2340,7 +2693,7 @@ async fn run_queued_builds(
         }
 
         // Initialize stage tracking
-        set_build_stage(&state, &build_id, BuildStage::Starting).await;
+        set_build_stage(&state, &build_id, &pkgbase, BuildStage::Starting).await;
 
         // Update status to Building
         {
@@ -2353,6 +2706,20 @@ async fn run_queued_builds(
                 .db
                 .update_build_status(&build_id, crate::models::BuildStatus::Running, None)
                 .await;
+            emit_event(
+                &state_write.events,
+                ServerEvent::BuildStarted {
+                    build_id: build_id.clone(),
+                    pkgbase: pkgbase.clone(),
+                },
+            );
+            emit_event(
+                &state_write.events,
+                ServerEvent::PackageStatusChanged {
+                    pkgbase: pkgbase.clone(),
+                    new_status: "building".to_string(),
+                },
+            );
         }
 
         tracing::info!("Starting queued build {} for {}", build_id, pkgbase);
@@ -2374,13 +2741,13 @@ async fn run_queued_builds(
                 // Build succeeded
                 tracing::info!("Build {} succeeded for {}", build_id, pkgbase);
 
-                set_build_stage(&state, &build_id, BuildStage::MovingToRepo).await;
+                set_build_stage(&state, &build_id, &pkgbase, BuildStage::MovingToRepo).await;
 
                 let build_system = BuildSystem::new(config.clone());
 
                 match build_system.move_to_repo(&packages) {
                     Ok(repo_packages) => {
-                        set_build_stage(&state, &build_id, BuildStage::UpdatingIndex).await;
+                        set_build_stage(&state, &build_id, &pkgbase, BuildStage::UpdatingIndex).await;
 
                         // Serialize repo-add under repo mutex
                         let repo_add_result = {
@@ -2390,7 +2757,7 @@ async fn run_queued_builds(
 
                         if let Err(e) = repo_add_result {
                             tracing::error!("repo-add failed for {}: {}", pkgbase, e);
-                            set_build_stage(&state, &build_id, BuildStage::Failed).await;
+                            set_build_stage(&state, &build_id, &pkgbase, BuildStage::Failed).await;
                             failed_pkgbases.insert(pkgbase.clone());
                             update_build_failed(
                                 &state,
@@ -2410,7 +2777,7 @@ async fn run_queued_builds(
                             .collect();
                         let outputs_json = serde_json::to_string(&outputs).unwrap_or_default();
 
-                        set_build_stage(&state, &build_id, BuildStage::Complete).await;
+                        set_build_stage(&state, &build_id, &pkgbase, BuildStage::Complete).await;
 
                         let state_write = state.write().await;
                         let _ = state_write
@@ -2425,13 +2792,28 @@ async fn run_queued_builds(
                             .db
                             .update_package_status(&pkgbase, PackageStatus::UpToDate)
                             .await;
+                        emit_event(
+                            &state_write.events,
+                            ServerEvent::BuildCompleted {
+                                build_id: build_id.clone(),
+                                pkgbase: pkgbase.clone(),
+                                status: "success".to_string(),
+                            },
+                        );
+                        emit_event(
+                            &state_write.events,
+                            ServerEvent::PackageStatusChanged {
+                                pkgbase: pkgbase.clone(),
+                                new_status: "up_to_date".to_string(),
+                            },
+                        );
                         drop(state_write);
 
                         clear_build_stage(&state, &build_id).await;
                     }
                     Err(e) => {
                         tracing::error!("Failed to move packages for {}: {}", pkgbase, e);
-                        set_build_stage(&state, &build_id, BuildStage::Failed).await;
+                        set_build_stage(&state, &build_id, &pkgbase, BuildStage::Failed).await;
                         failed_pkgbases.insert(pkgbase.clone());
                         update_build_failed(
                             &state,
@@ -2446,14 +2828,14 @@ async fn run_queued_builds(
             }
             Ok(Err(e)) => {
                 tracing::error!("Build {} failed for {}: {}", build_id, pkgbase, e);
-                set_build_stage(&state, &build_id, BuildStage::Failed).await;
+                set_build_stage(&state, &build_id, &pkgbase, BuildStage::Failed).await;
                 failed_pkgbases.insert(pkgbase.clone());
                 update_build_failed(&state, &build_id, &pkgbase, &e.to_string()).await;
                 clear_build_stage(&state, &build_id).await;
             }
             Err(e) => {
                 tracing::error!("Build task panicked for {}: {}", pkgbase, e);
-                set_build_stage(&state, &build_id, BuildStage::Failed).await;
+                set_build_stage(&state, &build_id, &pkgbase, BuildStage::Failed).await;
                 failed_pkgbases.insert(pkgbase.clone());
                 update_build_failed(
                     &state,
