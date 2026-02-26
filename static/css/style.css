@@ -412,6 +412,21 @@ select:focus {
     border-color: var(--accent);
 }
 
+.search-input {
+    padding: 0.5rem 0.75rem;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text-primary);
+    font-size: 0.875rem;
+    min-width: 180px;
+}
+
+.search-input:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
 /* Package Detail */
 .pkg-info-grid {
     display: grid;
