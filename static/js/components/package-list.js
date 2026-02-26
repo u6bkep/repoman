@@ -12,10 +12,17 @@ export async function init() {
     currentController = null;
     const statusFilter = document.getElementById('status-filter');
     const reasonFilter = document.getElementById('reason-filter');
+    const searchInput = document.getElementById('package-search');
     const checkUpdatesBtn = document.getElementById('check-updates-btn');
 
     statusFilter.addEventListener('change', () => loadPackages());
     reasonFilter.addEventListener('change', () => loadPackages());
+
+    let searchTimeout;
+    searchInput.addEventListener('input', () => {
+        clearTimeout(searchTimeout);
+        searchTimeout = setTimeout(() => loadPackages(), 200);
+    });
 
     checkUpdatesBtn.addEventListener('click', async () => {
         checkUpdatesBtn.disabled = true;
@@ -32,7 +39,70 @@ export async function init() {
         }
     });
 
+    const statusHandler = (e) => {
+        const event = e.detail;
+        if (event.type === 'package_status_changed') {
+            const row = document.querySelector(`.package-item[data-pkg="${event.pkgbase}"]`);
+            if (row) {
+                const badge = row.querySelector('.status-badge');
+                if (badge) {
+                    badge.className = `status-badge ${event.new_status}`;
+                    badge.textContent = formatStatus(event.new_status);
+                }
+                const actions = row.querySelector('.actions');
+                if (actions) {
+                    actions.innerHTML = '';
+                    if (canApprove(event.new_status)) {
+                        const approveBtn = document.createElement('button');
+                        approveBtn.className = 'btn btn-sm btn-primary';
+                        approveBtn.dataset.action = 'approve';
+                        approveBtn.dataset.pkg = event.pkgbase;
+                        approveBtn.textContent = 'Approve';
+                        actions.appendChild(approveBtn);
+                    }
+                    if (canBuild(event.new_status)) {
+                        const buildBtn = document.createElement('button');
+                        buildBtn.className = 'btn btn-sm btn-success';
+                        buildBtn.dataset.action = 'build';
+                        buildBtn.dataset.pkg = event.pkgbase;
+                        buildBtn.textContent = 'Build';
+                        actions.appendChild(buildBtn);
+                    }
+                    actions.querySelectorAll('[data-action]').forEach(btn => {
+                        btn.addEventListener('click', async (e) => {
+                            e.stopPropagation();
+                            const action = btn.dataset.action;
+                            const pkg = btn.dataset.pkg;
+                            btn.disabled = true;
+                            try {
+                                if (action === 'approve') {
+                                    await api.packages.approve(pkg);
+                                    showToast(`Approved ${pkg}`, 'success');
+                                } else if (action === 'build') {
+                                    await api.packages.build(pkg);
+                                    showToast(`Build started for ${pkg}`, 'success');
+                                }
+                                await loadPackages();
+                            } catch (error) {
+                                showToast(`Error: ${error.message}`, 'error');
+                                btn.disabled = false;
+                            }
+                        });
+                    });
+                }
+            }
+        }
+        if (event.type === 'build_completed') {
+            loadPackages();
+        }
+    };
+    window.addEventListener('repoman:status', statusHandler);
+
     await loadPackages();
+
+    return () => {
+        window.removeEventListener('repoman:status', statusHandler);
+    };
 }
 
 function sortPackages(packages) {
@@ -99,6 +169,12 @@ async function loadPackages() {
         // Apply reason filter (except orphans which is already filtered)
         if (reasonFilter && reasonFilter !== 'orphans') {
             packages = packages.filter(pkg => pkg.install_reason === reasonFilter);
+        }
+
+        // Apply search filter
+        const searchQuery = document.getElementById('package-search').value.trim().toLowerCase();
+        if (searchQuery) {
+            packages = packages.filter(pkg => pkg.pkgbase.toLowerCase().includes(searchQuery));
         }
 
         if (packages.length === 0) {
