@@ -12,19 +12,18 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncSeekExt};
-use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 
-use crate::aur::{AurClient, AurGit, read_srcinfo};
+use crate::aur::{AurClient, AurGit, DepResolver, read_srcinfo};
 use crate::build::{vercmp, BuildSystem};
-use crate::config::Config;
-use crate::db::Database;
-use crate::models::{BuildStage, InstallReason, Package, PackageName, PackageStatus};
-use crate::repo::RepoManager;
+use crate::models::{BuildStage, InstallReason, Package};
+use crate::service::status::{derive_status, DerivedStatus, StatusInputs};
+pub use crate::state::{AppState, SharedState, SrcInfoCache};
 
 /// Server-sent event for real-time status updates
 #[derive(Clone, Debug, Serialize)]
@@ -59,28 +58,6 @@ pub enum ServerEvent {
     },
 }
 
-/// Shared application state
-pub struct AppState {
-    pub db: Database,
-    pub config: Config,
-    pub aur: AurClient,
-    pub build: BuildSystem,
-    pub repo: RepoManager,
-    /// Current stage of running builds (in-memory tracking)
-    pub build_stages: std::collections::HashMap<String, BuildStage>,
-    /// Mutex for serializing repo-add/repo-remove operations
-    pub repo_mutex: Arc<Mutex<()>>,
-    /// Broadcast channel for SSE events
-    pub events: broadcast::Sender<ServerEvent>,
-    /// Set of pkgbases currently being built (prevents duplicate builds)
-    pub active_builds: std::collections::HashSet<String>,
-    /// Cancel flags for builds, keyed by build_id. Shared across a queue so
-    /// cancelling one build cancels the rest.
-    pub build_cancel_flags: std::collections::HashMap<String, Arc<AtomicBool>>,
-}
-
-pub type SharedState = Arc<RwLock<AppState>>;
-
 /// Create the API router
 pub fn router(state: SharedState) -> Router {
     Router::new()
@@ -93,14 +70,20 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/packages/{pkgbase}/pkgbuild", get(get_pkgbuild))
         .route("/api/packages/{pkgbase}/diff", get(get_diff))
         .route("/api/packages/{pkgbase}/approve", post(approve_package))
-        .route("/api/packages/{pkgbase}/reject", post(reject_package))
+        // reject endpoint removed in V2
         .route("/api/packages/{pkgbase}/build", post(trigger_build))
         .route("/api/packages/{pkgbase}/builds", get(list_builds))
         .route("/api/packages/{pkgbase}/mark", post(mark_package))
         .route("/api/packages/{pkgbase}/deps", get(get_package_deps))
-        .route("/api/packages/{pkgbase}/check-update", post(check_package_update))
+        .route(
+            "/api/packages/{pkgbase}/check-update",
+            post(check_package_update),
+        )
         .route("/api/packages/check-updates", post(check_updates))
-        .route("/api/packages/approve-and-build", post(approve_and_build_updates))
+        .route(
+            "/api/packages/approve-and-build",
+            post(approve_and_build_updates),
+        )
         .route("/api/packages/orphans", get(list_orphans))
         // AUR endpoints
         .route("/api/aur/search", get(search_aur))
@@ -139,10 +122,7 @@ pub fn router(state: SharedState) -> Router {
 async fn sse_events(
     State(state): State<SharedState>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<SseEvent, std::convert::Infallible>>> {
-    let rx = {
-        let state_read = state.read().await;
-        state_read.events.subscribe()
-    };
+    let rx = state.events.subscribe();
 
     let stream = BroadcastStream::new(rx).filter_map(|result| match result {
         Ok(event) => {
@@ -159,7 +139,7 @@ async fn sse_events(
 }
 
 /// Emit a server event on the broadcast channel. Ignores send errors (no receivers).
-fn emit_event(tx: &broadcast::Sender<ServerEvent>, event: ServerEvent) {
+pub fn emit_event(tx: &tokio::sync::broadcast::Sender<ServerEvent>, event: ServerEvent) {
     let _ = tx.send(event);
 }
 
@@ -173,11 +153,6 @@ pub struct AddPackageRequest {
     /// If true, automatically add missing AUR dependencies
     #[serde(default)]
     pub with_deps: bool,
-}
-
-#[derive(Deserialize)]
-pub struct RejectRequest {
-    pub reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -210,9 +185,7 @@ pub struct DeleteParams {
 
 #[derive(Serialize)]
 pub struct DeletePackageResponse {
-    /// Packages that were removed
     pub removed: Vec<String>,
-    /// Warning if other packages depend on the removed package(s)
     pub dependents_warning: Option<String>,
 }
 
@@ -235,22 +208,24 @@ pub struct ApproveQuery {
 }
 
 #[derive(Serialize)]
+pub struct PkgNameResponse {
+    pub pkgname: String,
+    pub pkgdesc: Option<String>,
+    pub depends: Vec<String>,
+    pub repo_version: Option<String>,
+}
+
+#[derive(Serialize)]
 pub struct PackageResponse {
     pub pkgbase: String,
-    pub pkgnames: Vec<String>,
-    pub pkgver: Option<String>,
-    pub status: String,
     pub install_reason: String,
+    pub auto_approve: bool,
     pub approved_commit: Option<String>,
     pub current_commit: Option<String>,
-    pub auto_approve: bool,
-    /// Whether this package exists in AUR (false = removed/local only)
-    pub has_upstream: bool,
-    /// Whether this package exists in official repos (for detecting deprecated AUR packages)
-    pub in_official_repos: bool,
-    pub rejection_reason: Option<String>,
-    /// Aggregated runtime dependencies from all pkgnames
-    pub depends: Vec<String>,
+    pub pkgver: Option<String>,
+    pub status: String,
+    pub pkgnames: Vec<PkgNameResponse>,
+    pub is_orphan: bool,
     pub added_at: String,
     pub updated_at: String,
 }
@@ -259,9 +234,7 @@ pub struct PackageResponse {
 pub struct AddPackageResponse {
     #[serde(flatten)]
     pub package: PackageResponse,
-    /// Dependencies not in official repos that may need to be added (if with_deps was false)
     pub missing_deps: Vec<crate::aur::MissingDep>,
-    /// Dependencies that were automatically added (if with_deps was true)
     pub added_deps: Vec<AddedDependency>,
 }
 
@@ -275,11 +248,10 @@ pub struct AddedDependency {
 pub struct PackageDetailResponse {
     #[serde(flatten)]
     pub package: PackageResponse,
-    pub package_names: Vec<PackageName>,
     pub aur_info: Option<crate::models::AurPackageInfo>,
-    pub builds: Vec<crate::models::Build>,
-    /// Parsed .SRCINFO data (makedepends, sources, etc.)
+    pub builds: Vec<BuildDetailResponse>,
     pub srcinfo: Option<crate::models::SrcInfo>,
+    pub dependencies: Option<PackageDepsResponse>,
 }
 
 #[derive(Serialize)]
@@ -307,12 +279,14 @@ pub struct BuildResponse {
     pub status: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct BuildDetailResponse {
     #[serde(flatten)]
     pub build: crate::models::Build,
     /// Current stage of the build (for running builds)
     pub current_stage: Option<String>,
+    /// Outputs as a real JSON array (not stringified)
+    pub outputs_list: Option<Vec<String>>,
 }
 
 #[derive(Serialize)]
@@ -334,11 +308,8 @@ pub struct QueueBuildsRequest {
 
 #[derive(Serialize)]
 pub struct QueueBuildsResponse {
-    /// Build order (topologically sorted)
     pub build_order: Vec<String>,
-    /// Build IDs for each package (in same order as build_order)
     pub build_ids: Vec<String>,
-    /// Packages that were skipped (not approved or not found)
     pub skipped: Vec<QueueSkipped>,
 }
 
@@ -370,8 +341,8 @@ pub struct CheckAndBuildResponse {
 pub struct DependencyInfo {
     pub name: String,
     pub version_constraint: Option<String>,
-    pub source: String, // "official", "aur", "aur-tracked", "unknown"
-    pub in_repo: bool,  // true if we're tracking this in our repo
+    pub source: String,
+    pub in_repo: bool,
 }
 
 #[derive(Serialize)]
@@ -403,15 +374,10 @@ pub struct PacmanCacheStats {
 
 #[derive(Serialize)]
 pub struct OrphanedData {
-    /// Orphaned AUR clone directories
     pub clones: Vec<String>,
-    /// Orphaned source cache directories
     pub sources: Vec<String>,
-    /// Orphaned pkgdest directories
     pub pkgdests: Vec<String>,
-    /// Orphaned build logs
     pub logs: Vec<String>,
-    /// Total size of all orphaned data
     pub total_size: u64,
 }
 
@@ -442,7 +408,7 @@ pub struct CheckUpdatesResponse {
 
 pub struct AppError {
     status: StatusCode,
-    message: String,
+    pub message: String,
 }
 
 impl AppError {
@@ -500,47 +466,123 @@ impl From<sqlx::Error> for AppError {
 
 // ==================== Helper functions ====================
 
-fn package_to_response(pkg: Package, names: Vec<PackageName>) -> PackageResponse {
-    // Aggregate dependencies from all package names
-    let mut all_deps: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for name in &names {
-        if let Some(deps_json) = &name.depends {
-            if let Ok(deps) = serde_json::from_str::<Vec<String>>(deps_json) {
-                all_deps.extend(deps);
-            }
-        }
-    }
-    let mut depends: Vec<String> = all_deps.into_iter().collect();
-    depends.sort();
+/// Derive the status for a single package using V2 derived status logic.
+async fn derive_package_status(state: &AppState, pkg: &Package) -> DerivedStatus {
+    let clone_dir = pkg.clone_path(&state.config.resolved_cache().aur_clones);
+
+    let cache = state.srcinfo_cache.read().await;
+    let head_commit = cache.get(&pkg.pkgbase).map(|c| c.commit.clone());
+    drop(cache);
+
+    // If no cached commit, try reading from disk
+    let head_commit = match head_commit {
+        Some(c) => Some(c),
+        None => SrcInfoCache::get_head_commit(&clone_dir).ok().flatten(),
+    };
+
+    let active = state.active_builds.read().await;
+    let is_active = active.contains(&pkg.pkgbase);
+    drop(active);
+
+    let repo = state.repo_state.read().await;
+    let in_repo = repo.has_pkgbase(&pkg.pkgbase);
+    drop(repo);
+
+    let latest_build = if let Some(ref approved) = pkg.approved_commit {
+        state
+            .db
+            .get_latest_build_for_commit(&pkg.pkgbase, approved)
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+
+    derive_status(&StatusInputs {
+        approved_commit: pkg.approved_commit.as_deref(),
+        head_commit: head_commit.as_deref(),
+        latest_build: latest_build.as_ref(),
+        is_active_build: is_active,
+        in_repo,
+    })
+}
+
+/// Merge global and per-package deps into a single list.
+fn merge_deps(global: &[String], per_pkg: &[String]) -> Vec<String> {
+    let mut all = global.to_vec();
+    all.extend_from_slice(per_pkg);
+    all.sort();
+    all.dedup();
+    all
+}
+
+/// Assemble a PackageResponse from a Package + caches. Does NOT set is_orphan.
+async fn assemble_package_response(state: &AppState, pkg: &Package) -> PackageResponse {
+    let cache = state.srcinfo_cache.read().await;
+    let repo = state.repo_state.read().await;
+
+    let srcinfo = cache.get(&pkg.pkgbase);
+    let head_commit = srcinfo.map(|c| c.commit.clone());
+    let pkgver = srcinfo.map(|s| s.srcinfo.full_version());
+
+    let pkgnames = srcinfo
+        .map(|s| {
+            s.srcinfo
+                .packages
+                .iter()
+                .map(|p| PkgNameResponse {
+                    pkgname: p.pkgname.clone(),
+                    pkgdesc: p.pkgdesc.clone().or(s.srcinfo.pkgdesc.clone()),
+                    depends: merge_deps(&s.srcinfo.depends, &p.depends),
+                    repo_version: repo
+                        .get_version_for_pkgname(&p.pkgname)
+                        .map(|v| v.to_string()),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    drop(cache);
+    drop(repo);
+
+    let status = derive_package_status(state, pkg).await;
 
     PackageResponse {
-        pkgbase: pkg.pkgbase,
-        pkgnames: names.into_iter().map(|n| n.pkgname).collect(),
-        pkgver: pkg.pkgver,
-        status: pkg.status.to_string(),
+        pkgbase: pkg.pkgbase.clone(),
         install_reason: pkg.install_reason.to_string(),
-        approved_commit: pkg.approved_commit,
-        current_commit: pkg.current_commit,
         auto_approve: pkg.auto_approve,
-        has_upstream: pkg.has_upstream,
-        in_official_repos: pkg.in_official_repos,
-        rejection_reason: pkg.rejection_reason,
-        depends,
+        approved_commit: pkg.approved_commit.clone(),
+        current_commit: head_commit,
+        pkgver,
+        status: status.to_string(),
+        pkgnames,
+        is_orphan: false, // computed by caller for list endpoint
         added_at: pkg.added_at.to_rfc3339(),
         updated_at: pkg.updated_at.to_rfc3339(),
     }
 }
 
-fn parse_status(s: &str) -> Result<PackageStatus, AppError> {
-    match s {
-        "pending_review" => Ok(PackageStatus::PendingReview),
-        "approved" => Ok(PackageStatus::Approved),
-        "building" => Ok(PackageStatus::Building),
-        "failed" => Ok(PackageStatus::Failed),
-        "up_to_date" => Ok(PackageStatus::UpToDate),
-        "update_available" => Ok(PackageStatus::UpdateAvailable),
-        "rejected" => Ok(PackageStatus::Rejected),
-        _ => Err(AppError::bad_request(format!("Invalid status: {}", s))),
+/// Build a BuildDetailResponse with current_stage and parsed outputs.
+async fn build_detail_response(state: &AppState, build: crate::models::Build) -> BuildDetailResponse {
+    let current_stage = if build.status == crate::models::BuildStatus::Running
+        || build.status == crate::models::BuildStatus::Pending
+    {
+        let stages = state.build_stages.read().await;
+        stages.get(&build.id).map(|s| s.to_string())
+    } else {
+        None
+    };
+
+    // Parse outputs from JSON string into real array
+    let outputs_list = build.outputs.as_ref().and_then(|s| {
+        serde_json::from_str::<Vec<String>>(s).ok()
+    });
+
+    BuildDetailResponse {
+        build,
+        current_stage,
+        outputs_list,
     }
 }
 
@@ -555,62 +597,39 @@ fn parse_reason(s: &str) -> Result<InstallReason, AppError> {
     }
 }
 
-/// Resolve a name (pkgbase or pkgname) to a Package
-async fn resolve_package(state: &AppState, name: &str) -> Result<Package, AppError> {
-    // Try by pkgbase first
-    if let Some(pkg) = state.db.get_package(name).await? {
-        return Ok(pkg);
-    }
-
-    // Try by pkgname
-    if let Some(pkgbase) = state.db.resolve_pkgbase(name).await? {
-        if let Some(pkg) = state.db.get_package(&pkgbase).await? {
-            return Ok(pkg);
-        }
-    }
-
-    Err(AppError::not_found("Package not found"))
-}
-
 // ==================== Package handlers ====================
 
 async fn list_packages(
     State(state): State<SharedState>,
     Query(query): Query<ListQuery>,
 ) -> Result<Json<Vec<PackageResponse>>, AppError> {
-    let state = state.read().await;
-
-    // Parse filters
-    let status_filter = query.status.as_ref().map(|s| parse_status(s)).transpose()?;
     let reason_filter = query.reason.as_ref().map(|r| parse_reason(r)).transpose()?;
 
-    // Get packages based on filters
-    let packages = match (status_filter, reason_filter) {
-        (Some(status), Some(reason)) => {
-            // Both filters: get by status, then filter by reason in memory
-            state
-                .db
-                .list_packages_by_status(status)
-                .await?
-                .into_iter()
-                .filter(|p| p.install_reason == reason)
-                .collect()
-        }
-        (Some(status), None) => state.db.list_packages_by_status(status).await?,
-        (None, Some(reason)) => state.db.list_packages_by_reason(reason).await?,
-        (None, None) => state.db.list_packages().await?,
+    let packages = match reason_filter {
+        Some(reason) => state.db.list_packages_by_reason(reason).await?,
+        None => state.db.list_packages().await?,
     };
 
-    // Fetch all package names in a single query to avoid N+1
-    let mut all_names = state.db.list_all_package_names().await?;
+    // Compute orphan set
+    let orphan_set = {
+        let orphans = crate::service::packages::list_orphans(&state).await?;
+        orphans
+            .iter()
+            .map(|p| p.pkgbase.clone())
+            .collect::<HashSet<String>>()
+    };
 
-    let responses = packages
-        .into_iter()
-        .map(|pkg| {
-            let names = all_names.remove(&pkg.pkgbase).unwrap_or_default();
-            package_to_response(pkg, names)
-        })
-        .collect();
+    let mut responses = Vec::new();
+    for pkg in &packages {
+        let mut resp = assemble_package_response(&state, pkg).await;
+        resp.is_orphan = orphan_set.contains(&pkg.pkgbase);
+        responses.push(resp);
+    }
+
+    // Filter by status if requested (derived status, so filter in memory)
+    if let Some(ref status_str) = query.status {
+        responses.retain(|r| r.status == *status_str);
+    }
 
     Ok(Json(responses))
 }
@@ -619,33 +638,19 @@ async fn add_package(
     State(state): State<SharedState>,
     Json(req): Json<AddPackageRequest>,
 ) -> Result<Json<AddPackageResponse>, AppError> {
-    // Check if package already exists under a brief read lock
-    {
-        let state_read = state.read().await;
-        if let Some(pkg) = state_read.db.get_package(&req.name).await? {
-            let names = state_read.db.get_package_names(&pkg.pkgbase).await?;
-            return Ok(Json(AddPackageResponse {
-                package: package_to_response(pkg, names),
-                missing_deps: vec![],
-                added_deps: vec![],
-            }));
-        }
-        if let Some(pkgbase) = state_read.db.resolve_pkgbase(&req.name).await? {
-            if let Some(pkg) = state_read.db.get_package(&pkgbase).await? {
-                let names = state_read.db.get_package_names(&pkg.pkgbase).await?;
-                return Ok(Json(AddPackageResponse {
-                    package: package_to_response(pkg, names),
-                    missing_deps: vec![],
-                    added_deps: vec![],
-                }));
-            }
-        }
+    // Check if package already exists
+    if let Ok(pkg) = crate::service::packages::resolve_package(&state, &req.name).await {
+        let resp = assemble_package_response(&state, &pkg).await;
+        return Ok(Json(AddPackageResponse {
+            package: resp,
+            missing_deps: vec![],
+            added_deps: vec![],
+        }));
     }
 
-    // Validate base image when with_deps=true (dep detection requires the container)
+    // Validate base image when with_deps=true
     if req.with_deps {
-        let state_read = state.read().await;
-        match state_read.build.image_exists() {
+        match state.build.image_exists() {
             Ok(true) => {}
             Ok(false) => {
                 return Err(AppError::bad_request(
@@ -661,47 +666,25 @@ async fn add_package(
         }
     }
 
-    // Determine install reason for the main package
     let install_reason = if req.as_dependency {
         InstallReason::Dependency
     } else {
         InstallReason::Explicit
     };
 
-    // Do AUR lookup, git clone, SRCINFO parsing OUTSIDE the lock
-    let (pkg, _version) = add_package_outside_lock(&state, &req.name, install_reason).await?;
+    let result =
+        crate::service::packages::add_package_single(&state, &req.name, install_reason).await?;
 
-    // Track added dependencies
     let mut added_deps: Vec<AddedDependency> = Vec::new();
 
-    // Find missing AUR dependencies (outside lock - uses AurClient and reads disk)
-    let (clone_path, container_image, repo_name, repo_path, tracked_pkgnames) = {
-        let state_read = state.read().await;
-        let cp = pkg.clone_path(&state_read.config.resolved_cache().aur_clones);
-        let image = state_read.config.container.image.clone();
-        let name = state_read.config.repo.name.clone();
-        let path = state_read.config.repo.path.clone();
-        let tracked = get_tracked_pkgnames(&state_read).await?;
-        (cp, image, name, path, tracked)
-    };
-    let srcinfo = read_srcinfo(&clone_path)?;
+    // Find missing AUR dependencies
+    let missing_deps =
+        crate::service::packages::find_missing_deps(&state, &result.pkg.pkgbase).await?;
 
-    let aur_client = AurClient::new();
-    let missing_deps = aur_client
-        .find_missing_aur_deps(&srcinfo, &tracked_pkgnames, &container_image, &repo_name, &repo_path)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!("Failed to check for missing deps: {}", e);
-            vec![]
-        });
-
-    // If with_deps is true, recursively add missing AUR dependencies
     let remaining_missing_deps = if req.with_deps && !missing_deps.is_empty() {
-        // Track which packages we've processed to avoid cycles
-        let mut processed: std::collections::HashSet<String> = std::collections::HashSet::new();
-        processed.insert(pkg.pkgbase.clone());
+        let mut processed: HashSet<String> = HashSet::new();
+        processed.insert(result.pkg.pkgbase.clone());
 
-        // Queue of packages to check for deps (pkgbase, name for AUR lookup)
         let mut to_check: Vec<(String, String)> = missing_deps
             .iter()
             .filter(|d| d.in_aur && d.pkgbase.is_some())
@@ -714,33 +697,28 @@ async fn add_package(
             }
             processed.insert(dep_pkgbase.clone());
 
-            // Add this dependency (does AUR/git outside lock, DB inside lock)
-            match add_package_outside_lock(&state, &dep_name, InstallReason::Dependency).await {
-                Ok((dep_pkg, dep_version)) => {
+            match crate::service::packages::add_package_single(
+                &state,
+                &dep_name,
+                InstallReason::Dependency,
+            )
+            .await
+            {
+                Ok(dep_result) => {
                     added_deps.push(AddedDependency {
-                        pkgbase: dep_pkg.pkgbase.clone(),
-                        version: dep_version,
+                        pkgbase: dep_result.pkg.pkgbase.clone(),
+                        version: dep_result.version,
                     });
 
-                    // Check for this package's dependencies (outside lock)
-                    let (dep_clone_path, current_tracked) = {
-                        let state_read = state.read().await;
-                        let cp = dep_pkg.clone_path(&state_read.config.resolved_cache().aur_clones);
-                        let tracked = get_tracked_pkgnames(&state_read).await?;
-                        (cp, tracked)
-                    };
-                    if let Ok(dep_srcinfo) = read_srcinfo(&dep_clone_path) {
-
-                        if let Ok(dep_missing) = aur_client
-                            .find_missing_aur_deps(&dep_srcinfo, &current_tracked, &container_image, &repo_name, &repo_path)
+                    if let Ok(dep_missing) =
+                        crate::service::packages::find_missing_deps(&state, &dep_result.pkg.pkgbase)
                             .await
-                        {
-                            for m in dep_missing {
-                                if m.in_aur {
-                                    if let Some(pb) = &m.pkgbase {
-                                        if !processed.contains(pb) {
-                                            to_check.push((pb.clone(), m.name.clone()));
-                                        }
+                    {
+                        for m in dep_missing {
+                            if m.in_aur {
+                                if let Some(pb) = &m.pkgbase {
+                                    if !processed.contains(pb) {
+                                        to_check.push((pb.clone(), m.name.clone()));
                                     }
                                 }
                             }
@@ -752,175 +730,55 @@ async fn add_package(
                 }
             }
         }
-
-        // Return empty missing_deps since we added them
         vec![]
     } else {
         missing_deps
     };
 
-    let state_read = state.read().await;
-    let names = state_read.db.get_package_names(&pkg.pkgbase).await?;
+    let resp = assemble_package_response(&state, &result.pkg).await;
     Ok(Json(AddPackageResponse {
-        package: package_to_response(pkg, names),
+        package: resp,
         missing_deps: remaining_missing_deps,
         added_deps,
     }))
-}
-
-/// Helper to get all tracked package names
-async fn get_tracked_pkgnames(
-    state: &AppState,
-) -> Result<std::collections::HashSet<String>, AppError> {
-    let tracked_packages = state.db.list_packages().await?;
-    let mut tracked_pkgnames: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for p in &tracked_packages {
-        tracked_pkgnames.insert(p.pkgbase.clone());
-        let names = state.db.get_package_names(&p.pkgbase).await?;
-        for n in names {
-            tracked_pkgnames.insert(n.pkgname);
-        }
-    }
-    Ok(tracked_pkgnames)
-}
-
-/// Add a single package: does AUR lookup, git clone, SRCINFO parsing outside the lock,
-/// then acquires write lock only for DB inserts.
-async fn add_package_outside_lock(
-    state: &SharedState,
-    name: &str,
-    install_reason: InstallReason,
-) -> Result<(Package, String), AppError> {
-    // Check if already exists under brief read lock
-    {
-        let state_read = state.read().await;
-        if let Some(pkg) = state_read.db.get_package(name).await? {
-            let version = pkg.pkgver.clone().unwrap_or_default();
-            return Ok((pkg, version));
-        }
-        if let Some(pkgbase) = state_read.db.resolve_pkgbase(name).await? {
-            if let Some(pkg) = state_read.db.get_package(&pkgbase).await? {
-                let version = pkg.pkgver.clone().unwrap_or_default();
-                return Ok((pkg, version));
-            }
-        }
-    }
-
-    // Query AUR outside lock
-    let aur_client = AurClient::new();
-    let aur_info = aur_client
-        .info_single(name)
-        .await?
-        .ok_or_else(|| AppError::not_found(format!("Package '{}' not found in AUR", name)))?;
-
-    let pkgbase = aur_info.package_base.clone();
-
-    // Check again after AUR lookup (pkgbase may differ from name)
-    {
-        let state_read = state.read().await;
-        if let Some(pkg) = state_read.db.get_package(&pkgbase).await? {
-            let version = pkg.pkgver.clone().unwrap_or_default();
-            return Ok((pkg, version));
-        }
-    }
-
-    // Get clone path under brief read lock
-    let clone_path = {
-        let state_read = state.read().await;
-        state_read.config.resolved_cache().aur_clones.join(&pkgbase)
-    };
-
-    // Clone repository outside lock (disk I/O + network)
-    if !clone_path.exists() {
-        AurGit::clone(&pkgbase, &clone_path)?;
-    }
-
-    // Parse .SRCINFO outside lock (disk I/O)
-    let srcinfo = read_srcinfo(&clone_path)?;
-    let current_commit = AurGit::head_commit(&clone_path)?;
-    let version = format!("{}-{}", srcinfo.pkgver, srcinfo.pkgrel);
-
-    // Create package record
-    let now = chrono::Utc::now();
-    let pkg = Package {
-        pkgbase: pkgbase.clone(),
-        approved_commit: None,
-        current_commit: Some(current_commit),
-        pkgver: Some(version.clone()),
-        status: PackageStatus::PendingReview,
-        install_reason,
-        auto_approve: false,
-        has_upstream: true,
-        in_official_repos: false,
-        rejection_reason: None,
-        added_at: now,
-        updated_at: now,
-    };
-
-    // Build package names list outside lock
-    let mut pkg_names = Vec::new();
-    for sp in &srcinfo.packages {
-        pkg_names.push(PackageName {
-            pkgname: sp.pkgname.clone(),
-            pkgbase: pkgbase.clone(),
-            pkgdesc: sp.pkgdesc.clone().or(srcinfo.pkgdesc.clone()),
-            pkgver: Some(version.clone()),
-            depends: Some(serde_json::to_string(&sp.depends).unwrap_or_default()),
-            optdepends: Some(serde_json::to_string(&sp.optdepends).unwrap_or_default()),
-            provides: Some(serde_json::to_string(&sp.provides).unwrap_or_default()),
-            conflicts: Some(serde_json::to_string(&sp.conflicts).unwrap_or_default()),
-            repo_version: None,
-        });
-    }
-
-    // Acquire write lock only for DB inserts
-    {
-        let state_write = state.write().await;
-
-        // Double-check: another request may have inserted this while we were cloning
-        if let Some(existing) = state_write.db.get_package(&pkgbase).await? {
-            let version = existing.pkgver.clone().unwrap_or_default();
-            return Ok((existing, version));
-        }
-
-        state_write.db.insert_package_with_names(&pkg, &pkg_names).await?;
-        emit_event(
-            &state_write.events,
-            ServerEvent::PackageStatusChanged {
-                pkgbase: pkgbase.clone(),
-                new_status: "pending_review".to_string(),
-            },
-        );
-    }
-
-    Ok((pkg, version))
 }
 
 async fn get_package(
     State(state): State<SharedState>,
     Path(pkgbase): Path<String>,
 ) -> Result<Json<PackageDetailResponse>, AppError> {
-    let state = state.read().await;
-
-    let pkg = resolve_package(&state, &pkgbase).await?;
-    let names = state.db.get_package_names(&pkg.pkgbase).await?;
+    let pkg = crate::service::packages::resolve_package(&state, &pkgbase).await?;
     let aur_info = state.aur.info_single(&pkg.pkgbase).await?;
-    let builds = state.db.list_builds(&pkg.pkgbase, 10, 0).await?;
+    let builds_raw = state.db.list_builds(&pkg.pkgbase, 10, 0).await?;
 
-    // Read .SRCINFO if the clone exists
-    let clone_path = pkg.clone_path(&state.config.resolved_cache().aur_clones);
-    let srcinfo = if clone_path.exists() {
-        read_srcinfo(&clone_path).ok()
+    // Build detail responses with current_stage and parsed outputs
+    let mut builds = Vec::new();
+    for b in builds_raw {
+        builds.push(build_detail_response(&state, b).await);
+    }
+
+    // Read .SRCINFO from cache
+    let srcinfo = {
+        let cache = state.srcinfo_cache.read().await;
+        cache.get(&pkg.pkgbase).map(|c| c.srcinfo.clone())
+    };
+
+    // Inline deps
+    let dependencies = if let Some(ref si) = srcinfo {
+        let tracked_pkgnames = crate::service::packages::get_tracked_pkgnames(&state).await?;
+        Some(build_deps_response(si, &state.aur, &tracked_pkgnames).await)
     } else {
         None
     };
 
+    let resp = assemble_package_response(&state, &pkg).await;
+
     Ok(Json(PackageDetailResponse {
-        package: package_to_response(pkg, names.clone()),
-        package_names: names,
+        package: resp,
         aur_info,
         builds,
         srcinfo,
+        dependencies,
     }))
 }
 
@@ -929,37 +787,43 @@ async fn remove_package(
     Path(pkgbase): Path<String>,
     Query(params): Query<DeleteParams>,
 ) -> Result<Json<DeletePackageResponse>, AppError> {
-    let mut state = state.write().await;
-
-    let pkg = resolve_package(&state, &pkgbase).await?;
-    let pkg_names = state.db.get_package_names(&pkg.pkgbase).await?;
-    let pkgnames_set: std::collections::HashSet<String> = pkg_names
-        .iter()
-        .map(|n| n.pkgname.clone())
-        .collect();
+    let pkg = crate::service::packages::resolve_package(&state, &pkgbase).await?;
 
     // Check if any other tracked packages depend on this package
+    let cache = state.srcinfo_cache.read().await;
+    let pkgnames_set: HashSet<String> = cache
+        .get(&pkg.pkgbase)
+        .map(|c| c.srcinfo.packages.iter().map(|p| p.pkgname.clone()).collect())
+        .unwrap_or_default();
+
     let all_packages = state.db.list_packages().await?;
     let mut dependents: Vec<String> = Vec::new();
     for other_pkg in &all_packages {
         if other_pkg.pkgbase == pkg.pkgbase {
             continue;
         }
-        let other_names = state.db.get_package_names(&other_pkg.pkgbase).await?;
-        for name in &other_names {
-            if let Some(deps_json) = &name.depends {
-                if let Ok(deps) = serde_json::from_str::<Vec<String>>(deps_json) {
-                    for dep in deps {
-                        let dep_name = crate::aur::DepResolver::dep_name(&dep);
-                        if pkgnames_set.contains(dep_name) {
-                            dependents.push(other_pkg.pkgbase.clone());
-                            break;
-                        }
-                    }
-                }
+        if let Some(other_cached) = cache.get(&other_pkg.pkgbase) {
+            let all_deps: Vec<&str> = other_cached
+                .srcinfo
+                .depends
+                .iter()
+                .chain(other_cached.srcinfo.makedepends.iter())
+                .chain(other_cached.srcinfo.checkdepends.iter())
+                .chain(
+                    other_cached
+                        .srcinfo
+                        .packages
+                        .iter()
+                        .flat_map(|p| p.depends.iter()),
+                )
+                .map(|d| DepResolver::dep_name(d))
+                .collect();
+            if all_deps.iter().any(|d| pkgnames_set.contains(*d)) {
+                dependents.push(other_pkg.pkgbase.clone());
             }
         }
     }
+    drop(cache);
     dependents.sort();
     dependents.dedup();
 
@@ -973,63 +837,22 @@ async fn remove_package(
         ))
     };
 
-    // Helper to remove a single package
-    async fn do_remove(
-        state: &mut AppState,
-        repo_mutex: &Mutex<()>,
-        pkgbase: &str,
-        delete_files: bool,
-        delete_clone: bool,
-    ) -> Result<(), AppError> {
-        let pkg = state
-            .db
-            .get_package(pkgbase)
-            .await?
-            .ok_or_else(|| AppError::not_found("Package not found"))?;
-
-        if delete_files {
-            let names = state.db.get_package_names(pkgbase).await?;
-            let pkgnames: Vec<&str> = names.iter().map(|n| n.pkgname.as_str()).collect();
-            // Serialize repo-remove under repo mutex
-            let _repo_lock = repo_mutex.lock().await;
-            let _ = state.build.repo_remove(&pkgnames); // Ignore errors
-            drop(_repo_lock);
-            for name in &names {
-                let _ = state.repo.delete_package_files(&name.pkgname);
-            }
-        }
-
-        if delete_clone {
-            let clone_path = pkg.clone_path(&state.config.resolved_cache().aur_clones);
-            if clone_path.exists() {
-                let _ = std::fs::remove_dir_all(&clone_path);
-            }
-        }
-
-        state.db.delete_package(pkgbase).await?;
-        Ok(())
-    }
-
     let delete_files = params.delete_files.unwrap_or(false);
     let delete_clone = params.delete_clone.unwrap_or(false);
     let recursive = params.recursive.unwrap_or(false);
 
-    let repo_mutex = state.repo_mutex.clone();
-
-    // Remove the main package
     let mut removed = vec![pkg.pkgbase.clone()];
-    do_remove(&mut state, &repo_mutex, &pkg.pkgbase, delete_files, delete_clone).await?;
+    do_remove(&state, &pkg.pkgbase, delete_files, delete_clone).await?;
 
-    // If recursive, also remove orphaned dependencies
     if recursive {
         loop {
-            let orphans = state.db.list_orphans().await?;
+            let orphans = crate::service::packages::list_orphans(&state).await?;
             if orphans.is_empty() {
                 break;
             }
             for orphan in orphans {
                 removed.push(orphan.pkgbase.clone());
-                do_remove(&mut state, &repo_mutex, &orphan.pkgbase, delete_files, delete_clone).await?;
+                do_remove(&state, &orphan.pkgbase, delete_files, delete_clone).await?;
             }
         }
     }
@@ -1040,13 +863,55 @@ async fn remove_package(
     }))
 }
 
+/// Remove a single package from DB, optionally from repo and clone.
+async fn do_remove(
+    state: &AppState,
+    pkgbase: &str,
+    delete_files: bool,
+    delete_clone: bool,
+) -> Result<(), AppError> {
+    if delete_files {
+        let cache = state.srcinfo_cache.read().await;
+        let pkgnames: Vec<String> = cache
+            .get(pkgbase)
+            .map(|c| c.srcinfo.packages.iter().map(|p| p.pkgname.clone()).collect())
+            .unwrap_or_default();
+        drop(cache);
+
+        if !pkgnames.is_empty() {
+            let pkgname_refs: Vec<&str> = pkgnames.iter().map(|s| s.as_str()).collect();
+            let _repo_lock = state.repo_mutex.lock().await;
+            let _ = state.build.repo_remove(&pkgname_refs);
+            drop(_repo_lock);
+            for name in &pkgnames {
+                let _ = state.repo.delete_package_files(name);
+            }
+        }
+    }
+
+    if delete_clone {
+        let clone_path = state.config.resolved_cache().aur_clones.join(pkgbase);
+        if clone_path.exists() {
+            let _ = std::fs::remove_dir_all(&clone_path);
+        }
+    }
+
+    state.db.delete_package(pkgbase).await?;
+
+    // Remove from SrcInfoCache
+    {
+        let mut cache = state.srcinfo_cache.write().await;
+        cache.remove(pkgbase);
+    }
+
+    Ok(())
+}
+
 async fn get_pkgbuild(
     State(state): State<SharedState>,
     Path(pkgbase): Path<String>,
 ) -> Result<Json<PkgbuildResponse>, AppError> {
-    let state = state.read().await;
-
-    let pkg = resolve_package(&state, &pkgbase).await?;
+    let pkg = crate::service::packages::resolve_package(&state, &pkgbase).await?;
     let clone_path = pkg.clone_path(&state.config.resolved_cache().aur_clones);
     AurGit::ensure_cloned(&pkg.pkgbase, &clone_path)?;
     let pkgbuild_path = clone_path.join("PKGBUILD");
@@ -1054,9 +919,8 @@ async fn get_pkgbuild(
     let content = std::fs::read_to_string(&pkgbuild_path)?;
     let commit = AurGit::head_commit(&clone_path)?;
 
-    // List all files in the repo
     let mut files = Vec::new();
-    for entry in std::fs::read_dir(clone_path)? {
+    for entry in std::fs::read_dir(&clone_path)? {
         let entry = entry?;
         if let Some(name) = entry.file_name().to_str() {
             if !name.starts_with('.') || name == ".SRCINFO" {
@@ -1076,17 +940,23 @@ async fn get_diff(
     State(state): State<SharedState>,
     Path(pkgbase): Path<String>,
 ) -> Result<Json<DiffResponse>, AppError> {
-    let state = state.read().await;
-
-    let pkg = resolve_package(&state, &pkgbase).await?;
+    let pkg = crate::service::packages::resolve_package(&state, &pkgbase).await?;
     let clone_path = pkg.clone_path(&state.config.resolved_cache().aur_clones);
     AurGit::ensure_cloned(&pkg.pkgbase, &clone_path)?;
 
+    // Get head commit from cache or disk
+    let head_commit = {
+        let cache = state.srcinfo_cache.read().await;
+        cache
+            .get(&pkg.pkgbase)
+            .map(|c| c.commit.clone())
+            .or_else(|| SrcInfoCache::get_head_commit(&clone_path).ok().flatten())
+    };
+
     let diff = if let Some(ref approved) = pkg.approved_commit {
-        let current = pkg.current_commit.as_deref().unwrap_or("HEAD");
+        let current = head_commit.as_deref().unwrap_or("HEAD");
         AurGit::diff(&clone_path, approved, current)?
     } else {
-        // No approved commit, show full PKGBUILD as "new"
         let pkgbuild = std::fs::read_to_string(clone_path.join("PKGBUILD"))?;
         format!(
             "+++ PKGBUILD (new file)\n{}",
@@ -1100,7 +970,7 @@ async fn get_diff(
 
     Ok(Json(DiffResponse {
         from_commit: pkg.approved_commit,
-        to_commit: pkg.current_commit,
+        to_commit: head_commit,
         diff,
     }))
 }
@@ -1110,48 +980,77 @@ async fn approve_package(
     Path(pkgbase): Path<String>,
     Query(query): Query<ApproveQuery>,
 ) -> Result<StatusCode, AppError> {
-    let state = state.write().await;
+    let pkg = crate::service::packages::resolve_package(&state, &pkgbase).await?;
 
-    let pkg = resolve_package(&state, &pkgbase).await?;
+    // Determine which commit to approve
+    let commit = if let Some(c) = query.commit {
+        c
+    } else {
+        // Use HEAD commit from cache or disk
+        let cache = state.srcinfo_cache.read().await;
+        let head = cache
+            .get(&pkg.pkgbase)
+            .map(|c| c.commit.clone());
+        drop(cache);
+
+        match head {
+            Some(c) => c,
+            None => {
+                let clone_path = pkg.clone_path(&state.config.resolved_cache().aur_clones);
+                AurGit::head_commit(&clone_path)?
+            }
+        }
+    };
+
     state
         .db
-        .approve_package(&pkg.pkgbase, false, query.commit.as_deref())
+        .approve_package(&pkg.pkgbase, &commit, false)
         .await?;
+
+    emit_event(
+        &state.events,
+        ServerEvent::PackageStatusChanged {
+            pkgbase: pkg.pkgbase.clone(),
+            new_status: "approved".to_string(),
+        },
+    );
 
     Ok(StatusCode::OK)
 }
 
-/// Approve all update_available/pending_review packages and queue builds for all approved
 async fn approve_and_build_updates(
     State(state): State<SharedState>,
 ) -> Result<Json<ApproveAndBuildResponse>, AppError> {
     let mut approved_pkgbases: Vec<String> = Vec::new();
     let mut buildable_pkgbases: Vec<String> = Vec::new();
 
-    // Approve updatable packages and collect all buildable ones
-    {
-        let state_write = state.write().await;
-        let packages = state_write.db.list_packages().await?;
-        for pkg in &packages {
-            if pkg.status == PackageStatus::UpdateAvailable
-                || pkg.status == PackageStatus::PendingReview
-            {
-                state_write
-                    .db
-                    .approve_package(&pkg.pkgbase, false, None)
-                    .await?;
-                emit_event(
-                    &state_write.events,
-                    ServerEvent::PackageStatusChanged {
-                        pkgbase: pkg.pkgbase.clone(),
-                        new_status: "approved".to_string(),
-                    },
-                );
-                approved_pkgbases.push(pkg.pkgbase.clone());
-                buildable_pkgbases.push(pkg.pkgbase.clone());
-            } else if pkg.status == PackageStatus::Approved {
+    let packages = state.db.list_packages().await?;
+    for pkg in &packages {
+        let status = derive_package_status(&state, pkg).await;
+        match status {
+            DerivedStatus::UpdateAvailable | DerivedStatus::PendingReview => {
+                // Get HEAD commit to approve
+                let cache = state.srcinfo_cache.read().await;
+                let head = cache.get(&pkg.pkgbase).map(|c| c.commit.clone());
+                drop(cache);
+
+                if let Some(commit) = head {
+                    state.db.approve_package(&pkg.pkgbase, &commit, false).await?;
+                    emit_event(
+                        &state.events,
+                        ServerEvent::PackageStatusChanged {
+                            pkgbase: pkg.pkgbase.clone(),
+                            new_status: "approved".to_string(),
+                        },
+                    );
+                    approved_pkgbases.push(pkg.pkgbase.clone());
+                    buildable_pkgbases.push(pkg.pkgbase.clone());
+                }
+            }
+            DerivedStatus::Approved => {
                 buildable_pkgbases.push(pkg.pkgbase.clone());
             }
+            _ => {}
         }
     }
 
@@ -1164,7 +1063,6 @@ async fn approve_and_build_updates(
         }));
     }
 
-    // Queue builds for all approved packages
     let queue_req = QueueBuildsRequest {
         packages: buildable_pkgbases,
     };
@@ -1178,36 +1076,35 @@ async fn approve_and_build_updates(
     }))
 }
 
-/// Combined check-updates + approve-and-build endpoint
 async fn check_and_build(
     State(state): State<SharedState>,
 ) -> Result<Json<CheckAndBuildResponse>, AppError> {
-    // Step 1: Check for updates
-    let check_result = check_updates_inner(&state).await?;
+    let check_result = crate::service::updates::check_updates_inner(&state).await?;
 
-    // Step 2: Approve and build (reuse approve_and_build logic)
     let mut approved_pkgbases: Vec<String> = Vec::new();
 
-    {
-        let state_write = state.write().await;
-        let packages = state_write.db.list_packages().await?;
-        for pkg in &packages {
-            if pkg.status == PackageStatus::UpdateAvailable
-                || pkg.status == PackageStatus::PendingReview
-            {
-                state_write
-                    .db
-                    .approve_package(&pkg.pkgbase, false, None)
-                    .await?;
-                emit_event(
-                    &state_write.events,
-                    ServerEvent::PackageStatusChanged {
-                        pkgbase: pkg.pkgbase.clone(),
-                        new_status: "approved".to_string(),
-                    },
-                );
-                approved_pkgbases.push(pkg.pkgbase.clone());
+    let packages = state.db.list_packages().await?;
+    for pkg in &packages {
+        let status = derive_package_status(&state, pkg).await;
+        match status {
+            DerivedStatus::UpdateAvailable | DerivedStatus::PendingReview => {
+                let cache = state.srcinfo_cache.read().await;
+                let head = cache.get(&pkg.pkgbase).map(|c| c.commit.clone());
+                drop(cache);
+
+                if let Some(commit) = head {
+                    state.db.approve_package(&pkg.pkgbase, &commit, false).await?;
+                    emit_event(
+                        &state.events,
+                        ServerEvent::PackageStatusChanged {
+                            pkgbase: pkg.pkgbase.clone(),
+                            new_status: "approved".to_string(),
+                        },
+                    );
+                    approved_pkgbases.push(pkg.pkgbase.clone());
+                }
             }
+            _ => {}
         }
     }
 
@@ -1237,120 +1134,110 @@ async fn check_and_build(
     }))
 }
 
-async fn reject_package(
-    State(state): State<SharedState>,
-    Path(pkgbase): Path<String>,
-    Json(req): Json<RejectRequest>,
-) -> Result<StatusCode, AppError> {
-    let state = state.write().await;
-
-    let pkg = resolve_package(&state, &pkgbase).await?;
-    state
-        .db
-        .reject_package(&pkg.pkgbase, req.reason.as_deref())
-        .await?;
-
-    Ok(StatusCode::OK)
-}
-
 async fn trigger_build(
     State(state): State<SharedState>,
     Path(pkgbase): Path<String>,
 ) -> Result<Json<BuildResponse>, AppError> {
-    // Do status check AND status update under a single write lock to prevent TOCTOU race
-    let (pkg, config, log_path, build_id) = {
-        let mut state_write = state.write().await;
+    let pkg = crate::service::packages::resolve_package(&state, &pkgbase).await?;
 
-        let pkg = resolve_package(&state_write, &pkgbase).await?;
-
-        // Check if this package is already building
-        if state_write.active_builds.contains(&pkg.pkgbase) {
+    // Check if already building
+    {
+        let active = state.active_builds.read().await;
+        if active.contains(&pkg.pkgbase) {
             return Err(AppError::bad_request("Package is already building"));
         }
+    }
 
-        if pkg.status != PackageStatus::Approved && pkg.status != PackageStatus::UpdateAvailable {
+    // Check status is appropriate for building
+    let status = derive_package_status(&state, &pkg).await;
+    if status != DerivedStatus::Approved && status != DerivedStatus::UpdateAvailable {
+        return Err(AppError::bad_request(
+            "Package must be approved before building",
+        ));
+    }
+
+    // Check base image exists
+    match state.build.image_exists() {
+        Ok(true) => {}
+        Ok(false) => {
             return Err(AppError::bad_request(
-                "Package must be approved before building",
+                "Base image not found. Run 'repoman rebuild-image' first.",
             ));
         }
-
-        // Check base image exists
-        match state_write.build.image_exists() {
-            Ok(true) => {}
-            Ok(false) => {
-                return Err(AppError::bad_request(
-                    "Base image not found. Run 'repoman rebuild-image' first.",
-                ));
-            }
-            Err(e) => {
-                return Err(AppError::internal(format!(
-                    "Failed to check base image: {}. Is Podman installed and running?",
-                    e
-                )));
-            }
+        Err(e) => {
+            return Err(AppError::internal(format!(
+                "Failed to check base image: {}. Is Podman installed and running?",
+                e
+            )));
         }
+    }
 
-        let commit = pkg
-            .current_commit
-            .clone()
-            .ok_or_else(|| AppError::bad_request("Package has no current commit"))?;
+    // Get commit from cache or disk
+    let commit = {
+        let cache = state.srcinfo_cache.read().await;
+        cache.get(&pkg.pkgbase).map(|c| c.commit.clone())
+    };
+    let commit = commit.or_else(|| {
+        let clone_dir = pkg.clone_path(&state.config.resolved_cache().aur_clones);
+        SrcInfoCache::get_head_commit(&clone_dir).ok().flatten()
+    });
+    let commit =
+        commit.ok_or_else(|| AppError::bad_request("Package has no current commit"))?;
 
-        let build_id = uuid::Uuid::new_v4().to_string();
-        let log_filename = format!("{}.log", build_id);
-        let log_path = state_write.config.resolved_cache().logs.join(&log_filename);
-        let now = chrono::Utc::now();
+    let build_id = uuid::Uuid::new_v4().to_string();
+    let log_filename = format!("{}.log", build_id);
+    let log_path = state.config.resolved_cache().logs.join(&log_filename);
+    let now = chrono::Utc::now();
 
-        let build = crate::models::Build {
-            id: build_id.clone(),
-            pkgbase: pkg.pkgbase.clone(),
-            commit,
-            status: crate::models::BuildStatus::Pending,
-            started_at: now,
-            finished_at: None,
-            log_path: Some(log_filename),
-            outputs: None,
-            error_message: None,
-        };
-
-        state_write.db.insert_build(&build).await?;
-        state_write
-            .db
-            .update_package_status(&pkg.pkgbase, PackageStatus::Building)
-            .await?;
-
-        // Mark this package as actively building
-        state_write.active_builds.insert(pkg.pkgbase.clone());
-
-        // Create a cancel flag for this build
-        let cancel_flag = Arc::new(AtomicBool::new(false));
-        state_write.build_cancel_flags.insert(build_id.clone(), cancel_flag);
-
-        emit_event(
-            &state_write.events,
-            ServerEvent::BuildStarted {
-                build_id: build_id.clone(),
-                pkgbase: pkg.pkgbase.clone(),
-            },
-        );
-        emit_event(
-            &state_write.events,
-            ServerEvent::PackageStatusChanged {
-                pkgbase: pkg.pkgbase.clone(),
-                new_status: "building".to_string(),
-            },
-        );
-
-        let config = state_write.config.clone();
-        (pkg, config, log_path, build_id)
+    let build = crate::models::Build {
+        id: build_id.clone(),
+        pkgbase: pkg.pkgbase.clone(),
+        commit,
+        status: crate::models::BuildStatus::Pending,
+        started_at: now,
+        finished_at: None,
+        log_path: Some(log_filename),
+        outputs: None,
+        error_message: None,
     };
 
-    // Spawn background task to run the build
+    state.db.insert_build(&build).await?;
+
+    // Mark as actively building
+    {
+        let mut active = state.active_builds.write().await;
+        active.insert(pkg.pkgbase.clone());
+    }
+
+    // Create cancel flag
+    {
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let mut flags = state.build_cancel_flags.write().await;
+        flags.insert(build_id.clone(), cancel_flag);
+    }
+
+    emit_event(
+        &state.events,
+        ServerEvent::BuildStarted {
+            build_id: build_id.clone(),
+            pkgbase: pkg.pkgbase.clone(),
+        },
+    );
+    emit_event(
+        &state.events,
+        ServerEvent::PackageStatusChanged {
+            pkgbase: pkg.pkgbase.clone(),
+            new_status: "building".to_string(),
+        },
+    );
+
+    let config = state.config.clone();
     let state_clone = state.clone();
     let pkgbase_clone = pkg.pkgbase.clone();
     let build_id_clone = build_id.clone();
 
     tokio::spawn(async move {
-        run_build_task(
+        crate::service::builds::run_build_task(
             state_clone,
             pkgbase_clone,
             build_id_clone,
@@ -1366,334 +1253,21 @@ async fn trigger_build(
     }))
 }
 
-/// Helper to update build stage in memory and emit SSE event
-async fn set_build_stage(state: &SharedState, build_id: &str, pkgbase: &str, stage: BuildStage) {
-    let mut state_write = state.write().await;
-    let stage_str = stage.to_string();
-    state_write.build_stages.insert(build_id.to_string(), stage);
-    emit_event(
-        &state_write.events,
-        ServerEvent::BuildStageChanged {
-            build_id: build_id.to_string(),
-            pkgbase: pkgbase.to_string(),
-            stage: stage_str,
-        },
-    );
-}
-
-/// Helper to remove build stage from memory (when build completes)
-async fn clear_build_stage(state: &SharedState, build_id: &str) {
-    let mut state_write = state.write().await;
-    state_write.build_stages.remove(build_id);
-}
-
-/// Helper to remove a pkgbase from active_builds and its cancel flag(s).
-/// Called on every build completion path (success, failure, panic, skip).
-async fn clear_active_build(state: &SharedState, pkgbase: &str, build_id: &str) {
-    let mut state_write = state.write().await;
-    state_write.active_builds.remove(pkgbase);
-    state_write.build_cancel_flags.remove(build_id);
-}
-
-/// Background task that executes a build
-async fn run_build_task(
-    state: SharedState,
-    pkgbase: String,
-    build_id: String,
-    log_path: std::path::PathBuf,
-    config: crate::config::Config,
-) {
-    tracing::info!("Starting build task for {} (build {})", pkgbase, build_id);
-
-    // Initialize stage tracking
-    set_build_stage(&state, &build_id, &pkgbase, BuildStage::Starting).await;
-
-    // Update status to Running
-    {
-        let state_write = state.write().await;
-        if let Err(e) = state_write
-            .db
-            .update_build_status(&build_id, crate::models::BuildStatus::Running, None)
-            .await
-        {
-            tracing::error!("Failed to update build status to Running: {}", e);
-            clear_build_stage(&state, &build_id).await;
-            clear_active_build(&state, &pkgbase, &build_id).await;
-            return;
-        }
-    }
-
-    // Create build system and ensure repo exists
-    let build_system = BuildSystem::new(config.clone());
-
-    if let Err(e) = std::fs::create_dir_all(&config.repo.path) {
-        tracing::error!("Failed to create repo directory: {}", e);
-        update_build_failed(
-            &state,
-            &build_id,
-            &pkgbase,
-            &format!("Failed to create repo dir: {}", e),
-        )
-        .await;
-        clear_active_build(&state, &pkgbase, &build_id).await;
-        return;
-    }
-
-    if let Err(e) = build_system.init_repo() {
-        tracing::error!("Failed to init repo: {}", e);
-        update_build_failed(
-            &state,
-            &build_id,
-            &pkgbase,
-            &format!("Failed to init repo: {}", e),
-        )
-        .await;
-        clear_active_build(&state, &pkgbase, &build_id).await;
-        return;
-    }
-
-    // Ensure clone exists (re-clone from AUR if missing)
-    let source_path = config.resolved_cache().aur_clones.join(&pkgbase);
-    {
-        let sp = source_path.clone();
-        let pb = pkgbase.clone();
-        if let Err(e) = tokio::task::spawn_blocking(move || {
-            AurGit::ensure_cloned(&pb, &sp)
-        }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("{}", e))) {
-            update_build_failed(
-                &state,
-                &build_id,
-                &pkgbase,
-                &format!("Failed to ensure clone exists: {}", e),
-            )
-            .await;
-            clear_active_build(&state, &pkgbase, &build_id).await;
-            return;
-        }
-    }
-
-    // Run the build using spawn_blocking for the sync version
-    let log_path_clone = log_path.clone();
-    let pkgbase_clone = pkgbase.clone();
-
-    let build_result = tokio::task::spawn_blocking(move || {
-        build_system.run_build_sync(&pkgbase_clone, &source_path, &log_path_clone)
-    })
-    .await;
-
-    // Get repo_mutex for serializing repo operations
-    let repo_mutex = {
-        let state_read = state.read().await;
-        state_read.repo_mutex.clone()
-    };
-
-    match build_result {
-        Ok(Ok(packages)) => {
-            // Build succeeded - move packages to repo
-            tracing::info!(
-                "Build succeeded for {}, moving {} package(s) to repo",
-                pkgbase,
-                packages.len()
-            );
-
-            set_build_stage(&state, &build_id, &pkgbase, BuildStage::MovingToRepo).await;
-
-            let build_system = BuildSystem::new(config.clone());
-
-            match build_system.move_to_repo(&packages) {
-                Ok(repo_packages) => {
-                    // Add to repo database under repo mutex
-                    set_build_stage(&state, &build_id, &pkgbase, BuildStage::UpdatingIndex).await;
-
-                    let repo_add_result = {
-                        let _repo_lock = repo_mutex.lock().await;
-                        build_system.repo_add(&repo_packages)
-                    };
-
-                    if let Err(e) = repo_add_result {
-                        tracing::error!("repo-add failed: {}", e);
-                        set_build_stage(&state, &build_id, &pkgbase, BuildStage::Failed).await;
-                        update_build_failed(
-                            &state,
-                            &build_id,
-                            &pkgbase,
-                            &format!("repo-add failed: {}", e),
-                        )
-                        .await;
-                        clear_build_stage(&state, &build_id).await;
-                        clear_active_build(&state, &pkgbase, &build_id).await;
-                        return;
-                    }
-
-                    // Update build record with outputs
-                    let outputs: Vec<String> = repo_packages
-                        .iter()
-                        .filter_map(|p| p.file_name())
-                        .map(|n| n.to_string_lossy().to_string())
-                        .collect();
-                    let outputs_json = match serde_json::to_string(&outputs) {
-                        Ok(json) => json,
-                        Err(e) => {
-                            tracing::error!("Failed to serialize build outputs: {}", e);
-                            "[]".to_string()
-                        }
-                    };
-
-                    set_build_stage(&state, &build_id, &pkgbase, BuildStage::Complete).await;
-
-                    let state_write = state.write().await;
-
-                    // Check if the build was cancelled while we were working
-                    let already_cancelled = state_write
-                        .db
-                        .get_build(&build_id)
-                        .await
-                        .ok()
-                        .flatten()
-                        .is_some_and(|b| b.status == crate::models::BuildStatus::Cancelled);
-
-                    if !already_cancelled {
-                        if let Err(e) = state_write
-                            .db
-                            .update_build_status(&build_id, crate::models::BuildStatus::Success, None)
-                            .await
-                        {
-                            tracing::error!(
-                                "Failed to update build {} status to Success: {}",
-                                build_id,
-                                e
-                            );
-                        }
-                        if let Err(e) = state_write
-                            .db
-                            .update_build_outputs(&build_id, &outputs_json)
-                            .await
-                        {
-                            tracing::error!("Failed to update build {} outputs: {}", build_id, e);
-                        }
-                        if let Err(e) = state_write
-                            .db
-                            .update_package_status(&pkgbase, PackageStatus::UpToDate)
-                            .await
-                        {
-                            tracing::error!(
-                                "Failed to update package {} status to UpToDate: {}",
-                                pkgbase,
-                                e
-                            );
-                        }
-                        emit_event(
-                            &state_write.events,
-                            ServerEvent::BuildCompleted {
-                                build_id: build_id.clone(),
-                                pkgbase: pkgbase.clone(),
-                                status: "success".to_string(),
-                            },
-                        );
-                        emit_event(
-                            &state_write.events,
-                            ServerEvent::PackageStatusChanged {
-                                pkgbase: pkgbase.clone(),
-                                new_status: "up_to_date".to_string(),
-                            },
-                        );
-                    }
-                    drop(state_write);
-
-                    clear_build_stage(&state, &build_id).await;
-                    clear_active_build(&state, &pkgbase, &build_id).await;
-                    tracing::info!("Build {} completed successfully", build_id);
-                }
-                Err(e) => {
-                    set_build_stage(&state, &build_id, &pkgbase, BuildStage::Failed).await;
-                    update_build_failed(
-                        &state,
-                        &build_id,
-                        &pkgbase,
-                        &format!("Failed to move packages: {}", e),
-                    )
-                    .await;
-                    clear_build_stage(&state, &build_id).await;
-                    clear_active_build(&state, &pkgbase, &build_id).await;
-                }
-            }
-        }
-        Ok(Err(e)) => {
-            // Build command failed
-            tracing::error!("Build failed for {}: {}", pkgbase, e);
-            set_build_stage(&state, &build_id, &pkgbase, BuildStage::Failed).await;
-            update_build_failed(&state, &build_id, &pkgbase, &e.to_string()).await;
-            clear_build_stage(&state, &build_id).await;
-            clear_active_build(&state, &pkgbase, &build_id).await;
-        }
-        Err(e) => {
-            // Task panicked
-            tracing::error!("Build task panicked for {}: {}", pkgbase, e);
-            set_build_stage(&state, &build_id, &pkgbase, BuildStage::Failed).await;
-            update_build_failed(
-                &state,
-                &build_id,
-                &pkgbase,
-                &format!("Build task panicked: {}", e),
-            )
-            .await;
-            clear_build_stage(&state, &build_id).await;
-            clear_active_build(&state, &pkgbase, &build_id).await;
-        }
-    }
-}
-
-/// Helper to update build and package status on failure
-async fn update_build_failed(state: &SharedState, build_id: &str, pkgbase: &str, error: &str) {
-    tracing::error!("Build {} failed: {}", build_id, error);
-    let state_write = state.write().await;
-    if let Err(e) = state_write
-        .db
-        .update_build_status(build_id, crate::models::BuildStatus::Failed, Some(error))
-        .await
-    {
-        tracing::error!("Failed to update build {} status to Failed: {}", build_id, e);
-    }
-    if let Err(e) = state_write
-        .db
-        .update_package_status(pkgbase, PackageStatus::Failed)
-        .await
-    {
-        tracing::error!(
-            "Failed to update package {} status to Failed: {}",
-            pkgbase,
-            e
-        );
-    }
-    emit_event(
-        &state_write.events,
-        ServerEvent::BuildCompleted {
-            build_id: build_id.to_string(),
-            pkgbase: pkgbase.to_string(),
-            status: "failed".to_string(),
-        },
-    );
-    emit_event(
-        &state_write.events,
-        ServerEvent::PackageStatusChanged {
-            pkgbase: pkgbase.to_string(),
-            new_status: "failed".to_string(),
-        },
-    );
-}
-
 async fn list_builds(
     State(state): State<SharedState>,
     Path(pkgbase): Path<String>,
     Query(pagination): Query<PaginationQuery>,
-) -> Result<Json<Vec<crate::models::Build>>, AppError> {
-    let state = state.read().await;
-
-    let limit = pagination.limit.unwrap_or(20).min(100); // Default 20, max 100
+) -> Result<Json<Vec<BuildDetailResponse>>, AppError> {
+    let limit = pagination.limit.unwrap_or(20).min(100);
     let offset = pagination.offset.unwrap_or(0).max(0);
 
-    let pkg = resolve_package(&state, &pkgbase).await?;
-    let builds = state.db.list_builds(&pkg.pkgbase, limit, offset).await?;
+    let pkg = crate::service::packages::resolve_package(&state, &pkgbase).await?;
+    let builds_raw = state.db.list_builds(&pkg.pkgbase, limit, offset).await?;
+
+    let mut builds = Vec::new();
+    for b in builds_raw {
+        builds.push(build_detail_response(&state, b).await);
+    }
 
     Ok(Json(builds))
 }
@@ -1703,9 +1277,7 @@ async fn mark_package(
     Path(pkgbase): Path<String>,
     Json(req): Json<MarkRequest>,
 ) -> Result<Json<PackageResponse>, AppError> {
-    let state = state.write().await;
-
-    let pkg = resolve_package(&state, &pkgbase).await?;
+    let pkg = crate::service::packages::resolve_package(&state, &pkgbase).await?;
 
     let reason: InstallReason = req
         .install_reason
@@ -1714,15 +1286,14 @@ async fn mark_package(
 
     state.db.update_install_reason(&pkg.pkgbase, reason).await?;
 
-    // Reload package to get updated data
     let pkg = state
         .db
         .get_package(&pkg.pkgbase)
         .await?
         .ok_or_else(|| AppError::internal("Package disappeared"))?;
-    let names = state.db.get_package_names(&pkg.pkgbase).await?;
 
-    Ok(Json(package_to_response(pkg, names)))
+    let resp = assemble_package_response(&state, &pkg).await;
+    Ok(Json(resp))
 }
 
 async fn update_package(
@@ -1730,11 +1301,8 @@ async fn update_package(
     Path(pkgbase): Path<String>,
     Json(req): Json<UpdatePackageRequest>,
 ) -> Result<Json<PackageResponse>, AppError> {
-    let state = state.write().await;
+    let pkg = crate::service::packages::resolve_package(&state, &pkgbase).await?;
 
-    let pkg = resolve_package(&state, &pkgbase).await?;
-
-    // Update auto_approve if provided
     if let Some(auto_approve) = req.auto_approve {
         state
             .db
@@ -1742,34 +1310,27 @@ async fn update_package(
             .await?;
     }
 
-    // Reload package to get updated data
     let pkg = state
         .db
         .get_package(&pkg.pkgbase)
         .await?
         .ok_or_else(|| AppError::internal("Package disappeared"))?;
-    let names = state.db.get_package_names(&pkg.pkgbase).await?;
 
-    Ok(Json(package_to_response(pkg, names)))
+    let resp = assemble_package_response(&state, &pkg).await;
+    Ok(Json(resp))
 }
 
 async fn list_orphans(
     State(state): State<SharedState>,
 ) -> Result<Json<Vec<PackageResponse>>, AppError> {
-    let state = state.read().await;
+    let orphans = crate::service::packages::list_orphans(&state).await?;
 
-    let orphans = state.db.list_orphans().await?;
-
-    // Fetch all package names in a single query to avoid N+1
-    let mut all_names = state.db.list_all_package_names().await?;
-
-    let responses = orphans
-        .into_iter()
-        .map(|pkg| {
-            let names = all_names.remove(&pkg.pkgbase).unwrap_or_default();
-            package_to_response(pkg, names)
-        })
-        .collect();
+    let mut responses = Vec::new();
+    for pkg in &orphans {
+        let mut resp = assemble_package_response(&state, pkg).await;
+        resp.is_orphan = true;
+        responses.push(resp);
+    }
 
     Ok(Json(responses))
 }
@@ -1778,53 +1339,39 @@ async fn get_package_deps(
     State(state): State<SharedState>,
     Path(pkgbase): Path<String>,
 ) -> Result<Json<PackageDepsResponse>, AppError> {
-    let state = state.read().await;
-
-    let pkg = resolve_package(&state, &pkgbase).await?;
+    let pkg = crate::service::packages::resolve_package(&state, &pkgbase).await?;
     let clone_path = pkg.clone_path(&state.config.resolved_cache().aur_clones);
     AurGit::ensure_cloned(&pkg.pkgbase, &clone_path)?;
 
-    // Parse .SRCINFO
-    let srcinfo = read_srcinfo(&clone_path)?;
+    let srcinfo = {
+        let cache = state.srcinfo_cache.read().await;
+        cache.get(&pkg.pkgbase).map(|c| c.srcinfo.clone())
+    };
 
-    // Get list of packages we're tracking
-    let tracked_packages = state.db.list_packages().await?;
-    let tracked_names: std::collections::HashSet<String> = tracked_packages
-        .iter()
-        .map(|p| p.pkgbase.clone())
-        .collect();
+    let srcinfo = match srcinfo {
+        Some(si) => si,
+        None => read_srcinfo(&clone_path)?,
+    };
 
-    // Also get all pkgnames we track
-    let mut tracked_pkgnames: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for tp in &tracked_packages {
-        let names = state.db.get_package_names(&tp.pkgbase).await?;
-        for name in names {
-            tracked_pkgnames.insert(name.pkgname);
-        }
-    }
+    let tracked_pkgnames = crate::service::packages::get_tracked_pkgnames(&state).await?;
+    let resp = build_deps_response(&srcinfo, &state.aur, &tracked_pkgnames).await;
 
-    // Helper to parse dep string like "package>=1.0" into (name, constraint)
-    fn parse_dep(dep: &str) -> (String, Option<String>) {
-        // Find first version operator
-        for op in &[">=", "<=", "=", ">", "<"] {
-            if let Some(pos) = dep.find(op) {
-                return (dep[..pos].to_string(), Some(dep[pos..].to_string()));
-            }
-        }
-        (dep.to_string(), None)
-    }
+    Ok(Json(resp))
+}
 
-    // Helper to classify a dependency
+/// Build a PackageDepsResponse from srcinfo.
+async fn build_deps_response(
+    srcinfo: &crate::models::SrcInfo,
+    aur: &AurClient,
+    tracked_pkgnames: &HashSet<String>,
+) -> PackageDepsResponse {
     async fn classify_dep(
         name: &str,
-        aur: &crate::aur::AurClient,
-        tracked_names: &std::collections::HashSet<String>,
-        tracked_pkgnames: &std::collections::HashSet<String>,
+        aur: &AurClient,
+        tracked_pkgnames: &HashSet<String>,
     ) -> (String, bool) {
-        // Check if we're tracking it
-        let in_repo = tracked_names.contains(name) || tracked_pkgnames.contains(name);
+        let in_repo = tracked_pkgnames.contains(name);
 
-        // Check if it's in official repos using pacman
         let pacman_check = std::process::Command::new("pacman")
             .args(["-Si", name])
             .output();
@@ -1835,7 +1382,6 @@ async fn get_package_deps(
             }
         }
 
-        // Check if it's in AUR
         if let Ok(Some(_)) = aur.info_single(name).await {
             if in_repo {
                 return ("aur-tracked".to_string(), true);
@@ -1843,7 +1389,6 @@ async fn get_package_deps(
             return ("aur".to_string(), false);
         }
 
-        // Could be a virtual package (provides) - check with pacman -Ss
         let pacman_search = std::process::Command::new("pacman")
             .args(["-Ss", &format!("^{}$", name)])
             .output();
@@ -1857,11 +1402,10 @@ async fn get_package_deps(
         ("unknown".to_string(), in_repo)
     }
 
-    // Process depends
     let mut depends = Vec::new();
     for dep in &srcinfo.depends {
-        let (name, constraint) = parse_dep(dep);
-        let (source, in_repo) = classify_dep(&name, &state.aur, &tracked_names, &tracked_pkgnames).await;
+        let (name, constraint) = crate::service::packages::parse_dep(dep);
+        let (source, in_repo) = classify_dep(&name, aur, tracked_pkgnames).await;
         depends.push(DependencyInfo {
             name,
             version_constraint: constraint,
@@ -1870,11 +1414,10 @@ async fn get_package_deps(
         });
     }
 
-    // Process makedepends
     let mut makedepends = Vec::new();
     for dep in &srcinfo.makedepends {
-        let (name, constraint) = parse_dep(dep);
-        let (source, in_repo) = classify_dep(&name, &state.aur, &tracked_names, &tracked_pkgnames).await;
+        let (name, constraint) = crate::service::packages::parse_dep(dep);
+        let (source, in_repo) = classify_dep(&name, aur, tracked_pkgnames).await;
         makedepends.push(DependencyInfo {
             name,
             version_constraint: constraint,
@@ -1883,11 +1426,10 @@ async fn get_package_deps(
         });
     }
 
-    // Process checkdepends
     let mut checkdepends = Vec::new();
     for dep in &srcinfo.checkdepends {
-        let (name, constraint) = parse_dep(dep);
-        let (source, in_repo) = classify_dep(&name, &state.aur, &tracked_names, &tracked_pkgnames).await;
+        let (name, constraint) = crate::service::packages::parse_dep(dep);
+        let (source, in_repo) = classify_dep(&name, aur, tracked_pkgnames).await;
         checkdepends.push(DependencyInfo {
             name,
             version_constraint: constraint,
@@ -1896,484 +1438,78 @@ async fn get_package_deps(
         });
     }
 
-    Ok(Json(PackageDepsResponse {
+    PackageDepsResponse {
         depends,
         makedepends,
         checkdepends,
-        optdepends: srcinfo.optdepends,
-    }))
+        optdepends: srcinfo.optdepends.clone(),
+    }
 }
 
 async fn check_updates(
     State(state): State<SharedState>,
 ) -> Result<Json<CheckUpdatesResponse>, AppError> {
-    check_updates_inner(&state).await.map(Json)
-}
-
-/// Inner check_updates logic, reusable for the combined check-and-build endpoint
-async fn check_updates_inner(
-    state: &SharedState,
-) -> Result<CheckUpdatesResponse, AppError> {
-    // Collect package list and event sender under brief read lock
-    let (packages, aur_client, events_tx, aur_clones) = {
-        let state_read = state.read().await;
-        let pkgs = state_read.db.list_packages().await?;
-        let aur = AurClient::new();
-        let tx = state_read.events.clone();
-        let clones = state_read.config.resolved_cache().aur_clones;
-        (pkgs, aur, tx, clones)
-    };
-
-    let total = packages.len();
-    let checked_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-
-    // --- Phase 1: batch RPC version pre-check ---
-    // Query AUR RPC for all packages at once to compare versions,
-    // so we only git fetch packages that actually have updates.
-    let needs_fetch: std::collections::HashSet<String> = {
-        // Collect pkgbases to query (skip building packages)
-        let query_names: Vec<&str> = packages
-            .iter()
-            .filter(|p| p.status != PackageStatus::Building)
-            .map(|p| p.pkgbase.as_str())
-            .collect();
-
-        // Batch RPC query (handles up to ~250 per request via URL params)
-        let mut rpc_versions: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-        for chunk in query_names.chunks(200) {
-            match aur_client.info(chunk).await {
-                Ok(infos) => {
-                    for info in infos {
-                        rpc_versions.insert(info.package_base.clone(), info.version.clone());
-                    }
-                }
-                Err(e) => {
-                    // RPC failed — fall back to git fetch for all packages
-                    tracing::warn!("AUR RPC batch query failed, falling back to git fetch: {}", e);
-                    return check_updates_git_only(state, packages, events_tx, total).await;
-                }
-            }
-        }
-
-        let mut needs = std::collections::HashSet::new();
-        for pkg in &packages {
-            if pkg.status == PackageStatus::Building {
-                continue;
-            }
-
-            // VCS packages (-git, -svn, -hg, -bzr) always need git fetch
-            // because their version is computed at build time
-            let is_vcs = pkg.pkgbase.ends_with("-git")
-                || pkg.pkgbase.ends_with("-svn")
-                || pkg.pkgbase.ends_with("-hg")
-                || pkg.pkgbase.ends_with("-bzr");
-
-            if is_vcs {
-                needs.insert(pkg.pkgbase.clone());
-                continue;
-            }
-
-            match (rpc_versions.get(&pkg.pkgbase), &pkg.pkgver) {
-                (Some(rpc_ver), Some(local_ver)) => {
-                    // Use vercmp for proper epoch/pkgrel comparison
-                    if vercmp(rpc_ver, local_ver) != std::cmp::Ordering::Equal {
-                        needs.insert(pkg.pkgbase.clone());
-                    }
-                }
-                (Some(_), None) => {
-                    // No local version stored — need to fetch
-                    needs.insert(pkg.pkgbase.clone());
-                }
-                (None, _) => {
-                    // Not found in RPC (deleted from AUR?) — try git fetch anyway
-                    needs.insert(pkg.pkgbase.clone());
-                }
-            }
-        }
-
-        tracing::info!(
-            "RPC pre-check: {}/{} packages need git fetch",
-            needs.len(),
-            query_names.len()
-        );
-
-        needs
-    };
-
-    // --- Phase 2: git fetch only packages that need it ---
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(4));
-    let mut join_set = tokio::task::JoinSet::new();
-
-    for pkg in packages {
-        // Don't touch the source directory while a build is actively using it
-        if pkg.status == PackageStatus::Building {
-            let n = checked_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            emit_event(
-                &events_tx,
-                ServerEvent::CheckUpdatesProgress {
-                    checked: n,
-                    total,
-                    current: pkg.pkgbase.clone(),
-                },
-            );
-            continue;
-        }
-
-        // Skip packages where RPC version matches local version
-        if !needs_fetch.contains(&pkg.pkgbase) {
-            let n = checked_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            emit_event(
-                &events_tx,
-                ServerEvent::CheckUpdatesProgress {
-                    checked: n,
-                    total,
-                    current: pkg.pkgbase.clone(),
-                },
-            );
-            continue;
-        }
-
-        let semaphore = semaphore.clone();
-        let state = state.clone();
-        let events_tx = events_tx.clone();
-        let checked_counter = checked_counter.clone();
-        let pkgbase = pkg.pkgbase.clone();
-        let clone_path = pkg.clone_path(&aur_clones);
-        let auto_approve = pkg.auto_approve;
-        let pkg_status = pkg.status;
-
-        // Each task returns Option<String> — Some(pkgbase) if updated
-        join_set.spawn(async move {
-            let _permit = semaphore.acquire().await.unwrap();
-
-            // Ensure clone exists, then check for updates
-            let clone_path_fetch = clone_path.clone();
-            let pkgbase_for_err = pkgbase.clone();
-            let has_updates = tokio::task::spawn_blocking(move || {
-                AurGit::ensure_cloned(&pkgbase_for_err, &clone_path_fetch)?;
-                AurGit::has_updates(&clone_path_fetch)
-            })
-            .await
-            .map_err(|e| AppError::internal(format!("Task join error: {}", e)))?
-            .map_err(|e| AppError::internal(format!("git fetch failed for {}: {}", pkgbase.clone(), e)))?;
-
-            let result = if has_updates {
-                let clone_path_reset = clone_path.clone();
-                let pkgbase_for_err = pkgbase.clone();
-                tokio::task::spawn_blocking(move || {
-                    AurGit::reset_to_remote(&clone_path_reset)
-                })
-                .await
-                .map_err(|e| AppError::internal(format!("Task join error: {}", e)))?
-                .map_err(|e| AppError::internal(format!("git reset failed for {}: {}", pkgbase_for_err, e)))?;
-
-                let clone_path_head = clone_path.clone();
-                let pkgbase_for_err = pkgbase.clone();
-                let new_commit = tokio::task::spawn_blocking(move || {
-                    AurGit::head_commit(&clone_path_head)
-                })
-                .await
-                .map_err(|e| AppError::internal(format!("Task join error: {}", e)))?
-                .map_err(|e| AppError::internal(format!("git head_commit failed for {}: {}", pkgbase_for_err, e)))?;
-
-                // Re-parse .SRCINFO (disk I/O)
-                let clone_path_srcinfo = clone_path.clone();
-                let pkgbase_for_err = pkgbase.clone();
-                let srcinfo = tokio::task::spawn_blocking(move || {
-                    read_srcinfo(&clone_path_srcinfo)
-                })
-                .await
-                .map_err(|e| AppError::internal(format!("Task join error: {}", e)))?
-                .map_err(|e| AppError::internal(format!("srcinfo parse failed for {}: {}", pkgbase_for_err, e)))?;
-
-                let pkgver = format!("{}-{}", srcinfo.pkgver, srcinfo.pkgrel);
-
-                // Acquire write lock briefly for DB updates
-                let state_write = state.write().await;
-                state_write
-                    .db
-                    .update_package_commit(&pkgbase, &new_commit, Some(&pkgver))
-                    .await
-                    .map_err(|e| AppError::internal(format!("DB error: {}", e)))?;
-
-                let new_status = if auto_approve && pkg_status == PackageStatus::UpdateAvailable {
-                    state_write.db.approve_package(&pkgbase, true, None).await
-                        .map_err(|e| AppError::internal(format!("DB error: {}", e)))?;
-                    PackageStatus::Approved
-                } else {
-                    PackageStatus::UpdateAvailable
-                };
-
-                state_write
-                    .db
-                    .update_package_status(&pkgbase, new_status)
-                    .await
-                    .map_err(|e| AppError::internal(format!("DB error: {}", e)))?;
-
-                emit_event(
-                    &state_write.events,
-                    ServerEvent::PackageStatusChanged {
-                        pkgbase: pkgbase.clone(),
-                        new_status: new_status.to_string(),
-                    },
-                );
-                drop(state_write);
-
-                Some(pkgbase.clone())
-            } else {
-                None
-            };
-
-            let n = checked_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            emit_event(
-                &events_tx,
-                ServerEvent::CheckUpdatesProgress {
-                    checked: n,
-                    total,
-                    current: pkgbase,
-                },
-            );
-
-            Ok::<Option<String>, AppError>(result)
-        });
-    }
-
-    // Collect results
-    let mut updated = Vec::new();
-    while let Some(result) = join_set.join_next().await {
-        match result {
-            Ok(Ok(Some(pkgbase))) => updated.push(pkgbase),
-            Ok(Ok(None)) => {}
-            Ok(Err(e)) => {
-                tracing::warn!("check_updates task failed: {}", e.message);
-            }
-            Err(e) => {
-                tracing::warn!("check_updates task panicked: {}", e);
-            }
-        }
-    }
-
-    emit_event(
-        &events_tx,
-        ServerEvent::CheckUpdatesComplete {
-            checked: total,
-            updated: updated.clone(),
-        },
-    );
-
-    Ok(CheckUpdatesResponse {
-        checked: total,
-        updated,
-    })
-}
-
-/// Fallback: check all packages via git fetch (used when RPC batch query fails)
-async fn check_updates_git_only(
-    state: &SharedState,
-    packages: Vec<Package>,
-    events_tx: broadcast::Sender<ServerEvent>,
-    total: usize,
-) -> Result<CheckUpdatesResponse, AppError> {
-    let aur_clones = {
-        let state_read = state.read().await;
-        state_read.config.resolved_cache().aur_clones
-    };
-    let checked_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(4));
-    let mut join_set = tokio::task::JoinSet::new();
-
-    for pkg in packages {
-        if pkg.status == PackageStatus::Building {
-            let n = checked_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            emit_event(
-                &events_tx,
-                ServerEvent::CheckUpdatesProgress {
-                    checked: n,
-                    total,
-                    current: pkg.pkgbase.clone(),
-                },
-            );
-            continue;
-        }
-
-        let semaphore = semaphore.clone();
-        let state = state.clone();
-        let events_tx = events_tx.clone();
-        let checked_counter = checked_counter.clone();
-        let pkgbase = pkg.pkgbase.clone();
-        let clone_path = pkg.clone_path(&aur_clones);
-        let auto_approve = pkg.auto_approve;
-        let pkg_status = pkg.status;
-
-        join_set.spawn(async move {
-            let _permit = semaphore.acquire().await.unwrap();
-
-            let clone_path_fetch = clone_path.clone();
-            let pkgbase_for_clone = pkgbase.clone();
-            let has_updates = tokio::task::spawn_blocking(move || {
-                AurGit::ensure_cloned(&pkgbase_for_clone, &clone_path_fetch)?;
-                AurGit::has_updates(&clone_path_fetch)
-            })
-            .await
-            .map_err(|e| AppError::internal(format!("Task join error: {}", e)))?
-            .map_err(|e| AppError::internal(format!("git fetch failed for {}: {}", pkgbase.clone(), e)))?;
-
-            let result = if has_updates {
-                let clone_path_reset = clone_path.clone();
-                let pkgbase_for_err = pkgbase.clone();
-                tokio::task::spawn_blocking(move || {
-                    AurGit::reset_to_remote(&clone_path_reset)
-                })
-                .await
-                .map_err(|e| AppError::internal(format!("Task join error: {}", e)))?
-                .map_err(|e| AppError::internal(format!("git reset failed for {}: {}", pkgbase_for_err, e)))?;
-
-                let clone_path_head = clone_path.clone();
-                let pkgbase_for_err = pkgbase.clone();
-                let new_commit = tokio::task::spawn_blocking(move || {
-                    AurGit::head_commit(&clone_path_head)
-                })
-                .await
-                .map_err(|e| AppError::internal(format!("Task join error: {}", e)))?
-                .map_err(|e| AppError::internal(format!("git head_commit failed for {}: {}", pkgbase_for_err, e)))?;
-
-                let clone_path_srcinfo = clone_path.clone();
-                let pkgbase_for_err = pkgbase.clone();
-                let srcinfo = tokio::task::spawn_blocking(move || {
-                    read_srcinfo(&clone_path_srcinfo)
-                })
-                .await
-                .map_err(|e| AppError::internal(format!("Task join error: {}", e)))?
-                .map_err(|e| AppError::internal(format!("srcinfo parse failed for {}: {}", pkgbase_for_err, e)))?;
-
-                let pkgver = format!("{}-{}", srcinfo.pkgver, srcinfo.pkgrel);
-
-                let state_write = state.write().await;
-                state_write
-                    .db
-                    .update_package_commit(&pkgbase, &new_commit, Some(&pkgver))
-                    .await
-                    .map_err(|e| AppError::internal(format!("DB error: {}", e)))?;
-
-                let new_status = if auto_approve && pkg_status == PackageStatus::UpdateAvailable {
-                    state_write.db.approve_package(&pkgbase, true, None).await
-                        .map_err(|e| AppError::internal(format!("DB error: {}", e)))?;
-                    PackageStatus::Approved
-                } else {
-                    PackageStatus::UpdateAvailable
-                };
-
-                state_write
-                    .db
-                    .update_package_status(&pkgbase, new_status)
-                    .await
-                    .map_err(|e| AppError::internal(format!("DB error: {}", e)))?;
-
-                emit_event(
-                    &state_write.events,
-                    ServerEvent::PackageStatusChanged {
-                        pkgbase: pkgbase.clone(),
-                        new_status: new_status.to_string(),
-                    },
-                );
-                drop(state_write);
-
-                Some(pkgbase.clone())
-            } else {
-                None
-            };
-
-            let n = checked_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            emit_event(
-                &events_tx,
-                ServerEvent::CheckUpdatesProgress {
-                    checked: n,
-                    total,
-                    current: pkgbase,
-                },
-            );
-
-            Ok::<Option<String>, AppError>(result)
-        });
-    }
-
-    let mut updated = Vec::new();
-    while let Some(result) = join_set.join_next().await {
-        match result {
-            Ok(Ok(Some(pkgbase))) => updated.push(pkgbase),
-            Ok(Ok(None)) => {}
-            Ok(Err(e)) => {
-                tracing::warn!("check_updates task failed: {}", e.message);
-            }
-            Err(e) => {
-                tracing::warn!("check_updates task panicked: {}", e);
-            }
-        }
-    }
-
-    emit_event(
-        &events_tx,
-        ServerEvent::CheckUpdatesComplete {
-            checked: total,
-            updated: updated.clone(),
-        },
-    );
-
-    Ok(CheckUpdatesResponse {
-        checked: total,
-        updated,
-    })
+    let result = crate::service::updates::check_updates_inner(&state).await?;
+    Ok(Json(CheckUpdatesResponse {
+        checked: result.checked,
+        updated: result.updated,
+    }))
 }
 
 async fn check_package_update(
     State(state): State<SharedState>,
     Path(pkgbase): Path<String>,
 ) -> Result<Json<PackageResponse>, AppError> {
-    // Resolve package under brief read lock
-    let pkg = {
-        let state_read = state.read().await;
-        resolve_package(&state_read, &pkgbase).await?
-    };
+    let pkg = crate::service::packages::resolve_package(&state, &pkgbase).await?;
 
-    let clone_path = {
-        let state_read = state.read().await;
-        pkg.clone_path(&state_read.config.resolved_cache().aur_clones)
-    };
-    AurGit::ensure_cloned(&pkg.pkgbase, &clone_path)?;
+    let clone_path = pkg.clone_path(&state.config.resolved_cache().aur_clones);
+    let pb = pkg.pkgbase.clone();
+    let cp = clone_path.clone();
+    tokio::task::spawn_blocking(move || AurGit::ensure_cloned(&pb, &cp))
+        .await
+        .map_err(|e| AppError::internal(format!("Task join error: {}", e)))?
+        .map_err(|e| AppError::internal(e.to_string()))?;
 
-    // Do git fetch/has_updates outside the lock (network I/O)
-    if AurGit::has_updates(&clone_path)? {
-        AurGit::reset_to_remote(&clone_path)?;
-        let new_commit = AurGit::head_commit(&clone_path)?;
+    let cp = clone_path.clone();
+    let has_updates = tokio::task::spawn_blocking(move || AurGit::has_updates(&cp))
+        .await
+        .map_err(|e| AppError::internal(format!("Task join error: {}", e)))?
+        .map_err(|e| AppError::internal(e.to_string()))?;
 
-        // Re-parse .SRCINFO (disk I/O, no lock needed)
-        let srcinfo = read_srcinfo(&clone_path)?;
-        let pkgver = format!("{}-{}", srcinfo.pkgver, srcinfo.pkgrel);
+    if has_updates {
+        let cp = clone_path.clone();
+        tokio::task::spawn_blocking(move || AurGit::reset_to_remote(&cp))
+            .await
+            .map_err(|e| AppError::internal(format!("Task join error: {}", e)))?
+            .map_err(|e| AppError::internal(e.to_string()))?;
 
-        // Re-acquire write lock only for brief DB updates
-        let state_write = state.write().await;
-        state_write
-            .db
-            .update_package_commit(&pkg.pkgbase, &new_commit, Some(&pkgver))
-            .await?;
+        // Re-read and update cache
+        let cp = clone_path.clone();
+        let (new_commit, srcinfo) = tokio::task::spawn_blocking(move || {
+            let commit = AurGit::head_commit(&cp)?;
+            let srcinfo = read_srcinfo(&cp)?;
+            Ok::<_, anyhow::Error>((commit, srcinfo))
+        })
+        .await
+        .map_err(|e| AppError::internal(format!("Task join error: {}", e)))?
+        .map_err(|e| AppError::internal(e.to_string()))?;
 
-        state_write
-            .db
-            .update_package_status(&pkg.pkgbase, PackageStatus::UpdateAvailable)
-            .await?;
+        // Update SrcInfoCache
+        {
+            let mut cache = state.srcinfo_cache.write().await;
+            cache.insert(pkg.pkgbase.clone(), srcinfo, new_commit);
+        }
     }
 
-    // Reload package to get updated data under read lock
-    let state_read = state.read().await;
-    let pkg = state_read
+    // Reload package
+    let pkg = state
         .db
         .get_package(&pkg.pkgbase)
         .await?
         .ok_or_else(|| AppError::internal("Package disappeared"))?;
-    let names = state_read.db.get_package_names(&pkg.pkgbase).await?;
 
-    Ok(Json(package_to_response(pkg, names)))
+    let resp = assemble_package_response(&state, &pkg).await;
+    Ok(Json(resp))
 }
 
 // ==================== AUR handlers ====================
@@ -2382,11 +1518,9 @@ async fn search_aur(
     State(state): State<SharedState>,
     Query(query): Query<SearchQuery>,
 ) -> Result<Json<Vec<crate::models::AurSearchResult>>, AppError> {
-    let state = state.read().await;
     let results = state.aur.search(&query.q).await?;
 
-    // Get the set of tracked pkgbases
-    let tracked_pkgbases: std::collections::HashSet<String> = state
+    let tracked_pkgbases: HashSet<String> = state
         .db
         .list_packages()
         .await?
@@ -2394,7 +1528,6 @@ async fn search_aur(
         .map(|p| p.pkgbase)
         .collect();
 
-    // Annotate each result with whether it's tracked
     let results: Vec<crate::models::AurSearchResult> = results
         .into_iter()
         .map(|info| {
@@ -2410,7 +1543,6 @@ async fn aur_info(
     State(state): State<SharedState>,
     Path(name): Path<String>,
 ) -> Result<Json<Option<crate::models::AurPackageInfo>>, AppError> {
-    let state = state.read().await;
     let info = state.aur.info_single(&name).await?;
     Ok(Json(info))
 }
@@ -2421,33 +1553,18 @@ async fn list_all_builds(
     State(state): State<SharedState>,
     Query(query): Query<BuildsListQuery>,
 ) -> Result<Json<Vec<BuildDetailResponse>>, AppError> {
-    let state = state.read().await;
-
     let limit = query.limit.unwrap_or(50).min(200);
     let offset = query.offset.unwrap_or(0).max(0);
 
-    let builds = state
+    let builds_raw = state
         .db
         .list_all_builds(limit, offset, query.status.as_deref())
         .await?;
 
-    let results: Vec<BuildDetailResponse> = builds
-        .into_iter()
-        .map(|build| {
-            let current_stage =
-                if build.status == crate::models::BuildStatus::Running
-                    || build.status == crate::models::BuildStatus::Pending
-                {
-                    state.build_stages.get(&build.id).map(|s| s.to_string())
-                } else {
-                    None
-                };
-            BuildDetailResponse {
-                build,
-                current_stage,
-            }
-        })
-        .collect();
+    let mut results = Vec::new();
+    for build in builds_raw {
+        results.push(build_detail_response(&state, build).await);
+    }
 
     Ok(Json(results))
 }
@@ -2456,33 +1573,20 @@ async fn get_build(
     State(state): State<SharedState>,
     Path(id): Path<String>,
 ) -> Result<Json<BuildDetailResponse>, AppError> {
-    let state = state.read().await;
     let build = state
         .db
         .get_build(&id)
         .await?
         .ok_or_else(|| AppError::not_found("Build not found"))?;
 
-    // Get current stage from in-memory tracking (only for running builds)
-    let current_stage = if build.status == crate::models::BuildStatus::Running
-        || build.status == crate::models::BuildStatus::Pending
-    {
-        state.build_stages.get(&id).map(|s| s.to_string())
-    } else {
-        None
-    };
-
-    Ok(Json(BuildDetailResponse {
-        build,
-        current_stage,
-    }))
+    let resp = build_detail_response(&state, build).await;
+    Ok(Json(resp))
 }
 
 async fn get_build_logs(
     State(state): State<SharedState>,
     Path(id): Path<String>,
 ) -> Result<String, AppError> {
-    let state = state.read().await;
     let build = state
         .db
         .get_build(&id)
@@ -2496,37 +1600,33 @@ async fn get_build_logs(
 
     let content = std::fs::read_to_string(&log_path)
         .unwrap_or_else(|_| "Log file not found or empty".to_string());
-
     Ok(content)
 }
 
-/// WebSocket endpoint for streaming build logs in real-time
 async fn stream_build_logs(
     State(state): State<SharedState>,
     Path(id): Path<String>,
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, AppError> {
-    // Validate build exists and get log path
-    let (log_path, build_id, pkgbase) = {
-        let state_read = state.read().await;
-        let build = state_read
-            .db
-            .get_build(&id)
-            .await?
-            .ok_or_else(|| AppError::not_found("Build not found"))?;
+    let build = state
+        .db
+        .get_build(&id)
+        .await?
+        .ok_or_else(|| AppError::not_found("Build not found"))?;
 
-        let logs_dir = state_read.config.resolved_cache().logs;
-        let log_path = build
-            .resolve_log_path(&logs_dir)
-            .ok_or_else(|| AppError::not_found("No log file for this build"))?;
+    let logs_dir = state.config.resolved_cache().logs;
+    let log_path = build
+        .resolve_log_path(&logs_dir)
+        .ok_or_else(|| AppError::not_found("No log file for this build"))?;
 
-        (log_path, build.id, build.pkgbase)
-    };
+    let build_id = build.id;
+    let pkgbase = build.pkgbase;
 
-    Ok(ws.on_upgrade(move |socket| handle_log_stream(socket, state, build_id, pkgbase, log_path)))
+    Ok(ws.on_upgrade(move |socket| {
+        handle_log_stream(socket, state, build_id, pkgbase, log_path)
+    }))
 }
 
-/// WebSocket message for stage changes
 #[derive(Serialize)]
 struct StageChangeMessage {
     #[serde(rename = "type")]
@@ -2534,7 +1634,6 @@ struct StageChangeMessage {
     stage: String,
 }
 
-/// Send a stage change message over WebSocket
 async fn send_stage_change(socket: &mut WebSocket, stage: BuildStage) -> bool {
     let msg = StageChangeMessage {
         msg_type: "stage",
@@ -2543,11 +1642,10 @@ async fn send_stage_change(socket: &mut WebSocket, stage: BuildStage) -> bool {
     if let Ok(json) = serde_json::to_string(&msg) {
         socket.send(Message::Text(json.into())).await.is_ok()
     } else {
-        true // Don't disconnect on serialization failure
+        true
     }
 }
 
-/// Handle the WebSocket connection for log streaming
 async fn handle_log_stream(
     mut socket: WebSocket,
     state: SharedState,
@@ -2557,27 +1655,25 @@ async fn handle_log_stream(
 ) {
     tracing::info!("WebSocket connected for build {} logs", build_id);
 
-    // Track the last stage we sent to avoid duplicates
     let mut last_sent_stage: Option<BuildStage> = None;
 
     // Send the current stage if build is already in progress
     {
-        let state_read = state.read().await;
-        if let Some(&stage) = state_read.build_stages.get(&build_id) {
+        let stages = state.build_stages.read().await;
+        if let Some(&stage) = stages.get(&build_id) {
             if send_stage_change(&mut socket, stage).await {
                 last_sent_stage = Some(stage);
             }
         }
     }
 
-    // Wait for log file to exist (build might just be starting)
+    // Wait for log file to exist
     let mut attempts = 0;
     while !log_path.exists() && attempts < 30 {
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         attempts += 1;
     }
 
-    // Open the log file
     let file = match tokio::fs::File::open(&log_path).await {
         Ok(f) => f,
         Err(e) => {
@@ -2601,18 +1697,17 @@ async fn handle_log_stream(
     let mut last_position: u64 = 0;
 
     loop {
-        // Read any new lines
         loop {
             line_buf.clear();
             match reader.read_line(&mut line_buf).await {
-                Ok(0) => break, // No more data available right now
+                Ok(0) => break,
                 Ok(_) => {
-                    // Check for stage change markers in the log line
                     if let Some(new_stage) = BuildStage::from_log_line(&line_buf) {
-                        // Update in-memory stage tracking
-                        set_build_stage(&state, &build_id, &pkgbase, new_stage).await;
+                        crate::service::builds::set_build_stage(
+                            &state, &build_id, &pkgbase, new_stage,
+                        )
+                        .await;
 
-                        // Send stage change to WebSocket client if different from last sent
                         if last_sent_stage != Some(new_stage) {
                             if send_stage_change(&mut socket, new_stage).await {
                                 last_sent_stage = Some(new_stage);
@@ -2620,14 +1715,15 @@ async fn handle_log_stream(
                         }
                     }
 
-                    // Send the log line over WebSocket
                     if socket
                         .send(Message::Text(line_buf.clone().into()))
                         .await
                         .is_err()
                     {
-                        // Client disconnected
-                        tracing::info!("WebSocket client disconnected for build {}", build_id);
+                        tracing::info!(
+                            "WebSocket client disconnected for build {}",
+                            build_id
+                        );
                         return;
                     }
                 }
@@ -2642,26 +1738,23 @@ async fn handle_log_stream(
             }
         }
 
-        // Remember current position
         if let Ok(pos) = reader.stream_position().await {
             last_position = pos;
         }
 
-        // Check if build is still running and get current stage
         let (build_status, current_stage) = {
-            let state_read = state.read().await;
-            let status = state_read
+            let status = state
                 .db
                 .get_build(&build_id)
                 .await
                 .ok()
                 .flatten()
                 .map(|b| b.status);
-            let stage = state_read.build_stages.get(&build_id).copied();
+            let stages = state.build_stages.read().await;
+            let stage = stages.get(&build_id).copied();
             (status, stage)
         };
 
-        // Send stage update if it changed (from host-side operations like moving/indexing)
         if let Some(stage) = current_stage {
             if last_sent_stage != Some(stage) {
                 if send_stage_change(&mut socket, stage).await {
@@ -2671,27 +1764,28 @@ async fn handle_log_stream(
         }
 
         match build_status {
-            Some(crate::models::BuildStatus::Running) | Some(crate::models::BuildStatus::Pending) => {
-                // Build still in progress, wait and check for more output
+            Some(crate::models::BuildStatus::Running)
+            | Some(crate::models::BuildStatus::Pending) => {
                 tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
 
-                // Re-open file to check for new content (handles file being appended to)
                 if let Ok(file) = tokio::fs::File::open(&log_path).await {
                     reader = tokio::io::BufReader::new(file);
-                    if reader.seek(std::io::SeekFrom::Start(last_position)).await.is_err() {
+                    if reader
+                        .seek(std::io::SeekFrom::Start(last_position))
+                        .await
+                        .is_err()
+                    {
                         continue;
                     }
                 }
             }
             Some(status) => {
-                // Build completed (success, failed, or cancelled)
-                // Read any remaining content
+                // Build completed - read remaining
                 loop {
                     line_buf.clear();
                     match reader.read_line(&mut line_buf).await {
                         Ok(0) => break,
                         Ok(_) => {
-                            // Check for stage markers in remaining lines too
                             if let Some(new_stage) = BuildStage::from_log_line(&line_buf) {
                                 if last_sent_stage != Some(new_stage) {
                                     if send_stage_change(&mut socket, new_stage).await {
@@ -2705,7 +1799,6 @@ async fn handle_log_stream(
                     }
                 }
 
-                // Send final stage
                 let final_stage = match status {
                     crate::models::BuildStatus::Success => BuildStage::Complete,
                     _ => BuildStage::Failed,
@@ -2714,7 +1807,6 @@ async fn handle_log_stream(
                     let _ = send_stage_change(&mut socket, final_stage).await;
                 }
 
-                // Send completion message
                 let status_msg = match status {
                     crate::models::BuildStatus::Success => "[Build completed successfully]",
                     crate::models::BuildStatus::Failed => "[Build failed]",
@@ -2727,7 +1819,6 @@ async fn handle_log_stream(
                 break;
             }
             None => {
-                // Build not found (deleted?)
                 let _ = socket
                     .send(Message::Text("[Build not found]".to_string().into()))
                     .await;
@@ -2735,7 +1826,6 @@ async fn handle_log_stream(
             }
         }
 
-        // Check for incoming messages (ping/pong, close)
         match tokio::time::timeout(
             tokio::time::Duration::from_millis(10),
             socket.recv(),
@@ -2750,12 +1840,9 @@ async fn handle_log_stream(
                 let _ = socket.send(Message::Pong(data)).await;
             }
             Ok(Some(Err(_))) | Ok(None) => {
-                // Connection error or closed
                 break;
             }
-            _ => {
-                // Timeout or other message, continue
-            }
+            _ => {}
         }
     }
 
@@ -2768,7 +1855,6 @@ async fn handle_log_stream(
     tracing::info!("WebSocket closed for build {}", build_id);
 }
 
-/// Queue multiple builds in dependency order
 async fn queue_builds(
     State(state): State<SharedState>,
     Json(req): Json<QueueBuildsRequest>,
@@ -2784,10 +1870,7 @@ async fn queue_builds_inner(
         return Err(AppError::bad_request("No packages specified"));
     }
 
-    let state_read = state.read().await;
-
-    // Check base image exists
-    match state_read.build.image_exists() {
+    match state.build.image_exists() {
         Ok(true) => {}
         Ok(false) => {
             return Err(AppError::bad_request(
@@ -2807,19 +1890,38 @@ async fn queue_builds_inner(
     let mut skipped: Vec<QueueSkipped> = Vec::new();
 
     for name in &req.packages {
-        match resolve_package(&state_read, name).await {
+        match crate::service::packages::resolve_package(state, name).await {
             Ok(pkg) => {
-                if pkg.status != PackageStatus::Approved && pkg.status != PackageStatus::UpdateAvailable {
+                let status = derive_package_status(state, &pkg).await;
+                if status != DerivedStatus::Approved && status != DerivedStatus::UpdateAvailable {
                     skipped.push(QueueSkipped {
                         pkgbase: pkg.pkgbase,
-                        reason: format!("Package status is '{}', must be 'approved' or 'update_available'", pkg.status),
-                    });
-                } else if pkg.current_commit.is_none() {
-                    skipped.push(QueueSkipped {
-                        pkgbase: pkg.pkgbase,
-                        reason: "Package has no current commit".to_string(),
+                        reason: format!(
+                            "Package status is '{}', must be 'approved' or 'update_available'",
+                            status
+                        ),
                     });
                 } else {
+                    // Verify we can get a commit
+                    let cache = state.srcinfo_cache.read().await;
+                    let has_commit = cache.get(&pkg.pkgbase).is_some();
+                    drop(cache);
+
+                    if !has_commit {
+                        let clone_dir =
+                            pkg.clone_path(&state.config.resolved_cache().aur_clones);
+                        if SrcInfoCache::get_head_commit(&clone_dir)
+                            .ok()
+                            .flatten()
+                            .is_none()
+                        {
+                            skipped.push(QueueSkipped {
+                                pkgbase: pkg.pkgbase,
+                                reason: "Package has no current commit".to_string(),
+                            });
+                            continue;
+                        }
+                    }
                     packages_to_build.push(pkg);
                 }
             }
@@ -2840,107 +1942,134 @@ async fn queue_builds_inner(
         });
     }
 
-    // Build dependency graph for topological sort
-    // Map pkgbase -> set of pkgbases it depends on (that are also in our build list)
-    let pkgbases_set: std::collections::HashSet<String> = packages_to_build
+    // Build dependency graph using srcinfo cache
+    let pkgbases_set: HashSet<String> = packages_to_build
         .iter()
         .map(|p| p.pkgbase.clone())
         .collect();
 
-    // Also map pkgnames to pkgbases for dependency lookup
-    let mut pkgname_to_pkgbase: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let cache = state.srcinfo_cache.read().await;
+
+    // Map pkgnames to pkgbases for dependency lookup
+    let mut pkgname_to_pkgbase: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for pkg in &packages_to_build {
-        let names = state_read.db.get_package_names(&pkg.pkgbase).await?;
-        for name in names {
-            pkgname_to_pkgbase.insert(name.pkgname, pkg.pkgbase.clone());
+        if let Some(cached) = cache.get(&pkg.pkgbase) {
+            for sp in &cached.srcinfo.packages {
+                pkgname_to_pkgbase.insert(sp.pkgname.clone(), pkg.pkgbase.clone());
+            }
         }
     }
 
-    // Build the dependency graph: pkgbase -> Vec<pkgbases it depends on>
-    let mut deps_graph: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    // Build the dependency graph
+    let mut deps_graph: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
 
     for pkg in &packages_to_build {
-        let names = state_read.db.get_package_names(&pkg.pkgbase).await?;
         let mut pkg_deps: Vec<String> = Vec::new();
-
-        for name in &names {
-            if let Some(deps_json) = &name.depends {
-                if let Ok(deps) = serde_json::from_str::<Vec<String>>(deps_json) {
-                    for dep in deps {
-                        let dep_name = crate::aur::DepResolver::dep_name(&dep);
-                        // Check if this dependency is one of the packages we're building
-                        if let Some(dep_pkgbase) = pkgname_to_pkgbase.get(dep_name) {
-                            if dep_pkgbase != &pkg.pkgbase && pkgbases_set.contains(dep_pkgbase) {
-                                pkg_deps.push(dep_pkgbase.clone());
-                            }
+        if let Some(cached) = cache.get(&pkg.pkgbase) {
+            // Global deps
+            for dep in cached
+                .srcinfo
+                .depends
+                .iter()
+                .chain(cached.srcinfo.makedepends.iter())
+                .chain(cached.srcinfo.checkdepends.iter())
+            {
+                let dep_name = DepResolver::dep_name(dep);
+                if let Some(dep_pkgbase) = pkgname_to_pkgbase.get(dep_name) {
+                    if dep_pkgbase != &pkg.pkgbase && pkgbases_set.contains(dep_pkgbase) {
+                        pkg_deps.push(dep_pkgbase.clone());
+                    }
+                }
+            }
+            // Per-package deps
+            for sp in &cached.srcinfo.packages {
+                for dep in &sp.depends {
+                    let dep_name = DepResolver::dep_name(dep);
+                    if let Some(dep_pkgbase) = pkgname_to_pkgbase.get(dep_name) {
+                        if dep_pkgbase != &pkg.pkgbase && pkgbases_set.contains(dep_pkgbase) {
+                            pkg_deps.push(dep_pkgbase.clone());
                         }
                     }
                 }
             }
         }
-
         pkg_deps.sort();
         pkg_deps.dedup();
         deps_graph.insert(pkg.pkgbase.clone(), pkg_deps);
     }
 
-    // Topological sort using Kahn's algorithm
-    let build_order = topological_sort(&pkgbases_set, &deps_graph)?;
+    drop(cache);
 
-    // Create build records for each package
-    let config = state_read.config.clone();
-    drop(state_read);
+    let build_order = crate::service::builds::topological_sort(&pkgbases_set, &deps_graph)?;
+
+    let config = state.config.clone();
 
     // Create a shared cancel flag for the entire queue
     let cancel_flag = Arc::new(AtomicBool::new(false));
 
     let mut build_ids: Vec<String> = Vec::new();
-    let mut pkg_info: Vec<(String, String, std::path::PathBuf)> = Vec::new(); // (pkgbase, build_id, log_path)
+    let mut pkg_info: Vec<(String, String, std::path::PathBuf)> = Vec::new();
 
-    {
-        let mut state_write = state.write().await;
-        let now = chrono::Utc::now();
+    let now = chrono::Utc::now();
 
-        for pkgbase in &build_order {
-            let pkg = packages_to_build.iter().find(|p| &p.pkgbase == pkgbase).unwrap();
-            let build_id = uuid::Uuid::new_v4().to_string();
-            let log_filename = format!("{}.log", build_id);
-            let log_path = config.resolved_cache().logs.join(&log_filename);
-            let commit = pkg.current_commit.clone().unwrap();
+    for pkgbase in &build_order {
+        let build_id = uuid::Uuid::new_v4().to_string();
+        let log_filename = format!("{}.log", build_id);
+        let log_path = config.resolved_cache().logs.join(&log_filename);
 
-            let build = crate::models::Build {
-                id: build_id.clone(),
-                pkgbase: pkgbase.clone(),
-                commit,
-                status: crate::models::BuildStatus::Pending,
-                started_at: now,
-                finished_at: None,
-                log_path: Some(log_filename),
-                outputs: None,
-                error_message: None,
-            };
+        // Get commit from cache
+        let cache = state.srcinfo_cache.read().await;
+        let commit = cache
+            .get(pkgbase)
+            .map(|c| c.commit.clone())
+            .unwrap_or_else(|| {
+                let clone_dir = state.config.resolved_cache().aur_clones.join(pkgbase);
+                SrcInfoCache::get_head_commit(&clone_dir)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default()
+            });
+        drop(cache);
 
-            state_write.db.insert_build(&build).await?;
+        let build = crate::models::Build {
+            id: build_id.clone(),
+            pkgbase: pkgbase.clone(),
+            commit,
+            status: crate::models::BuildStatus::Pending,
+            started_at: now,
+            finished_at: None,
+            log_path: Some(log_filename),
+            outputs: None,
+            error_message: None,
+        };
 
-            // Store the shared cancel flag for each build in the queue
-            state_write.build_cancel_flags.insert(build_id.clone(), cancel_flag.clone());
+        state.db.insert_build(&build).await?;
 
-            build_ids.push(build_id.clone());
-            pkg_info.push((
-                pkgbase.clone(),
-                build_id,
-                log_path,
-            ));
+        // Store cancel flag for each build
+        {
+            let mut flags = state.build_cancel_flags.write().await;
+            flags.insert(build_id.clone(), cancel_flag.clone());
         }
+
+        build_ids.push(build_id.clone());
+        pkg_info.push((pkgbase.clone(), build_id, log_path));
     }
 
-    // Spawn background task to run builds sequentially
     let state_clone = state.clone();
     let deps_graph_clone = deps_graph.clone();
     let cancel_flag_clone = cancel_flag.clone();
 
     tokio::spawn(async move {
-        run_queued_builds(state_clone, pkg_info, deps_graph_clone, config, cancel_flag_clone).await;
+        crate::service::builds::run_queued_builds(
+            state_clone,
+            pkg_info,
+            deps_graph_clone,
+            config,
+            cancel_flag_clone,
+        )
+        .await;
     });
 
     Ok(QueueBuildsResponse {
@@ -2950,460 +2079,46 @@ async fn queue_builds_inner(
     })
 }
 
-/// Topological sort using Kahn's algorithm
-fn topological_sort(
-    nodes: &std::collections::HashSet<String>,
-    deps: &std::collections::HashMap<String, Vec<String>>,
-) -> Result<Vec<String>, AppError> {
-    use std::collections::{HashMap, HashSet, VecDeque};
-
-    // Calculate in-degree for each node
-    let mut in_degree: HashMap<String, usize> = HashMap::new();
-    for node in nodes {
-        in_degree.insert(node.clone(), 0);
-    }
-
-    for node in nodes {
-        if let Some(node_deps) = deps.get(node) {
-            for dep in node_deps {
-                if nodes.contains(dep) {
-                    *in_degree.entry(node.clone()).or_insert(0) += 1;
-                }
-            }
-        }
-    }
-
-    // Start with nodes that have no dependencies (in-degree 0)
-    let mut queue: VecDeque<String> = VecDeque::new();
-    for (node, &degree) in &in_degree {
-        if degree == 0 {
-            queue.push_back(node.clone());
-        }
-    }
-
-    let mut result: Vec<String> = Vec::new();
-    let mut processed: HashSet<String> = HashSet::new();
-
-    while let Some(node) = queue.pop_front() {
-        result.push(node.clone());
-        processed.insert(node.clone());
-
-        // For each node that depends on this one, decrease its in-degree
-        for other in nodes {
-            if let Some(other_deps) = deps.get(other) {
-                if other_deps.contains(&node) && !processed.contains(other) {
-                    let degree = in_degree.get_mut(other).unwrap();
-                    *degree -= 1;
-                    if *degree == 0 {
-                        queue.push_back(other.clone());
-                    }
-                }
-            }
-        }
-    }
-
-    if result.len() != nodes.len() {
-        return Err(AppError::bad_request(
-            "Circular dependency detected in build queue",
-        ));
-    }
-
-    Ok(result)
-}
-
-/// Background task that runs queued builds sequentially
-async fn run_queued_builds(
-    state: SharedState,
-    builds: Vec<(String, String, std::path::PathBuf)>, // (pkgbase, build_id, log_path)
-    deps_graph: std::collections::HashMap<String, Vec<String>>,
-    config: crate::config::Config,
-    cancel_flag: Arc<AtomicBool>,
-) {
-    use std::collections::HashSet;
-
-    let mut failed_pkgbases: HashSet<String> = HashSet::new();
-
-    // Get repo_mutex once for the entire queue
-    let repo_mutex = {
-        let state_read = state.read().await;
-        state_read.repo_mutex.clone()
-    };
-
-    for (pkgbase, build_id, log_path) in &builds {
-        // Check if the queue has been cancelled
-        if cancel_flag.load(Ordering::Relaxed) {
-            tracing::info!(
-                "Cancelling queued build {} for {} (queue cancelled)",
-                build_id,
-                pkgbase
-            );
-
-            let state_write = state.write().await;
-            let _ = state_write
-                .db
-                .update_build_status(
-                    build_id,
-                    crate::models::BuildStatus::Cancelled,
-                    Some("Queue cancelled"),
-                )
-                .await;
-            let _ = state_write
-                .db
-                .update_package_status(pkgbase, PackageStatus::Approved)
-                .await;
-            emit_event(
-                &state_write.events,
-                ServerEvent::BuildCompleted {
-                    build_id: build_id.clone(),
-                    pkgbase: pkgbase.clone(),
-                    status: "cancelled".to_string(),
-                },
-            );
-            drop(state_write);
-
-            clear_active_build(&state, pkgbase, build_id).await;
-            continue;
-        }
-
-        // Check if any of this package's dependencies failed
-        let should_skip = if let Some(pkg_deps) = deps_graph.get(pkgbase) {
-            pkg_deps.iter().any(|dep| failed_pkgbases.contains(dep))
-        } else {
-            false
-        };
-
-        if should_skip {
-            tracing::info!(
-                "Skipping build {} for {} due to failed dependency",
-                build_id,
-                pkgbase
-            );
-
-            let state_write = state.write().await;
-            let _ = state_write
-                .db
-                .update_build_status(
-                    build_id,
-                    crate::models::BuildStatus::Cancelled,
-                    Some("Skipped: dependency build failed"),
-                )
-                .await;
-            emit_event(
-                &state_write.events,
-                ServerEvent::BuildCompleted {
-                    build_id: build_id.clone(),
-                    pkgbase: pkgbase.clone(),
-                    status: "skipped".to_string(),
-                },
-            );
-            drop(state_write);
-
-            failed_pkgbases.insert(pkgbase.clone());
-            clear_active_build(&state, pkgbase, build_id).await;
-            continue;
-        }
-
-        // Check if this package is already being built (by another trigger/queue)
-        {
-            let mut state_write = state.write().await;
-            if state_write.active_builds.contains(pkgbase) {
-                tracing::info!(
-                    "Skipping build {} for {} (already building)",
-                    build_id,
-                    pkgbase
-                );
-                let _ = state_write
-                    .db
-                    .update_build_status(
-                        build_id,
-                        crate::models::BuildStatus::Cancelled,
-                        Some("Skipped: package already building"),
-                    )
-                    .await;
-                emit_event(
-                    &state_write.events,
-                    ServerEvent::BuildCompleted {
-                        build_id: build_id.clone(),
-                        pkgbase: pkgbase.clone(),
-                        status: "skipped".to_string(),
-                    },
-                );
-                drop(state_write);
-                clear_active_build(&state, pkgbase, build_id).await;
-                continue;
-            }
-
-            // Mark as actively building
-            state_write.active_builds.insert(pkgbase.clone());
-        }
-
-        // Initialize stage tracking
-        set_build_stage(&state, build_id, pkgbase, BuildStage::Starting).await;
-
-        // Update status to Building
-        {
-            let state_write = state.write().await;
-            let _ = state_write
-                .db
-                .update_package_status(pkgbase, PackageStatus::Building)
-                .await;
-            let _ = state_write
-                .db
-                .update_build_status(build_id, crate::models::BuildStatus::Running, None)
-                .await;
-            emit_event(
-                &state_write.events,
-                ServerEvent::BuildStarted {
-                    build_id: build_id.clone(),
-                    pkgbase: pkgbase.clone(),
-                },
-            );
-            emit_event(
-                &state_write.events,
-                ServerEvent::PackageStatusChanged {
-                    pkgbase: pkgbase.clone(),
-                    new_status: "building".to_string(),
-                },
-            );
-        }
-
-        tracing::info!("Starting queued build {} for {}", build_id, pkgbase);
-
-        // Ensure clone exists (re-clone from AUR if missing)
-        let source_path = config.resolved_cache().aur_clones.join(pkgbase);
-        {
-            let sp = source_path.clone();
-            let pb = pkgbase.clone();
-            let ensure_result = tokio::task::spawn_blocking(move || {
-                AurGit::ensure_cloned(&pb, &sp)
-            }).await;
-            let clone_err = match ensure_result {
-                Ok(Ok(_)) => None,
-                Ok(Err(e)) => Some(format!("{}", e)),
-                Err(e) => Some(format!("task join error: {}", e)),
-            };
-            if let Some(err_msg) = clone_err {
-                    tracing::error!("Failed to ensure clone for {}: {}", pkgbase, err_msg);
-                    let state_write = state.write().await;
-                    let _ = state_write.db.update_build_status(
-                        build_id,
-                        crate::models::BuildStatus::Failed,
-                        Some(&format!("Clone missing and re-clone failed: {}", err_msg)),
-                    ).await;
-                    let _ = state_write.db.update_package_status(pkgbase, PackageStatus::Failed).await;
-                    failed_pkgbases.insert(pkgbase.clone());
-                    continue;
-            }
-        }
-
-        // Run the build
-        let log_path_clone = log_path.clone();
-        let pkgbase_clone = pkgbase.clone();
-        let config_clone = config.clone();
-
-        let build_result = tokio::task::spawn_blocking(move || {
-            let build_system = BuildSystem::new(config_clone);
-            build_system.run_build_sync(&pkgbase_clone, &source_path, &log_path_clone)
-        })
-        .await;
-
-        match build_result {
-            Ok(Ok(packages)) => {
-                // Build succeeded
-                tracing::info!("Build {} succeeded for {}", build_id, pkgbase);
-
-                set_build_stage(&state, build_id, pkgbase, BuildStage::MovingToRepo).await;
-
-                let build_system = BuildSystem::new(config.clone());
-
-                match build_system.move_to_repo(&packages) {
-                    Ok(repo_packages) => {
-                        set_build_stage(&state, build_id, pkgbase, BuildStage::UpdatingIndex).await;
-
-                        // Serialize repo-add under repo mutex
-                        let repo_add_result = {
-                            let _repo_lock = repo_mutex.lock().await;
-                            build_system.repo_add(&repo_packages)
-                        };
-
-                        if let Err(e) = repo_add_result {
-                            tracing::error!("repo-add failed for {}: {}", pkgbase, e);
-                            set_build_stage(&state, build_id, pkgbase, BuildStage::Failed).await;
-                            failed_pkgbases.insert(pkgbase.clone());
-                            update_build_failed(
-                                &state,
-                                build_id,
-                                pkgbase,
-                                &format!("repo-add failed: {}", e),
-                            )
-                            .await;
-                            clear_build_stage(&state, build_id).await;
-                            clear_active_build(&state, pkgbase, build_id).await;
-                            continue;
-                        }
-
-                        let outputs: Vec<String> = repo_packages
-                            .iter()
-                            .filter_map(|p| p.file_name())
-                            .map(|n| n.to_string_lossy().to_string())
-                            .collect();
-                        let outputs_json = serde_json::to_string(&outputs).unwrap_or_default();
-
-                        set_build_stage(&state, build_id, pkgbase, BuildStage::Complete).await;
-
-                        let state_write = state.write().await;
-
-                        // Check if the build was cancelled while we were working
-                        let already_cancelled = state_write
-                            .db
-                            .get_build(build_id)
-                            .await
-                            .ok()
-                            .flatten()
-                            .is_some_and(|b| b.status == crate::models::BuildStatus::Cancelled);
-
-                        if !already_cancelled {
-                            let _ = state_write
-                                .db
-                                .update_build_status(build_id, crate::models::BuildStatus::Success, None)
-                                .await;
-                            let _ = state_write
-                                .db
-                                .update_build_outputs(build_id, &outputs_json)
-                                .await;
-                            let _ = state_write
-                                .db
-                                .update_package_status(pkgbase, PackageStatus::UpToDate)
-                                .await;
-                            emit_event(
-                                &state_write.events,
-                                ServerEvent::BuildCompleted {
-                                    build_id: build_id.clone(),
-                                    pkgbase: pkgbase.clone(),
-                                    status: "success".to_string(),
-                                },
-                            );
-                            emit_event(
-                                &state_write.events,
-                                ServerEvent::PackageStatusChanged {
-                                    pkgbase: pkgbase.clone(),
-                                    new_status: "up_to_date".to_string(),
-                                },
-                            );
-                        }
-                        drop(state_write);
-
-                        clear_build_stage(&state, build_id).await;
-                        clear_active_build(&state, pkgbase, build_id).await;
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to move packages for {}: {}", pkgbase, e);
-                        set_build_stage(&state, build_id, pkgbase, BuildStage::Failed).await;
-                        failed_pkgbases.insert(pkgbase.clone());
-                        update_build_failed(
-                            &state,
-                            build_id,
-                            pkgbase,
-                            &format!("Failed to move packages: {}", e),
-                        )
-                        .await;
-                        clear_build_stage(&state, build_id).await;
-                        clear_active_build(&state, pkgbase, build_id).await;
-                    }
-                }
-            }
-            Ok(Err(e)) => {
-                tracing::error!("Build {} failed for {}: {}", build_id, pkgbase, e);
-                set_build_stage(&state, build_id, pkgbase, BuildStage::Failed).await;
-                failed_pkgbases.insert(pkgbase.clone());
-                update_build_failed(&state, build_id, pkgbase, &e.to_string()).await;
-                clear_build_stage(&state, build_id).await;
-                clear_active_build(&state, pkgbase, build_id).await;
-            }
-            Err(e) => {
-                tracing::error!("Build task panicked for {}: {}", pkgbase, e);
-                set_build_stage(&state, build_id, pkgbase, BuildStage::Failed).await;
-                failed_pkgbases.insert(pkgbase.clone());
-                update_build_failed(
-                    &state,
-                    build_id,
-                    pkgbase,
-                    &format!("Build task panicked: {}", e),
-                )
-                .await;
-                clear_build_stage(&state, build_id).await;
-                clear_active_build(&state, pkgbase, build_id).await;
-            }
-        }
-    }
-
-    // Clean up cancel flags for all builds in the queue
-    {
-        let mut state_write = state.write().await;
-        for (_, build_id, _) in &builds {
-            state_write.build_cancel_flags.remove(build_id);
-        }
-    }
-
-    tracing::info!(
-        "Build queue completed. {} failed builds.",
-        failed_pkgbases.len()
-    );
-}
-
 async fn cancel_build(
     State(state): State<SharedState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    // Gather info and set cancel flag under write lock, then drop it before
-    // calling stop_build (which runs `podman stop` and can block for seconds).
-    let (is_running, pkgbase, build_system) = {
-        let state_read = state.read().await;
+    let build = state
+        .db
+        .get_build(&id)
+        .await?
+        .ok_or_else(|| AppError::not_found("Build not found"))?;
 
-        let build = state_read
-            .db
-            .get_build(&id)
-            .await?
-            .ok_or_else(|| AppError::not_found("Build not found"))?;
+    let is_running = build.status == crate::models::BuildStatus::Running;
+    let is_pending = build.status == crate::models::BuildStatus::Pending;
 
-        let is_running = build.status == crate::models::BuildStatus::Running;
-        let is_pending = build.status == crate::models::BuildStatus::Pending;
+    if !is_running && !is_pending {
+        return Err(AppError::bad_request("Build is not running or pending"));
+    }
 
-        if !is_running && !is_pending {
-            return Err(AppError::bad_request("Build is not running or pending"));
-        }
-
-        // Set the cancel flag — this propagates to the entire queue since all
-        // builds in a queue share the same Arc<AtomicBool>
-        if let Some(flag) = state_read.build_cancel_flags.get(&id) {
+    // Set the cancel flag
+    {
+        let flags = state.build_cancel_flags.read().await;
+        if let Some(flag) = flags.get(&id) {
             flag.store(true, Ordering::Relaxed);
         }
+    }
 
-        let build_system = BuildSystem::new(state_read.config.clone());
-        (is_running, build.pkgbase.clone(), build_system)
-    };
+    let pkgbase = build.pkgbase.clone();
 
-    // Kill the container outside the lock (can take seconds)
+    // Kill the container outside locks
     if is_running {
         let container_name = format!("repoman-build-{}", pkgbase);
+        let build_system = BuildSystem::new(state.config.clone());
         build_system.stop_build(&container_name)?;
     }
 
-    // Now update DB state under write lock
-    {
-        let state_write = state.write().await;
-        state_write
-            .db
-            .update_build_status(&id, crate::models::BuildStatus::Cancelled, None)
-            .await?;
-        state_write
-            .db
-            .update_package_status(&pkgbase, PackageStatus::Approved)
-            .await?;
-        // Don't remove from active_builds here — let the background task do
-        // cleanup so there's no window where a new build could start while the
-        // container is still shutting down.
-    }
+    // Update DB state
+    state
+        .db
+        .update_build_status(&id, crate::models::BuildStatus::Cancelled, None)
+        .await?;
+    // V2: No update_package_status
 
     Ok(StatusCode::OK)
 }
@@ -3413,18 +2128,15 @@ async fn cancel_build(
 async fn repo_info(
     State(state): State<SharedState>,
 ) -> Result<Json<crate::repo::RepoStats>, AppError> {
-    let state = state.read().await;
     let stats = state.repo.stats()?;
     Ok(Json(stats))
 }
 
 async fn clean_repo(State(state): State<SharedState>) -> Result<Json<CleanResponse>, AppError> {
-    let state_read = state.read().await;
-    let repo_mutex = state_read.repo_mutex.clone();
-    let _repo_lock = repo_mutex.lock().await;
-    let deleted = state_read
+    let _repo_lock = state.repo_mutex.lock().await;
+    let deleted = state
         .repo
-        .clean_old_versions(state_read.config.repo.keep_versions)?;
+        .clean_old_versions(state.config.repo.keep_versions)?;
     Ok(Json(CleanResponse {
         deleted_count: deleted.len() as u32,
         deleted_files: deleted,
@@ -3432,45 +2144,57 @@ async fn clean_repo(State(state): State<SharedState>) -> Result<Json<CleanRespon
 }
 
 async fn rebuild_repo_db(State(state): State<SharedState>) -> Result<StatusCode, AppError> {
-    let state_read = state.read().await;
-    let repo_mutex = state_read.repo_mutex.clone();
-    let _repo_lock = repo_mutex.lock().await;
-    state_read.repo.rebuild_database()?;
+    let _repo_lock = state.repo_mutex.lock().await;
+    state.repo.rebuild_database()?;
+
+    // Reload RepoState
+    {
+        let mut repo = state.repo_state.write().await;
+        if let Err(e) = repo.reload() {
+            tracing::error!("Failed to reload repo state after rebuild: {}", e);
+        }
+    }
+
     Ok(StatusCode::OK)
 }
 
-/// Remove a package from the repository files but keep it tracked.
-/// The package status is set to Approved so it can be rebuilt.
 async fn remove_from_repo(
     State(state): State<SharedState>,
     Path(name): Path<String>,
 ) -> Result<Json<RemoveFromRepoResponse>, AppError> {
-    let state = state.write().await;
+    let pkg = crate::service::packages::resolve_package(&state, &name).await?;
 
-    // Resolve pkgname -> pkgbase if needed
-    let pkg = resolve_package(&state, &name).await?;
-    let pkg_names = state.db.get_package_names(&pkg.pkgbase).await?;
+    // Get pkgnames from srcinfo cache
+    let cache = state.srcinfo_cache.read().await;
+    let pkgnames: Vec<String> = cache
+        .get(&pkg.pkgbase)
+        .map(|c| c.srcinfo.packages.iter().map(|p| p.pkgname.clone()).collect())
+        .unwrap_or_default();
+    drop(cache);
 
-    // Remove from repo database and delete files (serialize under repo mutex)
-    let repo_mutex = state.repo_mutex.clone();
-    let pkgnames: Vec<&str> = pkg_names.iter().map(|n| n.pkgname.as_str()).collect();
+    // Remove from repo database
+    let pkgname_refs: Vec<&str> = pkgnames.iter().map(|s| s.as_str()).collect();
     {
-        let _repo_lock = repo_mutex.lock().await;
-        let _ = state.build.repo_remove(&pkgnames); // Ignore errors if not in repo
+        let _repo_lock = state.repo_mutex.lock().await;
+        let _ = state.build.repo_remove(&pkgname_refs);
     }
 
     let mut deleted_files = Vec::new();
-    for pkg_name in &pkg_names {
-        if let Ok(deleted) = state.repo.delete_package_files(&pkg_name.pkgname) {
+    for pkg_name in &pkgnames {
+        if let Ok(deleted) = state.repo.delete_package_files(pkg_name) {
             deleted_files.extend(deleted);
         }
     }
 
-    // Set status to Approved so it can be rebuilt
-    state
-        .db
-        .update_package_status(&pkg.pkgbase, PackageStatus::Approved)
-        .await?;
+    // V2: No update_package_status -- status is derived
+
+    // Reload RepoState
+    {
+        let mut repo = state.repo_state.write().await;
+        if let Err(e) = repo.reload() {
+            tracing::error!("Failed to reload repo state: {}", e);
+        }
+    }
 
     Ok(Json(RemoveFromRepoResponse {
         pkgbase: pkg.pkgbase,
@@ -3478,20 +2202,16 @@ async fn remove_from_repo(
     }))
 }
 
-async fn system_status(State(state): State<SharedState>) -> Result<Json<SystemStatusResponse>, AppError> {
-    let state = state.read().await;
-
+async fn system_status(
+    State(state): State<SharedState>,
+) -> Result<Json<SystemStatusResponse>, AppError> {
     let podman = BuildSystem::check_podman().is_ok();
     let image = state.build.image_exists().unwrap_or(false);
     let repo = state.repo.stats().ok();
 
     let packages = state.db.list_packages().await?;
 
-    // Collect tracked pkgbases for orphan detection
-    let tracked_pkgbases: std::collections::HashSet<String> = packages
-        .iter()
-        .map(|p| p.pkgbase.clone())
-        .collect();
+    let tracked_pkgbases: HashSet<String> = packages.iter().map(|p| p.pkgbase.clone()).collect();
 
     let mut counts = PackageCounts {
         total: packages.len() as u32,
@@ -3502,24 +2222,26 @@ async fn system_status(State(state): State<SharedState>) -> Result<Json<SystemSt
         failed: 0,
     };
 
-    for pkg in packages {
-        match pkg.status {
-            PackageStatus::PendingReview => counts.pending_review += 1,
-            PackageStatus::Approved => counts.approved += 1,
-            PackageStatus::UpToDate => counts.up_to_date += 1,
-            PackageStatus::UpdateAvailable => counts.update_available += 1,
-            PackageStatus::Failed => counts.failed += 1,
-            _ => {}
+    for pkg in &packages {
+        let status = derive_package_status(&state, pkg).await;
+        match status {
+            DerivedStatus::PendingReview | DerivedStatus::Missing => counts.pending_review += 1,
+            DerivedStatus::Approved => counts.approved += 1,
+            DerivedStatus::UpToDate => counts.up_to_date += 1,
+            DerivedStatus::UpdateAvailable => counts.update_available += 1,
+            DerivedStatus::Failed => counts.failed += 1,
+            DerivedStatus::Building => counts.approved += 1, // count building as approved for status bar
         }
     }
 
-    // Calculate cache stats
-    let pacman_cache = calculate_pacman_cache_stats(&state.config.resolved_cache().pacman_cache);
-    let source_cache = calculate_source_cache_stats(&state.config.resolved_cache().sources);
+    let pacman_cache =
+        calculate_pacman_cache_stats(&state.config.resolved_cache().pacman_cache);
+    let source_cache =
+        calculate_source_cache_stats(&state.config.resolved_cache().sources);
 
-    // Detect orphaned data
     let known_log_files = state.db.list_build_log_filenames().await.unwrap_or_default();
-    let orphaned_data = detect_orphaned_data(&state.config, &tracked_pkgbases, &known_log_files);
+    let orphaned_data =
+        detect_orphaned_data(&state.config, &tracked_pkgbases, &known_log_files);
 
     Ok(Json(SystemStatusResponse {
         podman,
@@ -3533,7 +2255,6 @@ async fn system_status(State(state): State<SharedState>) -> Result<Json<SystemSt
     }))
 }
 
-/// Get a documented TOML config template
 async fn config_template() -> String {
     crate::config::Config::template()
 }
@@ -3579,7 +2300,6 @@ fn calculate_source_cache_stats(sources_path: &std::path::Path) -> Option<CacheS
         for entry in entries.flatten() {
             if entry.path().is_dir() {
                 package_count += 1;
-                // Sum up sizes of all files in this package's source dir
                 if let Ok(files) = std::fs::read_dir(entry.path()) {
                     for file in files.flatten() {
                         if let Ok(meta) = file.metadata() {
@@ -3599,25 +2319,19 @@ fn calculate_source_cache_stats(sources_path: &std::path::Path) -> Option<CacheS
 }
 
 async fn rebuild_image(State(state): State<SharedState>) -> Result<StatusCode, AppError> {
-    let state = state.read().await;
     state.build.build_base_image()?;
     Ok(StatusCode::OK)
 }
 
-async fn clean_cache(State(state): State<SharedState>) -> Result<Json<CleanCacheResponse>, AppError> {
-    let state = state.read().await;
+async fn clean_cache(
+    State(state): State<SharedState>,
+) -> Result<Json<CleanCacheResponse>, AppError> {
     let cache_path = &state.config.resolved_cache().pacman_cache;
-
-    // Keep last 2 versions of each package (like paccache -rk2)
     let keep_versions = 2usize;
-
     let result = clean_pacman_cache(cache_path, keep_versions);
-
     Ok(Json(result))
 }
 
-/// Parse a pacman package filename into (pkgname, version_string, full_path)
-/// Filename format: {pkgname}-{pkgver}-{pkgrel}-{arch}.pkg.tar.{zst,xz}
 fn parse_pacman_pkg_filename(path: &std::path::Path) -> Option<(String, String)> {
     let filename = path.file_name()?.to_str()?;
 
@@ -3625,8 +2339,6 @@ fn parse_pacman_pkg_filename(path: &std::path::Path) -> Option<(String, String)>
         .strip_suffix(".pkg.tar.zst")
         .or_else(|| filename.strip_suffix(".pkg.tar.xz"))?;
 
-    // Split from the end: pkgname-pkgver-pkgrel-arch
-    // We need at least 4 parts
     let parts: Vec<&str> = name.rsplitn(4, '-').collect();
     if parts.len() < 4 {
         return None;
@@ -3637,9 +2349,7 @@ fn parse_pacman_pkg_filename(path: &std::path::Path) -> Option<(String, String)>
     let pkgver = parts[2];
     let pkgname = parts[3];
 
-    // Version string for sorting (pkgver-pkgrel-arch)
     let version = format!("{}-{}-{}", pkgver, pkgrel, arch);
-
     Some((pkgname.to_string(), version))
 }
 
@@ -3656,7 +2366,6 @@ fn clean_pacman_cache(cache_path: &std::path::Path, keep: usize) -> CleanCacheRe
         return result;
     }
 
-    // Group packages by name
     if let Ok(entries) = std::fs::read_dir(cache_path) {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -3669,12 +2378,9 @@ fn clean_pacman_cache(cache_path: &std::path::Path, keep: usize) -> CleanCacheRe
         }
     }
 
-    // For each package, keep only the newest N versions
     for (_name, mut versions) in by_name {
-        // Sort by version (newest first) using vercmp
         versions.sort_by(|a, b| vercmp(&b.1, &a.1));
 
-        // Delete versions beyond the keep limit
         for (path, _version) in versions.into_iter().skip(keep) {
             if let Ok(meta) = std::fs::metadata(&path) {
                 result.size_freed += meta.len();
@@ -3694,8 +2400,9 @@ pub struct CleanCacheResponse {
     pub size_freed: u64,
 }
 
-async fn clean_sources(State(state): State<SharedState>) -> Result<Json<CleanSourcesResponse>, AppError> {
-    let state = state.read().await;
+async fn clean_sources(
+    State(state): State<SharedState>,
+) -> Result<Json<CleanSourcesResponse>, AppError> {
     let sources_path = &state.config.resolved_cache().sources;
 
     let mut cleaned_count = 0u32;
@@ -3705,7 +2412,6 @@ async fn clean_sources(State(state): State<SharedState>) -> Result<Json<CleanSou
         if let Ok(entries) = std::fs::read_dir(sources_path) {
             for entry in entries.flatten() {
                 if entry.path().is_dir() {
-                    // Calculate size before deleting
                     if let Ok(files) = std::fs::read_dir(entry.path()) {
                         for file in files.flatten() {
                             if let Ok(meta) = file.metadata() {
@@ -3713,7 +2419,6 @@ async fn clean_sources(State(state): State<SharedState>) -> Result<Json<CleanSou
                             }
                         }
                     }
-                    // Use podman unshare to handle permission issues
                     let path_str = entry.path().to_string_lossy().to_string();
                     let status = std::process::Command::new("podman")
                         .args(["unshare", "rm", "-rf", &path_str])
@@ -3722,7 +2427,6 @@ async fn clean_sources(State(state): State<SharedState>) -> Result<Json<CleanSou
                     match status {
                         Ok(s) if s.success() => cleaned_count += 1,
                         _ => {
-                            // Fallback to regular rm
                             if std::fs::remove_dir_all(entry.path()).is_ok() {
                                 cleaned_count += 1;
                             }
@@ -3747,8 +2451,8 @@ pub struct CleanSourcesResponse {
 
 fn detect_orphaned_data(
     config: &crate::config::Config,
-    tracked_pkgbases: &std::collections::HashSet<String>,
-    known_log_files: &std::collections::HashSet<String>,
+    tracked_pkgbases: &HashSet<String>,
+    known_log_files: &HashSet<String>,
 ) -> Option<OrphanedData> {
     let mut orphaned = OrphanedData {
         clones: Vec::new(),
@@ -3758,7 +2462,6 @@ fn detect_orphaned_data(
         total_size: 0,
     };
 
-    // Check AUR clones directory
     if let Ok(entries) = std::fs::read_dir(&config.resolved_cache().aur_clones) {
         for entry in entries.flatten() {
             if entry.path().is_dir() {
@@ -3772,7 +2475,6 @@ fn detect_orphaned_data(
         }
     }
 
-    // Check sources directory
     if let Ok(entries) = std::fs::read_dir(&config.resolved_cache().sources) {
         for entry in entries.flatten() {
             if entry.path().is_dir() {
@@ -3786,19 +2488,15 @@ fn detect_orphaned_data(
         }
     }
 
-    // Check logs directory for orphaned pkgdest-* dirs and build logs
     if let Ok(entries) = std::fs::read_dir(&config.resolved_cache().logs) {
         for entry in entries.flatten() {
             if let Some(name) = entry.file_name().to_str() {
-                // Check pkgdest directories
                 if let Some(pkgbase) = name.strip_prefix("pkgdest-") {
                     if !tracked_pkgbases.contains(pkgbase) {
                         orphaned.total_size += dir_size(&entry.path());
                         orphaned.pkgdests.push(pkgbase.to_string());
                     }
-                }
-                // Check build logs ({uuid}.log)
-                else if name.ends_with(".log") && !known_log_files.contains(name) {
+                } else if name.ends_with(".log") && !known_log_files.contains(name) {
                     if let Ok(meta) = entry.metadata() {
                         orphaned.total_size += meta.len();
                     }
@@ -3808,7 +2506,6 @@ fn detect_orphaned_data(
         }
     }
 
-    // Return None if nothing orphaned
     if orphaned.clones.is_empty()
         && orphaned.sources.is_empty()
         && orphaned.pkgdests.is_empty()
@@ -3835,14 +2532,11 @@ fn dir_size(path: &std::path::Path) -> u64 {
     size
 }
 
-async fn clean_orphans(State(state): State<SharedState>) -> Result<Json<CleanOrphansResponse>, AppError> {
-    let state = state.read().await;
-
+async fn clean_orphans(
+    State(state): State<SharedState>,
+) -> Result<Json<CleanOrphansResponse>, AppError> {
     let packages = state.db.list_packages().await?;
-    let tracked_pkgbases: std::collections::HashSet<String> = packages
-        .iter()
-        .map(|p| p.pkgbase.clone())
-        .collect();
+    let tracked_pkgbases: HashSet<String> = packages.iter().map(|p| p.pkgbase.clone()).collect();
 
     let known_log_files = state.db.list_build_log_filenames().await.unwrap_or_default();
     let orphaned = detect_orphaned_data(&state.config, &tracked_pkgbases, &known_log_files);
@@ -3861,7 +2555,6 @@ async fn clean_orphans(State(state): State<SharedState>) -> Result<Json<CleanOrp
 
     cleaned.total_size_freed = orphaned.total_size;
 
-    // Clean orphaned clones
     for name in &orphaned.clones {
         let path = state.config.resolved_cache().aur_clones.join(name);
         if std::fs::remove_dir_all(&path).is_ok() {
@@ -3869,7 +2562,6 @@ async fn clean_orphans(State(state): State<SharedState>) -> Result<Json<CleanOrp
         }
     }
 
-    // Clean orphaned sources (may need podman unshare)
     for name in &orphaned.sources {
         let path = state.config.resolved_cache().sources.join(name);
         let path_str = path.to_string_lossy().to_string();
@@ -3887,9 +2579,12 @@ async fn clean_orphans(State(state): State<SharedState>) -> Result<Json<CleanOrp
         }
     }
 
-    // Clean orphaned pkgdest directories (may need podman unshare)
     for name in &orphaned.pkgdests {
-        let path = state.config.resolved_cache().logs.join(format!("pkgdest-{}", name));
+        let path = state
+            .config
+            .resolved_cache()
+            .logs
+            .join(format!("pkgdest-{}", name));
         let path_str = path.to_string_lossy().to_string();
         let status = std::process::Command::new("podman")
             .args(["unshare", "rm", "-rf", &path_str])
@@ -3905,7 +2600,6 @@ async fn clean_orphans(State(state): State<SharedState>) -> Result<Json<CleanOrp
         }
     }
 
-    // Clean orphaned logs
     for name in &orphaned.logs {
         let path = state.config.resolved_cache().logs.join(name);
         if std::fs::remove_file(&path).is_ok() {
@@ -3930,7 +2624,6 @@ pub struct CleanOrphansResponse {
 async fn list_containers(
     State(state): State<SharedState>,
 ) -> Result<Json<Vec<crate::build::ContainerInfo>>, AppError> {
-    let state = state.read().await;
     let containers = state.build.list_containers()?;
     Ok(Json(containers))
 }
@@ -3938,7 +2631,6 @@ async fn list_containers(
 async fn prune_containers(
     State(state): State<SharedState>,
 ) -> Result<Json<crate::build::PruneResult>, AppError> {
-    let state = state.read().await;
     let result = state.build.prune_containers()?;
     Ok(Json(result))
 }
@@ -3946,14 +2638,12 @@ async fn prune_containers(
 async fn list_images(
     State(state): State<SharedState>,
 ) -> Result<Json<Vec<crate::build::ImageInfo>>, AppError> {
-    let state = state.read().await;
     let images = state.build.list_images()?;
     Ok(Json(images))
 }
 
 #[derive(Deserialize)]
 pub struct PruneImagesQuery {
-    /// Number of images to keep (default: 3)
     #[serde(default = "default_keep_images")]
     keep: usize,
 }
@@ -3966,7 +2656,6 @@ async fn prune_images(
     State(state): State<SharedState>,
     Query(query): Query<PruneImagesQuery>,
 ) -> Result<Json<crate::build::PruneResult>, AppError> {
-    let state = state.read().await;
     let result = state.build.prune_images(query.keep)?;
     Ok(Json(result))
 }

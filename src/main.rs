@@ -11,17 +11,20 @@ mod state;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, Mutex, RwLock};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::api::{AppState, SharedState};
 use crate::aur::AurClient;
 use crate::build::BuildSystem;
 use crate::config::Config;
 use crate::db::Database;
+use crate::models::InstallReason;
 use crate::repo::RepoManager;
+use crate::service::status::{derive_status, is_orphan, DerivedStatus, StatusInputs};
+use crate::state::{RepoState, SrcInfoCache};
 
 #[derive(Parser)]
 #[command(name = "repoman")]
@@ -186,6 +189,187 @@ enum ConfigAction {
     Path,
 }
 
+// ==================== Enriched package for CLI display ====================
+
+struct EnrichedPackage {
+    pkg: models::Package,
+    status: DerivedStatus,
+    pkgver: Option<String>,
+    current_commit: Option<String>,
+    pkgnames: Vec<String>,
+}
+
+async fn enrich_package(
+    pkg: &models::Package,
+    db: &Database,
+    srcinfo_cache: &SrcInfoCache,
+    repo_state: &RepoState,
+    active_builds: &HashSet<String>,
+    aur_clones: &Path,
+) -> EnrichedPackage {
+    let clone_dir = pkg.clone_path(aur_clones);
+    let head_commit = SrcInfoCache::get_head_commit(&clone_dir).ok().flatten();
+    let srcinfo = srcinfo_cache.get(&pkg.pkgbase);
+    let pkgver = srcinfo.map(|s| s.srcinfo.full_version());
+    let pkgnames = srcinfo
+        .map(|s| {
+            s.srcinfo
+                .packages
+                .iter()
+                .map(|p| p.pkgname.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let latest_build = if let Some(ref commit) = pkg.approved_commit {
+        db.get_latest_build_for_commit(&pkg.pkgbase, commit)
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+
+    let status = derive_status(&StatusInputs {
+        approved_commit: pkg.approved_commit.as_deref(),
+        head_commit: head_commit.as_deref(),
+        latest_build: latest_build.as_ref(),
+        is_active_build: active_builds.contains(&pkg.pkgbase),
+        in_repo: repo_state.has_pkgbase(&pkg.pkgbase),
+    });
+
+    EnrichedPackage {
+        pkg: pkg.clone(),
+        status,
+        pkgver,
+        current_commit: head_commit,
+        pkgnames,
+    }
+}
+
+/// Resolve a pkgname or pkgbase to a pkgbase using the SrcInfoCache
+fn resolve_pkgbase_from_cache(cache: &SrcInfoCache, name: &str) -> Option<String> {
+    // First check if it's a pkgbase directly
+    if cache.get(name).is_some() {
+        return Some(name.to_string());
+    }
+    // Search all cached entries for a matching pkgname
+    for (pkgbase, cached) in cache.iter() {
+        for pkg in &cached.srcinfo.packages {
+            if pkg.pkgname == name {
+                return Some(pkgbase.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Find orphaned packages using SrcInfoCache
+fn find_orphans(packages: &[models::Package], cache: &SrcInfoCache) -> Vec<String> {
+    use crate::repo::db_parser::strip_version_constraint;
+
+    // Collect all deps of explicit packages
+    let mut explicit_deps = HashSet::new();
+    for pkg in packages {
+        if pkg.install_reason == InstallReason::Explicit {
+            if let Some(cached) = cache.get(&pkg.pkgbase) {
+                for dep in &cached.srcinfo.depends {
+                    explicit_deps.insert(strip_version_constraint(dep).to_string());
+                }
+                for p in &cached.srcinfo.packages {
+                    for dep in &p.depends {
+                        explicit_deps.insert(strip_version_constraint(dep).to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // Find orphans
+    packages
+        .iter()
+        .filter(|p| p.install_reason == InstallReason::Dependency)
+        .filter(|p| {
+            let pkgnames: Vec<String> = cache
+                .get(&p.pkgbase)
+                .map(|c| c.srcinfo.packages.iter().map(|p| p.pkgname.clone()).collect())
+                .unwrap_or_default();
+            is_orphan(&pkgnames, &explicit_deps)
+        })
+        .map(|p| p.pkgbase.clone())
+        .collect()
+}
+
+/// Parse a status string into DerivedStatus
+fn parse_status_filter(s: &str) -> Result<DerivedStatus> {
+    match s {
+        "pending_review" => Ok(DerivedStatus::PendingReview),
+        "approved" => Ok(DerivedStatus::Approved),
+        "building" => Ok(DerivedStatus::Building),
+        "failed" => Ok(DerivedStatus::Failed),
+        "up_to_date" => Ok(DerivedStatus::UpToDate),
+        "update_available" => Ok(DerivedStatus::UpdateAvailable),
+        "missing" => Ok(DerivedStatus::Missing),
+        _ => anyhow::bail!("Invalid status: {}", s),
+    }
+}
+
+// ==================== CLI State ====================
+
+/// State shared across CLI commands (not the web server AppState)
+struct CliState {
+    db: Database,
+    config: Config,
+    aur: AurClient,
+    build_system: BuildSystem,
+    repo: RepoManager,
+    srcinfo_cache: SrcInfoCache,
+    repo_state: RepoState,
+}
+
+impl CliState {
+    /// Resolve a name (pkgname or pkgbase) to a package
+    async fn resolve_package(&self, name: &str) -> Result<Option<models::Package>> {
+        // Try direct pkgbase lookup first
+        if let Some(pkg) = self.db.get_package(name).await? {
+            return Ok(Some(pkg));
+        }
+        // Try resolving via SrcInfoCache
+        if let Some(pkgbase) = resolve_pkgbase_from_cache(&self.srcinfo_cache, name) {
+            return self.db.get_package(&pkgbase).await;
+        }
+        Ok(None)
+    }
+
+    /// Get pkgnames for a pkgbase from the SrcInfoCache
+    fn get_pkgnames(&self, pkgbase: &str) -> Vec<String> {
+        self.srcinfo_cache
+            .get(pkgbase)
+            .map(|c| {
+                c.srcinfo
+                    .packages
+                    .iter()
+                    .map(|p| p.pkgname.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Enrich a package with derived status and metadata
+    async fn enrich(&self, pkg: &models::Package) -> EnrichedPackage {
+        let active_builds: HashSet<String> = HashSet::new();
+        enrich_package(
+            pkg,
+            &self.db,
+            &self.srcinfo_cache,
+            &self.repo_state,
+            &active_builds,
+            &self.config.resolved_cache().aur_clones,
+        )
+        .await
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize logging
@@ -216,95 +400,141 @@ async fn main() -> Result<()> {
 
     let db = Database::connect(&db_path).await?;
 
-    // Create broadcast channel for SSE events
-    let (events_tx, _events_rx) = tokio::sync::broadcast::channel(256);
+    let resolved_cache = config.resolved_cache();
 
-    // Create shared state
-    let state: SharedState = Arc::new(RwLock::new(AppState {
-        db,
-        config: config.clone(),
-        aur: AurClient::new(),
-        build: BuildSystem::new(config.clone()),
-        repo: RepoManager::new(config.clone()),
-        build_stages: std::collections::HashMap::new(),
-        repo_mutex: Arc::new(tokio::sync::Mutex::new(())),
-        events: events_tx,
-        active_builds: std::collections::HashSet::new(),
-        build_cancel_flags: std::collections::HashMap::new(),
-    }));
+    // Initialize SrcInfoCache
+    let mut srcinfo_cache = SrcInfoCache::new();
+    let packages = db.list_packages().await?;
+    let pkgbases: Vec<String> = packages.iter().map(|p| p.pkgbase.clone()).collect();
+    srcinfo_cache.bulk_load(&resolved_cache.aur_clones, &pkgbases)?;
+
+    // Initialize RepoState
+    let repo_state = RepoState::load(&config.repo.path, &config.repo.name)?;
 
     let json_output = cli.json;
 
+    // For the serve command, we need the full AppState with broadcast channels etc.
+    if matches!(cli.command, Some(Commands::Serve) | None) {
+        return run_server(db, config, srcinfo_cache, repo_state).await;
+    }
+
+    // Build CLI state for non-serve commands
+    let mut cli_state = CliState {
+        db,
+        config: config.clone(),
+        aur: AurClient::new(),
+        build_system: BuildSystem::new(config.clone()),
+        repo: RepoManager::new(config.clone()),
+        srcinfo_cache,
+        repo_state,
+    };
+
     match cli.command {
-        Some(Commands::Serve) | None => {
-            run_server(state, &config).await?;
+        Some(Commands::Add {
+            name,
+            asdeps,
+            with_deps,
+        }) => {
+            cmd_add(&mut cli_state, &name, asdeps, with_deps, json_output).await?;
         }
-        Some(Commands::Add { name, asdeps, with_deps }) => {
-            cmd_add(state, &name, asdeps, with_deps, json_output).await?;
+        Some(Commands::Remove {
+            name,
+            delete_files,
+            delete_clone,
+            recursive,
+        }) => {
+            cmd_remove(&mut cli_state, &name, delete_files, delete_clone, recursive).await?;
         }
-        Some(Commands::Remove { name, delete_files, delete_clone, recursive }) => {
-            cmd_remove(state, &name, delete_files, delete_clone, recursive).await?;
-        }
-        Some(Commands::List { status, explicit, deps, orphans }) => {
-            cmd_list(state, status, explicit, deps, orphans, json_output).await?;
+        Some(Commands::List {
+            status,
+            explicit,
+            deps,
+            orphans,
+        }) => {
+            cmd_list(&cli_state, status, explicit, deps, orphans, json_output).await?;
         }
         Some(Commands::Info { name }) => {
-            cmd_info(state, &name, json_output).await?;
+            cmd_info(&cli_state, &name, json_output).await?;
         }
         Some(Commands::Diff { name }) => {
-            cmd_diff(state, &name).await?;
+            cmd_diff(&cli_state, &name).await?;
         }
         Some(Commands::Review { name, stdout }) => {
-            cmd_review(state, &name, stdout).await?;
+            cmd_review(&cli_state, &name, stdout).await?;
         }
         Some(Commands::Approve { name }) => {
-            cmd_approve(state, &name).await?;
+            cmd_approve(&mut cli_state, &name).await?;
         }
         Some(Commands::Build { names, all, updates }) => {
-            cmd_build(state, names, all, updates).await?;
+            cmd_build(&mut cli_state, names, all, updates).await?;
         }
         Some(Commands::Logs { id, follow, lines }) => {
-            cmd_logs(state, &id, follow, lines).await?;
+            cmd_logs(&cli_state, &id, follow, lines).await?;
         }
         Some(Commands::CheckUpdates) => {
-            cmd_check_updates(state, json_output).await?;
+            cmd_check_updates(&mut cli_state, json_output).await?;
         }
         Some(Commands::RebuildImage) => {
-            cmd_rebuild_image(state).await?;
+            cmd_rebuild_image(&cli_state).await?;
         }
         Some(Commands::Status) => {
-            cmd_status(state, json_output).await?;
+            cmd_status(&cli_state, json_output).await?;
         }
-        Some(Commands::Mark { name, explicit, asdeps }) => {
-            cmd_mark(state, &name, explicit, asdeps).await?;
+        Some(Commands::Mark {
+            name,
+            explicit,
+            asdeps,
+        }) => {
+            cmd_mark(&cli_state, &name, explicit, asdeps).await?;
         }
         Some(Commands::Config { .. }) => {
             unreachable!("Config command handled earlier");
         }
         Some(Commands::Import { db_path, dry_run }) => {
-            cmd_import(state, &db_path, dry_run, json_output).await?;
+            cmd_import(&mut cli_state, &db_path, dry_run, json_output).await?;
+        }
+        Some(Commands::Serve) | None => {
+            unreachable!("Serve command handled earlier");
         }
     }
 
     Ok(())
 }
 
-async fn run_server(state: SharedState, config: &Config) -> Result<()> {
+async fn run_server(
+    db: Database,
+    config: Config,
+    srcinfo_cache: SrcInfoCache,
+    repo_state: RepoState,
+) -> Result<()> {
     // Check podman availability
     BuildSystem::check_podman()?;
 
     // Recover stale builds left in pending/running state (e.g. after server crash)
-    {
-        let state_read = state.read().await;
-        match state_read.db.recover_stale_builds().await {
-            Ok(0) => {}
-            Ok(n) => tracing::info!("Recovered {} stale build(s) from previous run", n),
-            Err(e) => tracing::error!("Failed to recover stale builds: {}", e),
-        }
+    match db.recover_stale_builds().await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!("Recovered {} stale build(s) from previous run", n),
+        Err(e) => tracing::error!("Failed to recover stale builds: {}", e),
     }
 
-    let app = api::router(state)
-        .fallback(assets::static_handler);
+    let (tx, _) = broadcast::channel(100);
+
+    let state: api::SharedState = Arc::new(api::AppState {
+        db,
+        config: config.clone(),
+        aur: AurClient::new(),
+        build: BuildSystem::new(config.clone()),
+        repo: RepoManager::new(config.clone()),
+        srcinfo_cache: RwLock::new(srcinfo_cache),
+        repo_state: RwLock::new(repo_state),
+        build_stages: RwLock::new(HashMap::new()),
+        repo_mutex: Mutex::new(()),
+        events: tx,
+        active_builds: RwLock::new(HashSet::new()),
+        build_cancel_flags: RwLock::new(HashMap::new()),
+    });
+
+    let app = api::router(state).fallback(assets::static_handler);
 
     let listener = tokio::net::TcpListener::bind(&config.server.listen).await?;
     tracing::info!("Server listening on {}", config.server.listen);
@@ -320,10 +550,16 @@ async fn run_server(state: SharedState, config: &Config) -> Result<()> {
 struct AddedPackage {
     pkgbase: String,
     version: String,
-    install_reason: models::InstallReason,
+    install_reason: InstallReason,
 }
 
-async fn cmd_add(state: SharedState, name: &str, asdeps: bool, with_deps: bool, json_output: bool) -> Result<()> {
+async fn cmd_add(
+    state: &mut CliState,
+    name: &str,
+    asdeps: bool,
+    with_deps: bool,
+    json_output: bool,
+) -> Result<()> {
     // Validate pkgbase format: only [a-zA-Z0-9@._+-] allowed
     if name.is_empty()
         || !name
@@ -339,135 +575,140 @@ async fn cmd_add(state: SharedState, name: &str, asdeps: bool, with_deps: bool, 
     let mut added_packages: Vec<AddedPackage> = Vec::new();
     let mut failed_deps: Vec<(String, String)> = Vec::new(); // (name, reason)
 
-    {
-        let mut state_guard = state.write().await;
-
-        // Check if already exists
-        if let Some(pkg) = state_guard.db.get_package(name).await? {
-            if json_output {
-                println!("{}", serde_json::json!({
+    // Check if already exists
+    if let Some(pkg) = state.db.get_package(name).await? {
+        if json_output {
+            println!(
+                "{}",
+                serde_json::json!({
                     "status": "already_tracked",
                     "pkgbase": pkg.pkgbase
-                }));
-            } else {
-                println!("Package {} already tracked", pkg.pkgbase);
-            }
-            return Ok(());
+                })
+            );
+        } else {
+            println!("Package {} already tracked", pkg.pkgbase);
         }
+        return Ok(());
+    }
 
-        if let Some(pkgbase) = state_guard.db.resolve_pkgbase(name).await? {
+    if let Some(pkgbase) = resolve_pkgbase_from_cache(&state.srcinfo_cache, name) {
+        if state.db.get_package(&pkgbase).await?.is_some() {
             if json_output {
-                println!("{}", serde_json::json!({
-                    "status": "already_tracked",
-                    "pkgbase": pkgbase
-                }));
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "status": "already_tracked",
+                        "pkgbase": pkgbase
+                    })
+                );
             } else {
                 println!("Package {} already tracked (as {})", name, pkgbase);
             }
             return Ok(());
         }
+    }
 
-        // Add the main package
-        let install_reason = if asdeps {
-            models::InstallReason::Dependency
+    // Add the main package
+    let install_reason = if asdeps {
+        InstallReason::Dependency
+    } else {
+        InstallReason::Explicit
+    };
+
+    add_package_internal(state, name, install_reason, &mut added_packages, json_output).await?;
+
+    // If --with-deps, recursively add missing AUR dependencies
+    if with_deps {
+        // Check if base image exists (needed for dep detection)
+        let image_exists = state.build_system.image_exists().unwrap_or(false);
+        if !image_exists {
+            if !json_output {
+                println!("\nWarning: Base image not found. Cannot detect AUR dependencies.");
+                println!("Run 'repoman rebuild-image' first to enable dependency detection.");
+            }
         } else {
-            models::InstallReason::Explicit
-        };
+            if !json_output {
+                println!("\nChecking for AUR dependencies...");
+            }
 
-        add_package_internal(&mut state_guard, name, install_reason, &mut added_packages, json_output).await?;
+            // Track which packages we've processed to avoid cycles
+            let mut processed: HashSet<String> = HashSet::new();
+            for p in &added_packages {
+                processed.insert(p.pkgbase.clone());
+            }
 
-        // If --with-deps, recursively add missing AUR dependencies
-        if with_deps {
-            // Check if base image exists (needed for dep detection)
-            let image_exists = state_guard.build.image_exists().unwrap_or(false);
-            if !image_exists {
-                if !json_output {
-                    println!("\nWarning: Base image not found. Cannot detect AUR dependencies.");
-                    println!("Run 'repoman rebuild-image' first to enable dependency detection.");
+            // Queue of packages to check for deps
+            let mut to_check: Vec<String> =
+                added_packages.iter().map(|p| p.pkgbase.clone()).collect();
+
+            while let Some(pkgbase) = to_check.pop() {
+                // Get the srcinfo for this package
+                let clone_path = state.config.resolved_cache().aur_clones.join(&pkgbase);
+                let srcinfo = match aur::read_srcinfo(&clone_path) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+
+                // Get currently tracked package names from cache + DB
+                let tracked_packages = state.db.list_packages().await?;
+                let mut tracked_pkgnames: HashSet<String> = HashSet::new();
+                for p in &tracked_packages {
+                    tracked_pkgnames.insert(p.pkgbase.clone());
+                    let pkgnames = state.get_pkgnames(&p.pkgbase);
+                    for n in pkgnames {
+                        tracked_pkgnames.insert(n);
+                    }
                 }
-            } else {
-                if !json_output {
-                    println!("\nChecking for AUR dependencies...");
-                }
 
-                // Track which packages we've processed to avoid cycles
-                let mut processed: std::collections::HashSet<String> = std::collections::HashSet::new();
-                for p in &added_packages {
-                    processed.insert(p.pkgbase.clone());
-                }
+                // Find missing AUR deps
+                let container_image = &state.config.container.image;
+                let repo_name = &state.config.repo.name;
+                let repo_path = &state.config.repo.path;
+                let missing = state
+                    .aur
+                    .find_missing_aur_deps(
+                        &srcinfo,
+                        &tracked_pkgnames,
+                        container_image,
+                        repo_name,
+                        repo_path,
+                    )
+                    .await
+                    .unwrap_or_default();
 
-                // Queue of packages to check for deps
-                let mut to_check: Vec<String> = added_packages.iter().map(|p| p.pkgbase.clone()).collect();
-
-                while let Some(pkgbase) = to_check.pop() {
-                    // Get the srcinfo for this package
-                    let clone_path = state_guard.config.resolved_cache().aur_clones.join(&pkgbase);
-                    let srcinfo = match aur::read_srcinfo(&clone_path) {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    };
-
-                    // Get currently tracked package names
-                    let tracked_packages = state_guard.db.list_packages().await?;
-                    let mut tracked_pkgnames: std::collections::HashSet<String> = std::collections::HashSet::new();
-                    for p in &tracked_packages {
-                        tracked_pkgnames.insert(p.pkgbase.clone());
-                        let names = state_guard.db.get_package_names(&p.pkgbase).await?;
-                        for n in names {
-                            tracked_pkgnames.insert(n.pkgname);
-                        }
+                // Filter to only deps that exist in AUR and we haven't processed
+                for dep in missing {
+                    if !dep.in_aur {
+                        failed_deps.push((dep.name.clone(), "not found in AUR".to_string()));
+                        continue;
                     }
 
-                    // Find missing AUR deps
-                    let container_image = &state_guard.config.container.image;
-                    let repo_name = &state_guard.config.repo.name;
-                    let repo_path = &state_guard.config.repo.path;
-                    let missing = state_guard
-                        .aur
-                        .find_missing_aur_deps(
-                            &srcinfo,
-                            &tracked_pkgnames,
-                            container_image,
-                            repo_name,
-                            repo_path,
-                        )
-                        .await
-                        .unwrap_or_default();
+                    let dep_pkgbase = match &dep.pkgbase {
+                        Some(pb) => pb.clone(),
+                        None => continue,
+                    };
 
-                    // Filter to only deps that exist in AUR and we haven't processed
-                    for dep in missing {
-                        if !dep.in_aur {
-                            failed_deps.push((dep.name.clone(), "not found in AUR".to_string()));
-                            continue;
+                    if processed.contains(&dep_pkgbase) {
+                        continue;
+                    }
+                    processed.insert(dep_pkgbase.clone());
+
+                    // Add this dependency
+                    match add_package_internal(
+                        state,
+                        &dep.name,
+                        InstallReason::Dependency,
+                        &mut added_packages,
+                        json_output,
+                    )
+                    .await
+                    {
+                        Ok(_) => {
+                            // Queue this package to check for its own deps
+                            to_check.push(dep_pkgbase);
                         }
-
-                        let dep_pkgbase = match &dep.pkgbase {
-                            Some(pb) => pb.clone(),
-                            None => continue,
-                        };
-
-                        if processed.contains(&dep_pkgbase) {
-                            continue;
-                        }
-                        processed.insert(dep_pkgbase.clone());
-
-                        // Add this dependency
-                        match add_package_internal(
-                            &mut state_guard,
-                            &dep.name,
-                            models::InstallReason::Dependency,
-                            &mut added_packages,
-                            json_output,
-                        )
-                        .await
-                        {
-                            Ok(_) => {
-                                // Queue this package to check for its own deps
-                                to_check.push(dep_pkgbase);
-                            }
-                            Err(e) => {
-                                failed_deps.push((dep.name.clone(), e.to_string()));
-                            }
+                        Err(e) => {
+                            failed_deps.push((dep.name.clone(), e.to_string()));
                         }
                     }
                 }
@@ -484,8 +725,8 @@ async fn cmd_add(state: SharedState, name: &str, asdeps: bool, with_deps: bool, 
                     "pkgbase": pkg.pkgbase,
                     "version": pkg.version,
                     "install_reason": match pkg.install_reason {
-                        models::InstallReason::Explicit => "explicit",
-                        models::InstallReason::Dependency => "dependency",
+                        InstallReason::Explicit => "explicit",
+                        InstallReason::Dependency => "dependency",
                     }
                 })
             })
@@ -501,11 +742,14 @@ async fn cmd_add(state: SharedState, name: &str, asdeps: bool, with_deps: bool, 
             })
             .collect();
 
-        println!("{}", serde_json::json!({
-            "status": "ok",
-            "added": added,
-            "failed_deps": failed
-        }));
+        println!(
+            "{}",
+            serde_json::json!({
+                "status": "ok",
+                "added": added,
+                "failed_deps": failed
+            })
+        );
     } else {
         println!();
         if added_packages.is_empty() {
@@ -514,8 +758,8 @@ async fn cmd_add(state: SharedState, name: &str, asdeps: bool, with_deps: bool, 
             println!("Added {} package(s):", added_packages.len());
             for pkg in &added_packages {
                 let reason_str = match pkg.install_reason {
-                    models::InstallReason::Explicit => "explicit",
-                    models::InstallReason::Dependency => "dependency",
+                    InstallReason::Explicit => "explicit",
+                    InstallReason::Dependency => "dependency",
                 };
                 println!("  {} {} ({})", pkg.pkgbase, pkg.version, reason_str);
             }
@@ -541,9 +785,9 @@ async fn cmd_add(state: SharedState, name: &str, asdeps: bool, with_deps: bool, 
 
 /// Internal helper to add a single package without recursion
 async fn add_package_internal(
-    state: &mut tokio::sync::RwLockWriteGuard<'_, api::AppState>,
+    state: &mut CliState,
     name: &str,
-    install_reason: models::InstallReason,
+    install_reason: InstallReason,
     added_packages: &mut Vec<AddedPackage>,
     json_output: bool,
 ) -> Result<()> {
@@ -551,7 +795,7 @@ async fn add_package_internal(
     if state.db.get_package(name).await?.is_some() {
         return Ok(()); // Already tracked
     }
-    if let Some(pkgbase) = state.db.resolve_pkgbase(name).await? {
+    if let Some(pkgbase) = resolve_pkgbase_from_cache(&state.srcinfo_cache, name) {
         if state.db.get_package(&pkgbase).await?.is_some() {
             return Ok(()); // Already tracked
         }
@@ -573,8 +817,8 @@ async fn add_package_internal(
 
     if !json_output {
         let reason_str = match install_reason {
-            models::InstallReason::Explicit => "explicit",
-            models::InstallReason::Dependency => "dependency",
+            InstallReason::Explicit => "explicit",
+            InstallReason::Dependency => "dependency",
         };
         println!("Adding {} ({})...", pkgbase, reason_str);
     }
@@ -588,43 +832,26 @@ async fn add_package_internal(
     // Parse .SRCINFO
     let srcinfo = aur::read_srcinfo(&clone_path)?;
     let current_commit = aur::AurGit::head_commit(&clone_path)?;
-    let version = format!("{}-{}", srcinfo.pkgver, srcinfo.pkgrel);
+    let version = srcinfo.full_version();
 
-    // Create package record
+    // Create package record (V2 -- no status, pkgver, current_commit fields)
     let now = chrono::Utc::now();
     let pkg = models::Package {
         pkgbase: pkgbase.clone(),
         approved_commit: None,
-        current_commit: Some(current_commit),
-        pkgver: Some(version.clone()),
-        status: models::PackageStatus::PendingReview,
         install_reason,
         auto_approve: false,
-        has_upstream: true,
-        in_official_repos: false,
-        rejection_reason: None,
         added_at: now,
         updated_at: now,
     };
 
-    // Build package names list
-    let mut pkg_names = Vec::new();
-    for sp in &srcinfo.packages {
-        pkg_names.push(models::PackageName {
-            pkgname: sp.pkgname.clone(),
-            pkgbase: pkgbase.clone(),
-            pkgdesc: sp.pkgdesc.clone().or(srcinfo.pkgdesc.clone()),
-            pkgver: Some(version.clone()),
-            depends: Some(serde_json::to_string(&sp.depends)?),
-            optdepends: Some(serde_json::to_string(&sp.optdepends)?),
-            provides: Some(serde_json::to_string(&sp.provides)?),
-            conflicts: Some(serde_json::to_string(&sp.conflicts)?),
-            repo_version: None,
-        });
-    }
+    // Insert package (no names table in V2)
+    state.db.insert_package(&pkg).await?;
 
-    // Insert package and its names atomically
-    state.db.insert_package_with_names(&pkg, &pkg_names).await?;
+    // Add to SrcInfoCache
+    state
+        .srcinfo_cache
+        .insert(pkgbase.clone(), srcinfo, current_commit);
 
     added_packages.push(AddedPackage {
         pkgbase: pkgbase.clone(),
@@ -635,27 +862,26 @@ async fn add_package_internal(
     Ok(())
 }
 
-async fn cmd_remove(state: SharedState, name: &str, delete_files: bool, delete_clone: bool, recursive: bool) -> Result<()> {
-    let state = state.write().await;
-
-    let pkg = state.db.get_package(name).await?
-        .or({
-            if let Some(pkgbase) = state.db.resolve_pkgbase(name).await? {
-                state.db.get_package(&pkgbase).await?
-            } else {
-                None
-            }
-        })
+async fn cmd_remove(
+    state: &mut CliState,
+    name: &str,
+    delete_files: bool,
+    delete_clone: bool,
+    recursive: bool,
+) -> Result<()> {
+    let pkg = state
+        .resolve_package(name)
+        .await?
         .ok_or_else(|| anyhow::anyhow!("Package not found"))?;
 
     if delete_files {
-        let names = state.db.get_package_names(&pkg.pkgbase).await?;
-        let pkgnames: Vec<&str> = names.iter().map(|n| n.pkgname.as_str()).collect();
-        println!("Removing from repo: {:?}", pkgnames);
-        state.build.repo_remove(&pkgnames)?;
+        let pkgnames = state.get_pkgnames(&pkg.pkgbase);
+        let pkgname_refs: Vec<&str> = pkgnames.iter().map(|n| n.as_str()).collect();
+        println!("Removing from repo: {:?}", pkgname_refs);
+        state.build_system.repo_remove(&pkgname_refs)?;
 
-        for name in &names {
-            state.repo.delete_package_files(&name.pkgname)?;
+        for pkgname in &pkgnames {
+            state.repo.delete_package_files(pkgname)?;
         }
     }
 
@@ -668,36 +894,43 @@ async fn cmd_remove(state: SharedState, name: &str, delete_files: bool, delete_c
             std::fs::remove_dir_all(&clone_path)?;
         }
         // Also clean up cached sources
-        state.build.cleanup_all_sources(&pkg.pkgbase)?;
+        state.build_system.cleanup_all_sources(&pkg.pkgbase)?;
     }
+
+    // Remove from SrcInfoCache
+    state.srcinfo_cache.remove(&pkg.pkgbase);
 
     state.db.delete_package(&pkg.pkgbase).await?;
     println!("Removed {}", pkg.pkgbase);
 
     // If recursive, also remove orphaned dependencies
     if recursive {
-        let orphans = state.db.list_orphans().await?;
-        if !orphans.is_empty() {
+        let all_packages = state.db.list_packages().await?;
+        let orphan_pkgbases = find_orphans(&all_packages, &state.srcinfo_cache);
+        if !orphan_pkgbases.is_empty() {
             println!("\nRemoving orphaned dependencies:");
-            for orphan in orphans {
+            for orphan_pkgbase in orphan_pkgbases {
                 if delete_files {
-                    let names = state.db.get_package_names(&orphan.pkgbase).await?;
-                    let pkgnames: Vec<&str> = names.iter().map(|n| n.pkgname.as_str()).collect();
-                    state.build.repo_remove(&pkgnames)?;
-                    for name in &names {
-                        state.repo.delete_package_files(&name.pkgname)?;
+                    let pkgnames = state.get_pkgnames(&orphan_pkgbase);
+                    let pkgname_refs: Vec<&str> = pkgnames.iter().map(|n| n.as_str()).collect();
+                    state.build_system.repo_remove(&pkgname_refs)?;
+                    for pkgname in &pkgnames {
+                        state.repo.delete_package_files(pkgname)?;
                     }
                 }
                 if delete_clone {
-                    let clone_path = orphan.clone_path(&aur_clones);
-                    if clone_path.exists() {
-                        std::fs::remove_dir_all(&clone_path)?;
+                    if let Some(orphan_pkg) = state.db.get_package(&orphan_pkgbase).await? {
+                        let clone_path = orphan_pkg.clone_path(&aur_clones);
+                        if clone_path.exists() {
+                            std::fs::remove_dir_all(&clone_path)?;
+                        }
+                        // Also clean up cached sources
+                        state.build_system.cleanup_all_sources(&orphan_pkgbase)?;
                     }
-                    // Also clean up cached sources
-                    state.build.cleanup_all_sources(&orphan.pkgbase)?;
                 }
-                state.db.delete_package(&orphan.pkgbase).await?;
-                println!("  Removed {} (orphan)", orphan.pkgbase);
+                state.srcinfo_cache.remove(&orphan_pkgbase);
+                state.db.delete_package(&orphan_pkgbase).await?;
+                println!("  Removed {} (orphan)", orphan_pkgbase);
             }
         }
     }
@@ -705,44 +938,106 @@ async fn cmd_remove(state: SharedState, name: &str, delete_files: bool, delete_c
     Ok(())
 }
 
-async fn cmd_list(state: SharedState, status: Option<String>, explicit: bool, deps: bool, orphans_flag: bool, json_output: bool) -> Result<()> {
-    let state = state.read().await;
+async fn cmd_list(
+    state: &CliState,
+    status: Option<String>,
+    explicit: bool,
+    deps: bool,
+    orphans_flag: bool,
+    json_output: bool,
+) -> Result<()> {
+    let active_builds: HashSet<String> = HashSet::new();
+    let aur_clones = state.config.resolved_cache().aur_clones;
 
-    // Get packages based on filters
-    let packages = if orphans_flag {
-        state.db.list_orphans().await?
-    } else if explicit {
-        state.db.list_packages_by_reason(models::InstallReason::Explicit).await?
+    // Get all packages first, then filter
+    let all_packages = if explicit {
+        state
+            .db
+            .list_packages_by_reason(InstallReason::Explicit)
+            .await?
     } else if deps {
-        state.db.list_packages_by_reason(models::InstallReason::Dependency).await?
-    } else if let Some(ref s) = status {
-        let status = match s.as_str() {
-            "pending_review" => models::PackageStatus::PendingReview,
-            "approved" => models::PackageStatus::Approved,
-            "building" => models::PackageStatus::Building,
-            "failed" => models::PackageStatus::Failed,
-            "up_to_date" => models::PackageStatus::UpToDate,
-            "update_available" => models::PackageStatus::UpdateAvailable,
-            "rejected" => models::PackageStatus::Rejected,
-            _ => anyhow::bail!("Invalid status: {}", s),
-        };
-        state.db.list_packages_by_status(status).await?
+        state
+            .db
+            .list_packages_by_reason(InstallReason::Dependency)
+            .await?
     } else {
         state.db.list_packages().await?
     };
 
+    // Handle orphans filter
+    if orphans_flag {
+        let all_for_orphan_check = state.db.list_packages().await?;
+        let orphan_pkgbases = find_orphans(&all_for_orphan_check, &state.srcinfo_cache);
+        let orphan_set: HashSet<&str> = orphan_pkgbases.iter().map(|s| s.as_str()).collect();
+
+        let orphan_packages: Vec<&models::Package> = all_for_orphan_check
+            .iter()
+            .filter(|p| orphan_set.contains(p.pkgbase.as_str()))
+            .collect();
+
+        let mut enriched: Vec<EnrichedPackage> = Vec::new();
+        for pkg in &orphan_packages {
+            enriched.push(
+                enrich_package(
+                    pkg,
+                    &state.db,
+                    &state.srcinfo_cache,
+                    &state.repo_state,
+                    &active_builds,
+                    &aur_clones,
+                )
+                .await,
+            );
+        }
+
+        print_package_list(&enriched, json_output, true)?;
+        return Ok(());
+    }
+
+    // Enrich all packages
+    let mut enriched: Vec<EnrichedPackage> = Vec::new();
+    for pkg in &all_packages {
+        enriched.push(
+            enrich_package(
+                pkg,
+                &state.db,
+                &state.srcinfo_cache,
+                &state.repo_state,
+                &active_builds,
+                &aur_clones,
+            )
+            .await,
+        );
+    }
+
+    // Filter by status if specified
+    if let Some(ref s) = status {
+        let filter_status = parse_status_filter(s)?;
+        enriched.retain(|e| e.status == filter_status);
+    }
+
+    print_package_list(&enriched, json_output, false)?;
+
+    Ok(())
+}
+
+fn print_package_list(
+    packages: &[EnrichedPackage],
+    json_output: bool,
+    is_orphan_list: bool,
+) -> Result<()> {
     if json_output {
         let json_packages: Vec<serde_json::Value> = packages
             .iter()
-            .map(|pkg| {
+            .map(|ep| {
                 serde_json::json!({
-                    "pkgbase": pkg.pkgbase,
-                    "version": pkg.pkgver,
-                    "status": pkg.status.to_string(),
-                    "install_reason": pkg.install_reason.to_string(),
-                    "auto_approve": pkg.auto_approve,
-                    "current_commit": pkg.current_commit,
-                    "approved_commit": pkg.approved_commit,
+                    "pkgbase": ep.pkg.pkgbase,
+                    "version": ep.pkgver,
+                    "status": ep.status.to_string(),
+                    "install_reason": ep.pkg.install_reason.to_string(),
+                    "auto_approve": ep.pkg.auto_approve,
+                    "current_commit": ep.current_commit,
+                    "approved_commit": ep.pkg.approved_commit,
                 })
             })
             .collect();
@@ -751,7 +1046,7 @@ async fn cmd_list(state: SharedState, status: Option<String>, explicit: bool, de
     }
 
     if packages.is_empty() {
-        if orphans_flag {
+        if is_orphan_list {
             println!("No orphaned packages found");
         } else {
             println!("No packages found");
@@ -759,15 +1054,19 @@ async fn cmd_list(state: SharedState, status: Option<String>, explicit: bool, de
         return Ok(());
     }
 
-    println!("{:<30} {:<20} {:<15} {:<10}", "PKGBASE", "VERSION", "STATUS", "REASON");
+    println!(
+        "{:<30} {:<20} {:<15} {:<10}",
+        "PKGBASE", "VERSION", "STATUS", "REASON"
+    );
     println!("{}", "-".repeat(75));
 
-    for pkg in &packages {
-        println!("{:<30} {:<20} {:<15} {:<10}",
-            pkg.pkgbase,
-            pkg.pkgver.as_deref().unwrap_or("-"),
-            pkg.status,
-            pkg.install_reason
+    for ep in packages {
+        println!(
+            "{:<30} {:<20} {:<15} {:<10}",
+            ep.pkg.pkgbase,
+            ep.pkgver.as_deref().unwrap_or("-"),
+            ep.status,
+            ep.pkg.install_reason
         );
     }
 
@@ -776,93 +1075,113 @@ async fn cmd_list(state: SharedState, status: Option<String>, explicit: bool, de
     Ok(())
 }
 
-async fn cmd_info(state: SharedState, name: &str, json_output: bool) -> Result<()> {
-    let state = state.read().await;
-
-    let pkg = state.db.get_package(name).await?
-        .or({
-            if let Some(pkgbase) = state.db.resolve_pkgbase(name).await? {
-                state.db.get_package(&pkgbase).await?
-            } else {
-                None
-            }
-        })
+async fn cmd_info(state: &CliState, name: &str, json_output: bool) -> Result<()> {
+    let pkg = state
+        .resolve_package(name)
+        .await?
         .ok_or_else(|| anyhow::anyhow!("Package not found"))?;
 
-    let names = state.db.get_package_names(&pkg.pkgbase).await?;
+    let enriched = state.enrich(&pkg).await;
+
+    let srcinfo = state.srcinfo_cache.get(&pkg.pkgbase);
+    let aur_clones = state.config.resolved_cache().aur_clones;
 
     if json_output {
-        let pkgnames: Vec<serde_json::Value> = names
-            .iter()
-            .map(|n| {
-                serde_json::json!({
-                    "pkgname": n.pkgname,
-                    "pkgdesc": n.pkgdesc,
-                    "pkgver": n.pkgver,
-                    "depends": n.depends.as_ref().and_then(|d| serde_json::from_str::<Vec<String>>(d).ok()),
-                    "provides": n.provides.as_ref().and_then(|p| serde_json::from_str::<Vec<String>>(p).ok()),
-                    "conflicts": n.conflicts.as_ref().and_then(|c| serde_json::from_str::<Vec<String>>(c).ok()),
-                    "repo_version": n.repo_version,
-                })
+        let pkgnames: Vec<serde_json::Value> = srcinfo
+            .map(|c| {
+                c.srcinfo
+                    .packages
+                    .iter()
+                    .map(|p| {
+                        serde_json::json!({
+                            "pkgname": p.pkgname,
+                            "pkgdesc": p.pkgdesc.as_ref().or(c.srcinfo.pkgdesc.as_ref()),
+                            "depends": p.depends,
+                            "provides": p.provides,
+                            "conflicts": p.conflicts,
+                            "repo_version": state.repo_state.get_version_for_pkgname(&p.pkgname),
+                        })
+                    })
+                    .collect()
             })
-            .collect();
+            .unwrap_or_default();
 
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-            "pkgbase": pkg.pkgbase,
-            "version": pkg.pkgver,
-            "status": pkg.status.to_string(),
-            "install_reason": pkg.install_reason.to_string(),
-            "auto_approve": pkg.auto_approve,
-            "aur_url": pkg.aur_url(),
-            "clone_path": pkg.clone_path(&state.config.resolved_cache().aur_clones),
-            "current_commit": pkg.current_commit,
-            "approved_commit": pkg.approved_commit,
-            "added_at": pkg.added_at.to_rfc3339(),
-            "updated_at": pkg.updated_at.to_rfc3339(),
-            "packages": pkgnames,
-        }))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "pkgbase": pkg.pkgbase,
+                "version": enriched.pkgver,
+                "status": enriched.status.to_string(),
+                "install_reason": pkg.install_reason.to_string(),
+                "auto_approve": pkg.auto_approve,
+                "aur_url": pkg.aur_url(),
+                "clone_path": pkg.clone_path(&aur_clones),
+                "current_commit": enriched.current_commit,
+                "approved_commit": pkg.approved_commit,
+                "added_at": pkg.added_at.to_rfc3339(),
+                "updated_at": pkg.updated_at.to_rfc3339(),
+                "packages": pkgnames,
+            }))?
+        );
         return Ok(());
     }
 
     println!("Package: {}", pkg.pkgbase);
-    println!("Version: {}", pkg.pkgver.as_deref().unwrap_or("-"));
-    println!("Status: {}", pkg.status);
+    println!(
+        "Version: {}",
+        enriched.pkgver.as_deref().unwrap_or("-")
+    );
+    println!("Status: {}", enriched.status);
     println!("Install reason: {}", pkg.install_reason);
     println!("Auto-approve: {}", pkg.auto_approve);
     println!("URL: {}", pkg.aur_url());
-    println!("Clone path: {}", pkg.clone_path(&state.config.resolved_cache().aur_clones).display());
-    println!("Current commit: {}", pkg.current_commit.as_deref().unwrap_or("-"));
-    println!("Approved commit: {}", pkg.approved_commit.as_deref().unwrap_or("-"));
+    println!(
+        "Clone path: {}",
+        pkg.clone_path(&aur_clones).display()
+    );
+    println!(
+        "Current commit: {}",
+        enriched.current_commit.as_deref().unwrap_or("-")
+    );
+    println!(
+        "Approved commit: {}",
+        pkg.approved_commit.as_deref().unwrap_or("-")
+    );
     println!("Added: {}", pkg.added_at);
     println!("Updated: {}", pkg.updated_at);
     println!();
     println!("Packages produced:");
-    for name in names {
-        println!("  - {} ({})", name.pkgname, name.pkgdesc.as_deref().unwrap_or("-"));
+    if let Some(cached) = srcinfo {
+        for sp in &cached.srcinfo.packages {
+            println!(
+                "  - {} ({})",
+                sp.pkgname,
+                sp.pkgdesc
+                    .as_deref()
+                    .or(cached.srcinfo.pkgdesc.as_deref())
+                    .unwrap_or("-")
+            );
+        }
+    } else {
+        println!("  (no .SRCINFO cached)");
     }
 
     Ok(())
 }
 
-async fn cmd_diff(state: SharedState, name: &str) -> Result<()> {
-    let state = state.read().await;
-
-    let pkg = state.db.get_package(name).await?
-        .or({
-            if let Some(pkgbase) = state.db.resolve_pkgbase(name).await? {
-                state.db.get_package(&pkgbase).await?
-            } else {
-                None
-            }
-        })
+async fn cmd_diff(state: &CliState, name: &str) -> Result<()> {
+    let pkg = state
+        .resolve_package(name)
+        .await?
         .ok_or_else(|| anyhow::anyhow!("Package not found"))?;
 
     let clone_path = pkg.clone_path(&state.config.resolved_cache().aur_clones);
     aur::AurGit::ensure_cloned(&pkg.pkgbase, &clone_path)?;
 
     if let Some(ref approved) = pkg.approved_commit {
-        let current = pkg.current_commit.as_deref().unwrap_or("HEAD");
-        let diff = aur::AurGit::diff(&clone_path, approved, current)?;
+        let current = SrcInfoCache::get_head_commit(&clone_path)?
+            .unwrap_or_else(|| "HEAD".to_string());
+        let diff = aur::AurGit::diff(&clone_path, approved, &current)?;
 
         if diff.is_empty() {
             println!("No changes since last approval");
@@ -879,17 +1198,10 @@ async fn cmd_diff(state: SharedState, name: &str) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_review(state: SharedState, name: &str, stdout: bool) -> Result<()> {
-    let state = state.read().await;
-
-    let pkg = state.db.get_package(name).await?
-        .or({
-            if let Some(pkgbase) = state.db.resolve_pkgbase(name).await? {
-                state.db.get_package(&pkgbase).await?
-            } else {
-                None
-            }
-        })
+async fn cmd_review(state: &CliState, name: &str, stdout: bool) -> Result<()> {
+    let pkg = state
+        .resolve_package(name)
+        .await?
         .ok_or_else(|| anyhow::anyhow!("Package not found"))?;
 
     let clone_path = pkg.clone_path(&state.config.resolved_cache().aur_clones);
@@ -918,9 +1230,12 @@ async fn cmd_review(state: SharedState, name: &str, stdout: bool) -> Result<()> 
             anyhow::bail!("Editor exited with non-zero status");
         }
 
+        let enriched = state.enrich(&pkg).await;
         println!("\nReviewed: {}", pkg.pkgbase);
-        println!("Status: {}", pkg.status);
-        if pkg.status == models::PackageStatus::PendingReview || pkg.status == models::PackageStatus::UpdateAvailable {
+        println!("Status: {}", enriched.status);
+        if enriched.status == DerivedStatus::PendingReview
+            || enriched.status == DerivedStatus::UpdateAvailable
+        {
             println!("\nTo approve: repoman approve {}", pkg.pkgbase);
         }
     }
@@ -928,54 +1243,84 @@ async fn cmd_review(state: SharedState, name: &str, stdout: bool) -> Result<()> 
     Ok(())
 }
 
-async fn cmd_approve(state: SharedState, name: &str) -> Result<()> {
-    let state = state.write().await;
-
-    let pkg = state.db.get_package(name).await?
-        .or({
-            if let Some(pkgbase) = state.db.resolve_pkgbase(name).await? {
-                state.db.get_package(&pkgbase).await?
-            } else {
-                None
-            }
-        })
+async fn cmd_approve(state: &mut CliState, name: &str) -> Result<()> {
+    let pkg = state
+        .resolve_package(name)
+        .await?
         .ok_or_else(|| anyhow::anyhow!("Package not found"))?;
 
-    state.db.approve_package(&pkg.pkgbase, false, None).await?;
-    println!("Approved {} at commit {}", pkg.pkgbase, pkg.current_commit.as_deref().unwrap_or("?"));
+    let clone_path = pkg.clone_path(&state.config.resolved_cache().aur_clones);
+    aur::AurGit::ensure_cloned(&pkg.pkgbase, &clone_path)?;
+
+    let current_commit = SrcInfoCache::get_head_commit(&clone_path)?
+        .ok_or_else(|| anyhow::anyhow!("Could not determine HEAD commit"))?;
+
+    state
+        .db
+        .approve_package(&pkg.pkgbase, &current_commit, false)
+        .await?;
+    println!("Approved {} at commit {}", pkg.pkgbase, current_commit);
     println!("Run 'repoman build {}' to build", pkg.pkgbase);
 
     Ok(())
 }
 
-async fn cmd_build(state: SharedState, names: Vec<String>, all: bool, updates: bool) -> Result<()> {
-    // Determine which packages to build
-    let packages_to_build: Vec<String> = {
-        let state_read = state.read().await;
+async fn cmd_build(state: &mut CliState, names: Vec<String>, all: bool, updates: bool) -> Result<()> {
+    let active_builds: HashSet<String> = HashSet::new();
+    let aur_clones = state.config.resolved_cache().aur_clones.clone();
 
-        if all {
-            // Build all approved packages
-            let approved = state_read.db.list_packages_by_status(models::PackageStatus::Approved).await?;
-            let update_avail = state_read.db.list_packages_by_status(models::PackageStatus::UpdateAvailable).await?;
-            approved.into_iter().chain(update_avail).map(|p| p.pkgbase).collect()
-        } else if updates {
-            // Build packages with updates
-            state_read.db.list_packages_by_status(models::PackageStatus::UpdateAvailable).await?
-                .into_iter().map(|p| p.pkgbase).collect()
-        } else {
-            // Resolve provided names to pkgbases
-            let mut resolved = Vec::new();
-            for name in &names {
-                if let Some(pkg) = state_read.db.get_package(name).await? {
-                    resolved.push(pkg.pkgbase);
-                } else if let Some(pkgbase) = state_read.db.resolve_pkgbase(name).await? {
-                    resolved.push(pkgbase);
-                } else {
-                    println!("Warning: package '{}' not found, skipping", name);
-                }
+    // Determine which packages to build
+    let packages_to_build: Vec<String> = if all {
+        // Build all approved packages
+        let all_packages = state.db.list_packages().await?;
+        let mut buildable = Vec::new();
+        for pkg in &all_packages {
+            let enriched = enrich_package(
+                pkg,
+                &state.db,
+                &state.srcinfo_cache,
+                &state.repo_state,
+                &active_builds,
+                &aur_clones,
+            )
+            .await;
+            if enriched.status == DerivedStatus::Approved
+                || enriched.status == DerivedStatus::UpdateAvailable
+            {
+                buildable.push(pkg.pkgbase.clone());
             }
-            resolved
         }
+        buildable
+    } else if updates {
+        // Build packages with updates
+        let all_packages = state.db.list_packages().await?;
+        let mut buildable = Vec::new();
+        for pkg in &all_packages {
+            let enriched = enrich_package(
+                pkg,
+                &state.db,
+                &state.srcinfo_cache,
+                &state.repo_state,
+                &active_builds,
+                &aur_clones,
+            )
+            .await;
+            if enriched.status == DerivedStatus::UpdateAvailable {
+                buildable.push(pkg.pkgbase.clone());
+            }
+        }
+        buildable
+    } else {
+        // Resolve provided names to pkgbases
+        let mut resolved = Vec::new();
+        for name in &names {
+            if let Some(pkg) = state.resolve_package(name).await? {
+                resolved.push(pkg.pkgbase);
+            } else {
+                println!("Warning: package '{}' not found, skipping", name);
+            }
+        }
+        resolved
     };
 
     if packages_to_build.is_empty() {
@@ -992,70 +1337,86 @@ async fn cmd_build(state: SharedState, names: Vec<String>, all: bool, updates: b
     println!("Queuing {} packages for build...", packages_to_build.len());
 
     // Build dependency graph for topological sort
-    let (build_order, deps_graph) = {
-        let state_read = state.read().await;
+    // Check base image exists
+    if !state.build_system.image_exists()? {
+        anyhow::bail!("Base image not found. Run 'repoman rebuild-image' first.");
+    }
 
-        // Check base image exists
-        if !state_read.build.image_exists()? {
-            anyhow::bail!("Base image not found. Run 'repoman rebuild-image' first.");
+    // Get packages and validate
+    let mut valid_packages: Vec<models::Package> = Vec::new();
+    for pkgbase in &packages_to_build {
+        if let Some(pkg) = state.db.get_package(pkgbase).await? {
+            let enriched = enrich_package(
+                &pkg,
+                &state.db,
+                &state.srcinfo_cache,
+                &state.repo_state,
+                &active_builds,
+                &aur_clones,
+            )
+            .await;
+            if enriched.status == DerivedStatus::Approved
+                || enriched.status == DerivedStatus::UpdateAvailable
+            {
+                valid_packages.push(pkg);
+            } else {
+                println!(
+                    "Skipping {}: status is '{}' (must be approved)",
+                    pkgbase, enriched.status
+                );
+            }
         }
+    }
 
-        // Get packages and validate
-        let mut valid_packages: Vec<models::Package> = Vec::new();
-        for pkgbase in &packages_to_build {
-            if let Some(pkg) = state_read.db.get_package(pkgbase).await? {
-                if pkg.status == models::PackageStatus::Approved || pkg.status == models::PackageStatus::UpdateAvailable {
-                    valid_packages.push(pkg);
-                } else {
-                    println!("Skipping {}: status is '{}' (must be approved)", pkgbase, pkg.status);
+    if valid_packages.is_empty() {
+        println!("No packages ready to build");
+        return Ok(());
+    }
+
+    // Build pkgname -> pkgbase mapping from SrcInfoCache
+    let pkgbases_set: HashSet<String> =
+        valid_packages.iter().map(|p| p.pkgbase.clone()).collect();
+    let mut pkgname_to_pkgbase: HashMap<String, String> = HashMap::new();
+    for pkg in &valid_packages {
+        let pkgnames = state.get_pkgnames(&pkg.pkgbase);
+        for pkgname in pkgnames {
+            pkgname_to_pkgbase.insert(pkgname, pkg.pkgbase.clone());
+        }
+    }
+
+    // Build dependency graph from SrcInfoCache
+    let mut deps_graph: HashMap<String, Vec<String>> = HashMap::new();
+    for pkg in &valid_packages {
+        let mut pkg_deps: Vec<String> = Vec::new();
+        if let Some(cached) = state.srcinfo_cache.get(&pkg.pkgbase) {
+            // Global deps
+            for dep in &cached.srcinfo.depends {
+                let dep_name = aur::DepResolver::dep_name(dep);
+                if let Some(dep_pkgbase) = pkgname_to_pkgbase.get(dep_name) {
+                    if dep_pkgbase != &pkg.pkgbase && pkgbases_set.contains(dep_pkgbase) {
+                        pkg_deps.push(dep_pkgbase.clone());
+                    }
                 }
             }
-        }
-
-        if valid_packages.is_empty() {
-            println!("No packages ready to build");
-            return Ok(());
-        }
-
-        // Build pkgname -> pkgbase mapping
-        let pkgbases_set: std::collections::HashSet<String> = valid_packages.iter().map(|p| p.pkgbase.clone()).collect();
-        let mut pkgname_to_pkgbase: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        for pkg in &valid_packages {
-            let names = state_read.db.get_package_names(&pkg.pkgbase).await?;
-            for name in names {
-                pkgname_to_pkgbase.insert(name.pkgname, pkg.pkgbase.clone());
-            }
-        }
-
-        // Build dependency graph
-        let mut deps_graph: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
-        for pkg in &valid_packages {
-            let names = state_read.db.get_package_names(&pkg.pkgbase).await?;
-            let mut pkg_deps: Vec<String> = Vec::new();
-            for name in &names {
-                if let Some(deps_json) = &name.depends {
-                    if let Ok(deps) = serde_json::from_str::<Vec<String>>(deps_json) {
-                        for dep in deps {
-                            let dep_name = aur::DepResolver::dep_name(&dep);
-                            if let Some(dep_pkgbase) = pkgname_to_pkgbase.get(dep_name) {
-                                if dep_pkgbase != &pkg.pkgbase && pkgbases_set.contains(dep_pkgbase) {
-                                    pkg_deps.push(dep_pkgbase.clone());
-                                }
-                            }
+            // Per-package deps
+            for sp in &cached.srcinfo.packages {
+                for dep in &sp.depends {
+                    let dep_name = aur::DepResolver::dep_name(dep);
+                    if let Some(dep_pkgbase) = pkgname_to_pkgbase.get(dep_name) {
+                        if dep_pkgbase != &pkg.pkgbase && pkgbases_set.contains(dep_pkgbase) {
+                            pkg_deps.push(dep_pkgbase.clone());
                         }
                     }
                 }
             }
-            pkg_deps.sort();
-            pkg_deps.dedup();
-            deps_graph.insert(pkg.pkgbase.clone(), pkg_deps);
         }
+        pkg_deps.sort();
+        pkg_deps.dedup();
+        deps_graph.insert(pkg.pkgbase.clone(), pkg_deps);
+    }
 
-        // Topological sort
-        let build_order = topological_sort_cli(&pkgbases_set, &deps_graph)?;
-
-        (build_order, deps_graph)
-    };
+    // Topological sort
+    let build_order = topological_sort_cli(&pkgbases_set, &deps_graph)?;
 
     println!("\nBuild order (dependencies first):");
     for (i, pkgbase) in build_order.iter().enumerate() {
@@ -1064,7 +1425,7 @@ async fn cmd_build(state: SharedState, names: Vec<String>, all: bool, updates: b
     println!();
 
     // Run builds sequentially
-    let mut failed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut failed: HashSet<String> = HashSet::new();
     let mut succeeded = 0;
     let mut skipped = 0;
 
@@ -1085,7 +1446,7 @@ async fn cmd_build(state: SharedState, names: Vec<String>, all: bool, updates: b
 
         println!("\n=== Building {} ===", pkgbase);
 
-        match cmd_build_single(state.clone(), pkgbase).await {
+        match cmd_build_single(state, pkgbase).await {
             Ok(_) => {
                 succeeded += 1;
             }
@@ -1110,10 +1471,10 @@ async fn cmd_build(state: SharedState, names: Vec<String>, all: bool, updates: b
 
 /// Topological sort for CLI (Kahn's algorithm)
 fn topological_sort_cli(
-    nodes: &std::collections::HashSet<String>,
-    deps: &std::collections::HashMap<String, Vec<String>>,
+    nodes: &HashSet<String>,
+    deps: &HashMap<String, Vec<String>>,
 ) -> Result<Vec<String>> {
-    use std::collections::{HashMap, HashSet, VecDeque};
+    use std::collections::VecDeque;
 
     let mut in_degree: HashMap<String, usize> = HashMap::new();
     for node in nodes {
@@ -1165,48 +1526,42 @@ fn topological_sort_cli(
 }
 
 /// Build a single package (synchronous, with output)
-async fn cmd_build_single(state: SharedState, name: &str) -> Result<()> {
-    let (pkg, build_system, log_path) = {
-        let state_read = state.read().await;
+async fn cmd_build_single(state: &mut CliState, name: &str) -> Result<()> {
+    let pkg = state
+        .resolve_package(name)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Package not found"))?;
 
-        let pkg = state_read.db.get_package(name).await?
-            .or({
-                if let Some(pkgbase) = state_read.db.resolve_pkgbase(name).await? {
-                    state_read.db.get_package(&pkgbase).await?
-                } else {
-                    None
-                }
-            })
-            .ok_or_else(|| anyhow::anyhow!("Package not found"))?;
-
-        if pkg.status != models::PackageStatus::Approved && pkg.status != models::PackageStatus::UpdateAvailable {
-            anyhow::bail!("Package must be approved before building (current status: {})", pkg.status);
-        }
-
-        if !state_read.build.image_exists()? {
-            anyhow::bail!("Base image not found. Run 'repoman rebuild-image' first.");
-        }
-
-        let log_path = state_read.config.resolved_cache().logs.join(format!("{}-build.log", pkg.pkgbase));
-        let build_system = build::BuildSystem::new(state_read.config.clone());
-
-        std::fs::create_dir_all(&state_read.config.repo.path)?;
-        build_system.init_repo()?;
-
-        (pkg, build_system, log_path)
-    };
-
+    // Derive status to check if package is buildable
+    let enriched = state.enrich(&pkg).await;
+    if enriched.status != DerivedStatus::Approved
+        && enriched.status != DerivedStatus::UpdateAvailable
     {
-        let state_write = state.write().await;
-        state_write.db.update_package_status(&pkg.pkgbase, models::PackageStatus::Building).await?;
+        anyhow::bail!(
+            "Package must be approved before building (current status: {})",
+            enriched.status
+        );
     }
+
+    if !state.build_system.image_exists()? {
+        anyhow::bail!("Base image not found. Run 'repoman rebuild-image' first.");
+    }
+
+    let log_path = state
+        .config
+        .resolved_cache()
+        .logs
+        .join(format!("{}-build.log", pkg.pkgbase));
+    let build_system = BuildSystem::new(state.config.clone());
+
+    std::fs::create_dir_all(&state.config.repo.path)?;
+    build_system.init_repo()?;
+
+    // No status update needed in V2 -- status is derived
 
     println!("Building {}...", pkg.pkgbase);
 
-    let source_path = {
-        let state_read = state.read().await;
-        pkg.clone_path(&state_read.config.resolved_cache().aur_clones)
-    };
+    let source_path = pkg.clone_path(&state.config.resolved_cache().aur_clones);
     // Ensure clone exists (re-clone from AUR if missing)
     aur::AurGit::ensure_cloned(&pkg.pkgbase, &source_path)?;
     let result = build_system.run_build_sync(&pkg.pkgbase, &source_path, &log_path);
@@ -1222,33 +1577,30 @@ async fn cmd_build_single(state: SharedState, name: &str) -> Result<()> {
 
             match post_build_result {
                 Ok(repo_packages) => {
-                    {
-                        let state_write = state.write().await;
-                        state_write.db.update_package_status(&pkg.pkgbase, models::PackageStatus::UpToDate).await?;
-                    }
+                    // Reload RepoState after repo-add
+                    state.repo_state.reload()?;
 
                     println!("\nBuild successful!");
                     println!("Packages added to repository:");
-                    for pkg in &repo_packages {
-                        println!("  - {}", pkg.file_name().unwrap_or_default().to_string_lossy());
+                    for pkg_path in &repo_packages {
+                        println!(
+                            "  - {}",
+                            pkg_path
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                        );
                     }
                     Ok(())
                 }
                 Err(e) => {
-                    {
-                        let state_write = state.write().await;
-                        state_write.db.update_package_status(&pkg.pkgbase, models::PackageStatus::Failed).await?;
-                    }
+                    // No status update needed in V2 -- status will derive as Failed or Approved
                     Err(e)
                 }
             }
         }
         Err(e) => {
-            {
-                let state_write = state.write().await;
-                state_write.db.update_package_status(&pkg.pkgbase, models::PackageStatus::Failed).await?;
-            }
-
+            // No status update needed in V2
             println!("\nBuild failed: {}", e);
             println!("Check logs at: {}", log_path.display());
             anyhow::bail!("Build failed");
@@ -1256,21 +1608,18 @@ async fn cmd_build_single(state: SharedState, name: &str) -> Result<()> {
     }
 }
 
-async fn cmd_logs(state: SharedState, id: &str, follow: bool, lines: Option<usize>) -> Result<()> {
-    let state = state.read().await;
-
+async fn cmd_logs(state: &CliState, id: &str, follow: bool, lines: Option<usize>) -> Result<()> {
     // Try to find the log path
     let logs_dir = state.config.resolved_cache().logs;
     let log_path: PathBuf = if let Some(build) = state.db.get_build(id).await? {
         // Found a build by ID
-        build.resolve_log_path(&logs_dir)
+        build
+            .resolve_log_path(&logs_dir)
             .ok_or_else(|| anyhow::anyhow!("Build {} has no log file", id))?
     } else {
         // Try to interpret as package name and get latest build
-        let pkgbase: Option<String> = if let Some(pkg) = state.db.get_package(id).await? {
+        let pkgbase: Option<String> = if let Some(pkg) = state.resolve_package(id).await? {
             Some(pkg.pkgbase)
-        } else if let Some(resolved) = state.db.resolve_pkgbase(id).await? {
-            Some(resolved)
         } else {
             None
         };
@@ -1279,7 +1628,8 @@ async fn cmd_logs(state: SharedState, id: &str, follow: bool, lines: Option<usiz
             // Get the latest build for this package
             let builds = state.db.list_builds(&pkgbase, 1, 0).await?;
             if let Some(build) = builds.first() {
-                build.resolve_log_path(&logs_dir)
+                build
+                    .resolve_log_path(&logs_dir)
                     .unwrap_or_else(|| logs_dir.join(format!("{}-build.log", pkgbase)))
             } else {
                 // No builds yet, try the default log path
@@ -1358,22 +1708,32 @@ async fn cmd_logs(state: SharedState, id: &str, follow: bool, lines: Option<usiz
     Ok(())
 }
 
-async fn cmd_check_updates(state: SharedState, json_output: bool) -> Result<()> {
-    let state = state.write().await;
-
+async fn cmd_check_updates(state: &mut CliState, json_output: bool) -> Result<()> {
     let packages = state.db.list_packages().await?;
     let mut updates: Vec<serde_json::Value> = Vec::new();
+    let active_builds: HashSet<String> = HashSet::new();
+    let aur_clones = state.config.resolved_cache().aur_clones.clone();
 
     for pkg in packages {
-        // Don't touch the source directory while a build is actively using it
-        if pkg.status == models::PackageStatus::Building {
+        // Derive status to check if building
+        let enriched = enrich_package(
+            &pkg,
+            &state.db,
+            &state.srcinfo_cache,
+            &state.repo_state,
+            &active_builds,
+            &aur_clones,
+        )
+        .await;
+
+        if enriched.status == DerivedStatus::Building {
             if !json_output {
                 println!("Skipping {} (build in progress)", pkg.pkgbase);
             }
             continue;
         }
 
-        let clone_path = pkg.clone_path(&state.config.resolved_cache().aur_clones);
+        let clone_path = pkg.clone_path(&aur_clones);
         aur::AurGit::ensure_cloned(&pkg.pkgbase, &clone_path)?;
 
         if !json_output {
@@ -1389,11 +1749,11 @@ async fn cmd_check_updates(state: SharedState, json_output: bool) -> Result<()> 
             let new_commit = aur::AurGit::head_commit(&clone_path)?;
 
             let srcinfo = aur::read_srcinfo(&clone_path)?;
-            let pkgver = format!("{}-{}", srcinfo.pkgver, srcinfo.pkgrel);
+            let pkgver = srcinfo.full_version();
 
             // Clean up stale sources if version changed
             if old_version.as_deref() != Some(&pkgver) {
-                let deleted = state.build.cleanup_stale_sources(
+                let deleted = state.build_system.cleanup_stale_sources(
                     &pkg.pkgbase,
                     old_srcinfo.as_ref(),
                     &srcinfo,
@@ -1404,16 +1764,18 @@ async fn cmd_check_updates(state: SharedState, json_output: bool) -> Result<()> 
                 }
             }
 
-            state.db.update_package_commit(&pkg.pkgbase, &new_commit, Some(&pkgver)).await?;
+            // Update SrcInfoCache with new data
+            state
+                .srcinfo_cache
+                .insert(pkg.pkgbase.clone(), srcinfo, new_commit.clone());
 
-            let new_status = if pkg.auto_approve {
-                state.db.approve_package(&pkg.pkgbase, true, None).await?;
-                models::PackageStatus::Approved
-            } else {
-                models::PackageStatus::UpdateAvailable
-            };
-
-            state.db.update_package_status(&pkg.pkgbase, new_status).await?;
+            // Auto-approve if configured
+            if pkg.auto_approve {
+                state
+                    .db
+                    .approve_package(&pkg.pkgbase, &new_commit, true)
+                    .await?;
+            }
 
             if !json_output {
                 println!("UPDATE AVAILABLE ({})", pkgver);
@@ -1431,66 +1793,85 @@ async fn cmd_check_updates(state: SharedState, json_output: bool) -> Result<()> 
     }
 
     if json_output {
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-            "updates": updates,
-            "count": updates.len(),
-        }))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "updates": updates,
+                "count": updates.len(),
+            }))?
+        );
     } else if updates.is_empty() {
         println!("\nAll packages up to date");
     } else {
-        let names: Vec<&str> = updates.iter()
+        let names: Vec<&str> = updates
+            .iter()
             .filter_map(|u| u.get("pkgbase").and_then(|v| v.as_str()))
             .collect();
-        println!("\n{} package(s) with updates: {}", updates.len(), names.join(", "));
+        println!(
+            "\n{} package(s) with updates: {}",
+            updates.len(),
+            names.join(", ")
+        );
     }
 
     Ok(())
 }
 
-async fn cmd_rebuild_image(state: SharedState) -> Result<()> {
-    let state = state.read().await;
-
+async fn cmd_rebuild_image(state: &CliState) -> Result<()> {
     println!("Rebuilding base container image...");
-    state.build.build_base_image()?;
+    state.build_system.build_base_image()?;
     println!("Done");
 
     Ok(())
 }
 
-async fn cmd_status(state: SharedState, json_output: bool) -> Result<()> {
-    let state = state.read().await;
-
+async fn cmd_status(state: &CliState, json_output: bool) -> Result<()> {
     // Gather status info
     let podman_available = BuildSystem::check_podman().is_ok();
-    let image_exists = state.build.image_exists().unwrap_or(false);
+    let image_exists = state.build_system.image_exists().unwrap_or(false);
     let repo_stats = state.repo.stats().ok();
 
-    // Package counts
+    // Package counts by derived status
     let packages = state.db.list_packages().await?;
-    let mut by_status: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let active_builds: HashSet<String> = HashSet::new();
+    let aur_clones = state.config.resolved_cache().aur_clones.clone();
+
+    let mut by_status: HashMap<String, usize> = HashMap::new();
     for pkg in &packages {
-        *by_status.entry(pkg.status.to_string()).or_default() += 1;
+        let enriched = enrich_package(
+            pkg,
+            &state.db,
+            &state.srcinfo_cache,
+            &state.repo_state,
+            &active_builds,
+            &aur_clones,
+        )
+        .await;
+        *by_status.entry(enriched.status.to_string()).or_default() += 1;
     }
 
     if json_output {
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-            "podman": {
-                "available": podman_available,
-            },
-            "image": {
-                "name": state.config.container.image,
-                "exists": image_exists,
-            },
-            "repository": repo_stats.as_ref().map(|s| serde_json::json!({
-                "path": s.path.to_string_lossy(),
-                "package_count": s.package_count,
-                "total_size": s.total_size,
-            })),
-            "packages": {
-                "total": packages.len(),
-                "by_status": by_status,
-            },
-        }))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "podman": {
+                    "available": podman_available,
+                },
+                "image": {
+                    "name": state.config.container.image,
+                    "exists": image_exists,
+                },
+                "repository": repo_stats.as_ref().map(|s| serde_json::json!({
+                    "path": s.path.to_string_lossy(),
+                    "package_count": s.package_count,
+                    "total_size": s.total_size,
+                })),
+                "packages": {
+                    "total": packages.len(),
+                    "by_status": by_status,
+                },
+            }))?
+        );
         return Ok(());
     }
 
@@ -1513,7 +1894,8 @@ async fn cmd_status(state: SharedState, json_output: bool) -> Result<()> {
     // Repo stats
     match repo_stats {
         Some(stats) => {
-            println!("Repository: {} ({} packages, {} bytes)",
+            println!(
+                "Repository: {} ({} packages, {} bytes)",
                 stats.path.display(),
                 stats.package_count,
                 stats.total_size
@@ -1530,23 +1912,16 @@ async fn cmd_status(state: SharedState, json_output: bool) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_mark(state: SharedState, name: &str, explicit: bool, asdeps: bool) -> Result<()> {
-    let state = state.write().await;
-
-    let pkg = state.db.get_package(name).await?
-        .or({
-            if let Some(pkgbase) = state.db.resolve_pkgbase(name).await? {
-                state.db.get_package(&pkgbase).await?
-            } else {
-                None
-            }
-        })
+async fn cmd_mark(state: &CliState, name: &str, explicit: bool, asdeps: bool) -> Result<()> {
+    let pkg = state
+        .resolve_package(name)
+        .await?
         .ok_or_else(|| anyhow::anyhow!("Package not found"))?;
 
     let new_reason = if explicit {
-        models::InstallReason::Explicit
+        InstallReason::Explicit
     } else if asdeps {
-        models::InstallReason::Dependency
+        InstallReason::Dependency
     } else {
         anyhow::bail!("Must specify either --explicit or --asdeps");
     };
@@ -1556,13 +1931,32 @@ async fn cmd_mark(state: SharedState, name: &str, explicit: bool, asdeps: bool) 
         return Ok(());
     }
 
-    state.db.update_install_reason(&pkg.pkgbase, new_reason).await?;
-    println!("Changed {} install reason: {} -> {}", pkg.pkgbase, pkg.install_reason, new_reason);
+    state
+        .db
+        .update_install_reason(&pkg.pkgbase, new_reason)
+        .await?;
+    println!(
+        "Changed {} install reason: {} -> {}",
+        pkg.pkgbase, pkg.install_reason, new_reason
+    );
 
     Ok(())
 }
 
-fn cmd_config(action: ConfigAction, config: &Config, custom_path: Option<&std::path::Path>) -> Result<()> {
+/// Package being imported (intermediate state for cmd_import)
+struct ImportedPackage {
+    pkg: models::Package,
+    pkg_entries: Vec<repo::db_parser::RepoPkgEntry>,
+    has_upstream: bool,
+    in_official_repos: bool,
+    srcinfo_opt: Option<models::SrcInfo>,
+}
+
+fn cmd_config(
+    action: ConfigAction,
+    config: &Config,
+    custom_path: Option<&std::path::Path>,
+) -> Result<()> {
     match action {
         ConfigAction::Show => {
             println!("{}", config.to_toml()?);
@@ -1594,17 +1988,14 @@ fn cmd_config(action: ConfigAction, config: &Config, custom_path: Option<&std::p
     Ok(())
 }
 
-/// Package being imported (intermediate state)
-struct ImportedPackage {
-    pkg: models::Package,
-    pkg_entries: Vec<repo::db_parser::RepoPkgEntry>,
-    pkg_names: Vec<models::PackageName>,
-}
-
-async fn cmd_import(state: SharedState, db_path: &std::path::Path, dry_run: bool, json_output: bool) -> Result<()> {
-    use std::collections::HashSet;
-    use repo::db_parser::parse_repo_db;
+async fn cmd_import(
+    state: &mut CliState,
+    db_path: &std::path::Path,
+    dry_run: bool,
+    json_output: bool,
+) -> Result<()> {
     use anyhow::Context;
+    use repo::db_parser::parse_repo_db;
 
     // Parse the repository database
     if !json_output {
@@ -1615,26 +2006,25 @@ async fn cmd_import(state: SharedState, db_path: &std::path::Path, dry_run: bool
         .with_context(|| format!("Failed to parse repo database: {}", db_path.display()))?;
 
     if !json_output {
-        println!("Found {} packages in {} pkgbases",
+        println!(
+            "Found {} packages in {} pkgbases",
             repo_contents.packages.len(),
-            repo_contents.by_pkgbase.len());
+            repo_contents.by_pkgbase.len()
+        );
     }
 
-    // Get state for reading tracked packages
-    let (config, tracked_pkgbases) = {
-        let state_read = state.read().await;
-        let packages = state_read.db.list_packages().await?;
-        let tracked: HashSet<String> = packages.iter().map(|p| p.pkgbase.clone()).collect();
-        (state_read.config.clone(), tracked)
-    };
+    // Get tracked packages
+    let packages = state.db.list_packages().await?;
+    let tracked_pkgbases: HashSet<String> = packages.iter().map(|p| p.pkgbase.clone()).collect();
 
     // Process each pkgbase
     let mut imported: Vec<ImportedPackage> = Vec::new();
     let mut skipped_tracked = 0;
     let mut no_upstream = 0;
-    let mut clone_errors: Vec<(String, String)> = Vec::new();
+    let mut _clone_errors: Vec<(String, String)> = Vec::new();
 
     let total = repo_contents.by_pkgbase.len();
+    let resolved_cache = state.config.resolved_cache();
 
     for (idx, (pkgbase, entries)) in repo_contents.by_pkgbase.iter().enumerate() {
         // Skip already tracked packages
@@ -1650,10 +2040,13 @@ async fn cmd_import(state: SharedState, db_path: &std::path::Path, dry_run: bool
         }
 
         // Get version from repo
-        let repo_version = entries.first().map(|e| e.version.clone()).unwrap_or_default();
+        let repo_version = entries
+            .first()
+            .map(|e| e.version.clone())
+            .unwrap_or_default();
 
         // Try to clone from AUR
-        let clone_path = config.resolved_cache().aur_clones.join(pkgbase);
+        let clone_path = resolved_cache.aur_clones.join(pkgbase);
 
         let (has_upstream, srcinfo_opt, current_commit) = if !dry_run {
             // Actually try to clone
@@ -1671,7 +2064,7 @@ async fn cmd_import(state: SharedState, db_path: &std::path::Path, dry_run: bool
                         if !json_output {
                             print!("(no AUR upstream) ");
                         }
-                        clone_errors.push((pkgbase.to_string(), e.to_string()));
+                        _clone_errors.push((pkgbase.to_string(), e.to_string()));
                         no_upstream += 1;
                         (false, None, None)
                     }
@@ -1684,8 +2077,7 @@ async fn cmd_import(state: SharedState, db_path: &std::path::Path, dry_run: bool
             }
         } else {
             // Dry run: check AUR RPC to see if package exists
-            let state_read = state.read().await;
-            match state_read.aur.info_single(pkgbase).await {
+            match state.aur.info_single(pkgbase).await {
                 Ok(Some(_)) => {
                     if !json_output {
                         print!("(in AUR) ");
@@ -1702,140 +2094,143 @@ async fn cmd_import(state: SharedState, db_path: &std::path::Path, dry_run: bool
             }
         };
 
-        // Determine status based on version comparison
-        let status = if !has_upstream {
-            // No upstream, mark as up to date (can't update)
-            models::PackageStatus::UpToDate
-        } else if let Some(ref srcinfo) = srcinfo_opt {
-            let aur_version = srcinfo.full_version();
-            if aur_version == repo_version {
-                models::PackageStatus::UpToDate
-            } else {
-                if !json_output {
-                    print!("(update: {} -> {}) ", repo_version, aur_version);
+        // Determine if there's an update (for display)
+        let _has_update = if has_upstream {
+            if let Some(ref srcinfo) = srcinfo_opt {
+                let aur_version = srcinfo.full_version();
+                if aur_version != repo_version {
+                    if !json_output {
+                        print!("(update: {} -> {}) ", repo_version, aur_version);
+                    }
+                    true
+                } else {
+                    false
                 }
-                models::PackageStatus::UpdateAvailable
+            } else {
+                false
             }
         } else {
-            // Dry run or couldn't read srcinfo, assume up to date
-            models::PackageStatus::UpToDate
+            false
         };
 
         if !json_output {
             println!();
         }
 
-        // Create package record
+        // Create package record (V2 -- no status, pkgver, current_commit, etc.)
         let now = chrono::Utc::now();
-        let aur_version = srcinfo_opt.as_ref().map(|s| s.full_version());
 
         let pkg = models::Package {
             pkgbase: pkgbase.to_string(),
             // Auto-approve imported packages (they were already built)
             approved_commit: current_commit.clone(),
-            current_commit: current_commit.clone(),
-            pkgver: aur_version.or(Some(repo_version.clone())),
-            status,
-            install_reason: models::InstallReason::Explicit, // Will be updated later
+            install_reason: InstallReason::Explicit, // Will be updated later
             auto_approve: false,
-            has_upstream,
-            in_official_repos: false, // Will be updated later
-            rejection_reason: None,
             added_at: now,
             updated_at: now,
         };
 
-        // Create package names from repo entries or srcinfo
-        let mut pkg_names = Vec::new();
-        if let Some(ref srcinfo) = srcinfo_opt {
-            // Use srcinfo for more accurate data
-            for sp in &srcinfo.packages {
-                // Merge global and per-package deps
-                let mut all_depends = srcinfo.depends.clone();
-                all_depends.extend(sp.depends.clone());
-
-                let mut all_optdepends = srcinfo.optdepends.clone();
-                all_optdepends.extend(sp.optdepends.clone());
-
-                let mut all_provides = srcinfo.provides.clone();
-                all_provides.extend(sp.provides.clone());
-
-                let mut all_conflicts = srcinfo.conflicts.clone();
-                all_conflicts.extend(sp.conflicts.clone());
-
-                pkg_names.push(models::PackageName {
-                    pkgname: sp.pkgname.clone(),
-                    pkgbase: pkgbase.to_string(),
-                    pkgdesc: sp.pkgdesc.clone().or(srcinfo.pkgdesc.clone()),
-                    pkgver: Some(srcinfo.full_version()),
-                    depends: Some(serde_json::to_string(&all_depends)?),
-                    optdepends: Some(serde_json::to_string(&all_optdepends)?),
-                    provides: Some(serde_json::to_string(&all_provides)?),
-                    conflicts: Some(serde_json::to_string(&all_conflicts)?),
-                    repo_version: Some(repo_version.clone()),
-                });
-            }
-        } else {
-            // Use repo database entries
-            for entry in entries {
-                pkg_names.push(models::PackageName {
-                    pkgname: entry.name.clone(),
-                    pkgbase: pkgbase.to_string(),
-                    pkgdesc: entry.desc.clone(),
-                    pkgver: Some(entry.version.clone()),
-                    depends: Some(serde_json::to_string(&entry.depends)?),
-                    optdepends: Some(serde_json::to_string(&entry.optdepends)?),
-                    provides: Some(serde_json::to_string(&entry.provides)?),
-                    conflicts: Some(serde_json::to_string(&entry.conflicts)?),
-                    repo_version: Some(entry.version.clone()),
-                });
-            }
+        // Add to SrcInfoCache if we have srcinfo
+        if let (Some(srcinfo), Some(commit)) = (&srcinfo_opt, &current_commit) {
+            state
+                .srcinfo_cache
+                .insert(pkgbase.to_string(), srcinfo.clone(), commit.clone());
         }
 
         imported.push(ImportedPackage {
             pkg,
             pkg_entries: entries.clone(),
-            pkg_names,
+            has_upstream,
+            in_official_repos: false,
+            srcinfo_opt,
         });
     }
 
     // Infer install reasons from dependency graph
-    infer_install_reasons(&mut imported);
+    infer_install_reasons_v2(&mut imported);
 
     // Count stats
-    let explicit_count = imported.iter().filter(|p| p.pkg.install_reason == models::InstallReason::Explicit).count();
-    let dep_count = imported.iter().filter(|p| p.pkg.install_reason == models::InstallReason::Dependency).count();
-    let update_count = imported.iter().filter(|p| p.pkg.status == models::PackageStatus::UpdateAvailable).count();
-    let deprecated_count = imported.iter().filter(|p| !p.pkg.has_upstream && p.pkg.in_official_repos).count();
-    let local_only_count = imported.iter().filter(|p| !p.pkg.has_upstream && !p.pkg.in_official_repos).count();
+    let explicit_count = imported
+        .iter()
+        .filter(|p| p.pkg.install_reason == InstallReason::Explicit)
+        .count();
+    let dep_count = imported
+        .iter()
+        .filter(|p| p.pkg.install_reason == InstallReason::Dependency)
+        .count();
+    // For update count, derive status for each imported package
+    let active_builds: HashSet<String> = HashSet::new();
+    let aur_clones = state.config.resolved_cache().aur_clones.clone();
+    let mut update_count = 0;
+    for imp in &imported {
+        let enriched = enrich_package(
+            &imp.pkg,
+            &state.db,
+            &state.srcinfo_cache,
+            &state.repo_state,
+            &active_builds,
+            &aur_clones,
+        )
+        .await;
+        if enriched.status == DerivedStatus::UpdateAvailable {
+            update_count += 1;
+        }
+    }
+    let deprecated_count = imported
+        .iter()
+        .filter(|p| !p.has_upstream && p.in_official_repos)
+        .count();
+    let local_only_count = imported
+        .iter()
+        .filter(|p| !p.has_upstream && !p.in_official_repos)
+        .count();
 
     if dry_run {
         // Print what would be imported
         if json_output {
-            let packages: Vec<serde_json::Value> = imported.iter().map(|imp| {
-                serde_json::json!({
-                    "pkgbase": imp.pkg.pkgbase,
-                    "version": imp.pkg.pkgver,
-                    "status": imp.pkg.status.to_string(),
-                    "install_reason": imp.pkg.install_reason.to_string(),
-                    "has_upstream": imp.pkg.has_upstream,
-                    "in_official_repos": imp.pkg.in_official_repos,
-                    "pkgnames": imp.pkg_names.iter().map(|n| &n.pkgname).collect::<Vec<_>>(),
+            let pkgs: Vec<serde_json::Value> = imported
+                .iter()
+                .map(|imp| {
+                    let pkgver = imp
+                        .srcinfo_opt
+                        .as_ref()
+                        .map(|s| s.full_version())
+                        .or_else(|| {
+                            imp.pkg_entries.first().map(|e| e.version.clone())
+                        });
+                    let pkgnames: Vec<&str> = imp
+                        .srcinfo_opt
+                        .as_ref()
+                        .map(|s| s.packages.iter().map(|p| p.pkgname.as_str()).collect())
+                        .unwrap_or_else(|| {
+                            imp.pkg_entries.iter().map(|e| e.name.as_str()).collect()
+                        });
+                    serde_json::json!({
+                        "pkgbase": imp.pkg.pkgbase,
+                        "version": pkgver,
+                        "install_reason": imp.pkg.install_reason.to_string(),
+                        "has_upstream": imp.has_upstream,
+                        "in_official_repos": imp.in_official_repos,
+                        "pkgnames": pkgnames,
+                    })
                 })
-            }).collect();
+                .collect();
 
-            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                "dry_run": true,
-                "would_import": packages.len(),
-                "skipped_already_tracked": skipped_tracked,
-                "explicit": explicit_count,
-                "dependencies": dep_count,
-                "updates_available": update_count,
-                "no_upstream": no_upstream,
-                "deprecated": deprecated_count,
-                "local_only": local_only_count,
-                "packages": packages,
-            }))?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "dry_run": true,
+                    "would_import": pkgs.len(),
+                    "skipped_already_tracked": skipped_tracked,
+                    "explicit": explicit_count,
+                    "dependencies": dep_count,
+                    "updates_available": update_count,
+                    "no_upstream": no_upstream,
+                    "deprecated": deprecated_count,
+                    "local_only": local_only_count,
+                    "packages": pkgs,
+                }))?
+            );
         } else {
             println!("\n=== Dry run summary ===");
             println!("Would import: {} packages", imported.len());
@@ -1847,31 +2242,39 @@ async fn cmd_import(state: SharedState, db_path: &std::path::Path, dry_run: bool
                 println!("    - Deprecated (now in official): {}", deprecated_count);
             }
             if local_only_count > 0 {
-                println!("    - Local only (not in AUR or official): {}", local_only_count);
+                println!(
+                    "    - Local only (not in AUR or official): {}",
+                    local_only_count
+                );
             }
             println!("Skipped (already tracked): {}", skipped_tracked);
 
             if !imported.is_empty() {
                 println!("\nPackages to import:");
                 for imp in &imported {
+                    let pkgver = imp
+                        .srcinfo_opt
+                        .as_ref()
+                        .map(|s| s.full_version())
+                        .or_else(|| imp.pkg_entries.first().map(|e| e.version.clone()));
                     let reason = match imp.pkg.install_reason {
-                        models::InstallReason::Explicit => "explicit",
-                        models::InstallReason::Dependency => "dependency",
+                        InstallReason::Explicit => "explicit",
+                        InstallReason::Dependency => "dependency",
                     };
-                    let status_note = if imp.pkg.status == models::PackageStatus::UpdateAvailable {
-                        " (update available)"
-                    } else if !imp.pkg.has_upstream && imp.pkg.in_official_repos {
+                    let status_note = if !imp.has_upstream && imp.in_official_repos {
                         " (DEPRECATED - now in official repos)"
-                    } else if !imp.pkg.has_upstream {
+                    } else if !imp.has_upstream {
                         " (local only)"
                     } else {
                         ""
                     };
-                    println!("  {} {} [{}]{}",
+                    println!(
+                        "  {} {} [{}]{}",
                         imp.pkg.pkgbase,
-                        imp.pkg.pkgver.as_deref().unwrap_or("-"),
+                        pkgver.as_deref().unwrap_or("-"),
                         reason,
-                        status_note);
+                        status_note
+                    );
                 }
             }
         }
@@ -1884,38 +2287,45 @@ async fn cmd_import(state: SharedState, db_path: &std::path::Path, dry_run: bool
         println!("\nInserting packages into database...");
     }
 
-    {
-        let state_write = state.write().await;
-        for imp in &imported {
-            state_write.db.insert_package_with_names(&imp.pkg, &imp.pkg_names).await?;
-        }
+    for imp in &imported {
+        state.db.insert_package(&imp.pkg).await?;
     }
 
     // Print summary
     if json_output {
-        let packages: Vec<serde_json::Value> = imported.iter().map(|imp| {
-            serde_json::json!({
-                "pkgbase": imp.pkg.pkgbase,
-                "version": imp.pkg.pkgver,
-                "status": imp.pkg.status.to_string(),
-                "install_reason": imp.pkg.install_reason.to_string(),
-                "has_upstream": imp.pkg.has_upstream,
-                "in_official_repos": imp.pkg.in_official_repos,
+        let pkgs: Vec<serde_json::Value> = imported
+            .iter()
+            .map(|imp| {
+                let pkgver = imp
+                    .srcinfo_opt
+                    .as_ref()
+                    .map(|s| s.full_version())
+                    .or_else(|| imp.pkg_entries.first().map(|e| e.version.clone()));
+                serde_json::json!({
+                    "pkgbase": imp.pkg.pkgbase,
+                    "version": pkgver,
+                    "install_reason": imp.pkg.install_reason.to_string(),
+                    "has_upstream": imp.has_upstream,
+                    "in_official_repos": imp.in_official_repos,
+                })
             })
-        }).collect();
+            .collect();
 
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-            "status": "ok",
-            "imported": packages.len(),
-            "skipped_already_tracked": skipped_tracked,
-            "explicit": explicit_count,
-            "dependencies": dep_count,
-            "updates_available": update_count,
-            "no_upstream": no_upstream,
-            "deprecated": deprecated_count,
-            "local_only": local_only_count,
-            "packages": packages,
-        }))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": "ok",
+                "imported": pkgs.len(),
+                "skipped_already_tracked": skipped_tracked,
+                "explicit": explicit_count,
+                "dependencies": dep_count,
+                "updates_available": update_count,
+                "no_upstream": no_upstream,
+                "deprecated": deprecated_count,
+                "local_only": local_only_count,
+                "packages": pkgs,
+            }))?
+        );
     } else {
         println!("\n=== Import complete ===");
         println!("Imported: {} packages", imported.len());
@@ -1932,24 +2342,44 @@ async fn cmd_import(state: SharedState, db_path: &std::path::Path, dry_run: bool
         println!("Skipped (already tracked): {}", skipped_tracked);
 
         // Show deprecated packages prominently
-        let deprecated_pkgs: Vec<_> = imported.iter()
-            .filter(|p| !p.pkg.has_upstream && p.pkg.in_official_repos)
+        let deprecated_pkgs: Vec<_> = imported
+            .iter()
+            .filter(|p| !p.has_upstream && p.in_official_repos)
             .collect();
         if !deprecated_pkgs.is_empty() {
             println!("\nDeprecated packages (consider removing - now in official repos):");
             for imp in deprecated_pkgs {
-                println!("  {} {}", imp.pkg.pkgbase, imp.pkg.pkgver.as_deref().unwrap_or("-"));
+                let pkgver = imp
+                    .srcinfo_opt
+                    .as_ref()
+                    .map(|s| s.full_version())
+                    .or_else(|| imp.pkg_entries.first().map(|e| e.version.clone()));
+                println!(
+                    "  {} {}",
+                    imp.pkg.pkgbase,
+                    pkgver.as_deref().unwrap_or("-")
+                );
             }
         }
 
         // Show local-only packages
-        let local_only_pkgs: Vec<_> = imported.iter()
-            .filter(|p| !p.pkg.has_upstream && !p.pkg.in_official_repos)
+        let local_only_pkgs: Vec<_> = imported
+            .iter()
+            .filter(|p| !p.has_upstream && !p.in_official_repos)
             .collect();
         if !local_only_pkgs.is_empty() && local_only_pkgs.len() <= 15 {
             println!("\nLocal-only packages (no AUR or official repo upstream):");
             for imp in local_only_pkgs {
-                println!("  {} {}", imp.pkg.pkgbase, imp.pkg.pkgver.as_deref().unwrap_or("-"));
+                let pkgver = imp
+                    .srcinfo_opt
+                    .as_ref()
+                    .map(|s| s.full_version())
+                    .or_else(|| imp.pkg_entries.first().map(|e| e.version.clone()));
+                println!(
+                    "  {} {}",
+                    imp.pkg.pkgbase,
+                    pkgver.as_deref().unwrap_or("-")
+                );
             }
         }
     }
@@ -1958,7 +2388,7 @@ async fn cmd_import(state: SharedState, db_path: &std::path::Path, dry_run: bool
     if !json_output && !imported.is_empty() {
         let repo_dir = db_path.parent().unwrap_or(std::path::Path::new("."));
 
-        // Extract repo name from database filename (e.g., "aur.db.tar.zst" -> "aur")
+        // Extract repo name from database filename
         let repo_name = db_path
             .file_name()
             .and_then(|s| s.to_str())
@@ -1973,18 +2403,17 @@ async fn cmd_import(state: SharedState, db_path: &std::path::Path, dry_run: bool
             .unwrap_or("aur");
 
         // Check if config differs
-        let config_differs = {
-            let state_read = state.read().await;
-            state_read.config.repo.path != repo_dir || state_read.config.repo.name != repo_name
-        };
+        let config_differs =
+            state.config.repo.path != repo_dir || state.config.repo.name != repo_name;
 
         if config_differs {
             println!();
             println!("Your current config points to a different repository:");
-            {
-                let state_read = state.read().await;
-                println!("  Current: {} ({})", state_read.config.repo.path.display(), state_read.config.repo.name);
-            }
+            println!(
+                "  Current: {} ({})",
+                state.config.repo.path.display(),
+                state.config.repo.name
+            );
             println!("  Imported: {} ({})", repo_dir.display(), repo_name);
             println!();
             print!("Update config to use the imported repository? [Y/n] ");
@@ -2014,19 +2443,13 @@ async fn cmd_import(state: SharedState, db_path: &std::path::Path, dry_run: bool
 /// Check if packages exist in official Arch repos using pacman
 ///
 /// Returns a set of pkgnames that exist in official repos
-fn check_official_repos(pkgnames: &[String]) -> std::collections::HashSet<String> {
-    use std::collections::HashSet;
-
+fn check_official_repos(pkgnames: &[String]) -> HashSet<String> {
     let mut in_official: HashSet<String> = HashSet::new();
 
-    // Use pacman -Ss to search for exact package names
-    // We batch this for efficiency
     if pkgnames.is_empty() {
         return in_official;
     }
 
-    // Check each package individually with pacman -Si (package info)
-    // This is more accurate than -Ss which does substring matching
     for pkgname in pkgnames {
         let output = std::process::Command::new("pacman")
             .args(["-Si", pkgname])
@@ -2034,7 +2457,6 @@ fn check_official_repos(pkgnames: &[String]) -> std::collections::HashSet<String
 
         if let Ok(output) = output {
             if output.status.success() {
-                // Package found in sync databases (official repos)
                 in_official.insert(pkgname.clone());
             }
         }
@@ -2043,22 +2465,21 @@ fn check_official_repos(pkgnames: &[String]) -> std::collections::HashSet<String
     in_official
 }
 
-/// Infer install reasons and check official repos
+/// Infer install reasons and check official repos for imported packages
 ///
 /// Uses multiple heuristics:
 /// 1. Packages depended upon by others in the set -> Dependency
-/// 2. Compat packages (-compat-libs, -shim, version suffixes like icu70) without upstream -> Dependency
+/// 2. Compat packages (-compat-libs, -shim, version suffixes) without upstream -> Dependency
 /// 3. Packages without upstream that exist in official repos -> mark in_official_repos
 /// 4. Everything else -> Explicit (conservative default)
-fn infer_install_reasons(packages: &mut [ImportedPackage]) {
-    use std::collections::{HashMap, HashSet};
+fn infer_install_reasons_v2(packages: &mut [ImportedPackage]) {
     use repo::db_parser::strip_version_constraint;
 
     // Collect all pkgnames for packages without upstream to check official repos
     let pkgnames_to_check: Vec<String> = packages
         .iter()
-        .filter(|imp| !imp.pkg.has_upstream)
-        .flat_map(|imp| imp.pkg_names.iter().map(|n| n.pkgname.clone()))
+        .filter(|imp| !imp.has_upstream)
+        .flat_map(|imp| imp.pkg_entries.iter().map(|e| e.name.clone()))
         .collect();
 
     // Check which packages are in official repos
@@ -2066,9 +2487,9 @@ fn infer_install_reasons(packages: &mut [ImportedPackage]) {
 
     // Mark packages as in_official_repos if any of their pkgnames are in official repos
     for imp in packages.iter_mut() {
-        if !imp.pkg.has_upstream {
-            let is_in_official = imp.pkg_names.iter().any(|n| in_official.contains(&n.pkgname));
-            imp.pkg.in_official_repos = is_in_official;
+        if !imp.has_upstream {
+            let is_in_official = imp.pkg_entries.iter().any(|e| in_official.contains(&e.name));
+            imp.in_official_repos = is_in_official;
         }
     }
 
@@ -2077,12 +2498,6 @@ fn infer_install_reasons(packages: &mut [ImportedPackage]) {
     for imp in packages.iter() {
         for entry in &imp.pkg_entries {
             pkgname_to_pkgbase.insert(entry.name.clone(), imp.pkg.pkgbase.clone());
-        }
-        for name in &imp.pkg_names {
-            pkgname_to_pkgbase.insert(name.pkgname.clone(), imp.pkg.pkgbase.clone());
-        }
-        // Also add provides
-        for entry in &imp.pkg_entries {
             for provided in &entry.provides {
                 let provided_name = strip_version_constraint(provided);
                 pkgname_to_pkgbase.insert(provided_name.to_string(), imp.pkg.pkgbase.clone());
@@ -2098,8 +2513,7 @@ fn infer_install_reasons(packages: &mut [ImportedPackage]) {
             for dep in &entry.depends {
                 let dep_name = strip_version_constraint(dep);
                 if let Some(dep_pkgbase) = pkgname_to_pkgbase.get(dep_name) {
-                    // Skip self-dependencies
-                    if dep_pkgbase != &imp.pkg.pkgbase {
+                    if *dep_pkgbase != imp.pkg.pkgbase {
                         reverse_deps
                             .entry(dep_pkgbase.clone())
                             .or_default()
@@ -2117,25 +2531,29 @@ fn infer_install_reasons(packages: &mut [ImportedPackage]) {
             .map(|d| !d.is_empty())
             .unwrap_or(false);
 
-        // Heuristic: packages with dependents within the repo are dependencies
         if has_dependents {
-            imp.pkg.install_reason = models::InstallReason::Dependency;
+            imp.pkg.install_reason = InstallReason::Dependency;
             continue;
         }
 
-        // Heuristic: version compatibility packages (icu70, ncurses5-compat-libs, etc.)
         let pkgbase = &imp.pkg.pkgbase;
         let looks_like_compat = pkgbase.ends_with("-compat-libs")
             || pkgbase.ends_with("-shim")
-            || pkgbase.chars().last().map(|c| c.is_ascii_digit()).unwrap_or(false)
-               && pkgbase.chars().filter(|c| c.is_ascii_digit()).count() >= 2;
+            || pkgbase
+                .chars()
+                .last()
+                .map(|c| c.is_ascii_digit())
+                .unwrap_or(false)
+                && pkgbase
+                    .chars()
+                    .filter(|c| c.is_ascii_digit())
+                    .count()
+                    >= 2;
 
-        // If it looks like a compat package AND doesn't have AUR upstream, likely a dep
-        if looks_like_compat && !imp.pkg.has_upstream {
-            imp.pkg.install_reason = models::InstallReason::Dependency;
+        if looks_like_compat && !imp.has_upstream {
+            imp.pkg.install_reason = InstallReason::Dependency;
         } else {
-            // Default to explicit - user probably wanted this package
-            imp.pkg.install_reason = models::InstallReason::Explicit;
+            imp.pkg.install_reason = InstallReason::Explicit;
         }
     }
 }
