@@ -228,19 +228,11 @@ async function loadBuildInfo(buildId) {
         // Show outputs panel for successful builds
         const outputsPanel = document.getElementById('outputs-panel');
         if (outputsPanel) {
-            if (build.status === 'success' && build.outputs) {
-                try {
-                    const outputs = JSON.parse(build.outputs);
-                    if (outputs.length > 0) {
-                        const list = document.getElementById('outputs-list');
-                        list.innerHTML = outputs.map(f => `<li>${escapeHtml(f)}</li>`).join('');
-                        outputsPanel.style.display = 'block';
-                    } else {
-                        outputsPanel.style.display = 'none';
-                    }
-                } catch {
-                    outputsPanel.style.display = 'none';
-                }
+            const outputs = build.outputs_list;
+            if (build.status === 'success' && outputs && outputs.length > 0) {
+                const list = document.getElementById('outputs-list');
+                list.innerHTML = outputs.map(f => `<li>${escapeHtml(f)}</li>`).join('');
+                outputsPanel.style.display = 'block';
             } else {
                 outputsPanel.style.display = 'none';
             }

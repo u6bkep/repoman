@@ -107,17 +107,16 @@ async function loadBuilds() {
     }
 }
 
-function buildRow(b) {
-    const build = b.build || b;
+function buildRow(build) {
     const isActive = build.status === 'running' || build.status === 'pending';
     const duration = formatDuration(build.started_at, build.finished_at);
-    const stage = b.current_stage ? formatStage(b.current_stage) : '';
+    const stage = build.current_stage ? formatStage(build.current_stage) : '';
 
     return `
         <tr data-build-id="${escapeHtml(build.id)}" class="clickable">
             <td><a href="#/packages/${escapeHtml(build.pkgbase)}">${escapeHtml(build.pkgbase)}</a></td>
             <td><span class="status-badge ${build.status}">${formatStatus(build.status)}</span></td>
-            <td>${isActive && stage ? `<span class="stage-badge ${escapeHtml(b.current_stage)}">${escapeHtml(stage)}</span>` : ''}</td>
+            <td>${isActive && stage ? `<span class="stage-badge ${escapeHtml(build.current_stage)}">${escapeHtml(stage)}</span>` : ''}</td>
             <td>${formatRelativeTime(build.started_at)}</td>
             <td>${duration}</td>
             <td>

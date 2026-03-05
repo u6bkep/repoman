@@ -150,14 +150,7 @@ async function loadPackages() {
     const reasonFilter = document.getElementById('reason-filter').value;
 
     try {
-        let packages;
-
-        // If orphans filter is selected, use the orphans endpoint
-        if (reasonFilter === 'orphans') {
-            packages = await api.packages.listOrphans();
-        } else {
-            packages = await api.packages.list({ signal });
-        }
+        let packages = await api.packages.list({ signal });
 
         if (signal.aborted) return;
 
@@ -166,8 +159,10 @@ async function loadPackages() {
             packages = packages.filter(pkg => pkg.status === statusFilter);
         }
 
-        // Apply reason filter (except orphans which is already filtered)
-        if (reasonFilter && reasonFilter !== 'orphans') {
+        // Apply reason filter
+        if (reasonFilter === 'orphans') {
+            packages = packages.filter(pkg => pkg.is_orphan === true);
+        } else if (reasonFilter) {
             packages = packages.filter(pkg => pkg.install_reason === reasonFilter);
         }
 
@@ -198,7 +193,7 @@ async function loadPackages() {
             ${packages.map(pkg => `
                 <div class="package-item" data-pkg="${escapeHtml(pkg.pkgbase)}">
                     <span class="name">${escapeHtml(pkg.pkgbase)}${formatUpstreamBadge(pkg)}</span>
-                    <span class="version">${escapeHtml(pkg.pkgver || '-')}</span>
+                    <span class="version">${formatVersionColumn(pkg)}</span>
                     <span class="reason-badge ${pkg.install_reason}">${escapeHtml(pkg.install_reason)}</span>
                     <span class="status-badge ${pkg.status}">${formatStatus(pkg.status)}</span>
                     <span class="updated">${formatRelativeTime(pkg.updated_at)}</span>
@@ -267,6 +262,18 @@ function canApprove(status) {
 
 function canBuild(status) {
     return ['approved', 'update_available'].includes(status);
+}
+
+function formatVersionColumn(pkg) {
+    const pkgver = escapeHtml(pkg.pkgver || '-');
+    // Check if any pkgname has a repo_version that differs from pkgver
+    if (pkg.pkgnames && pkg.pkgnames.length > 0) {
+        const repoVer = pkg.pkgnames[0].repo_version;
+        if (repoVer && pkg.pkgver && repoVer !== pkg.pkgver) {
+            return `${escapeHtml(repoVer)} → ${pkgver}`;
+        }
+    }
+    return pkgver;
 }
 
 function formatUpstreamBadge(pkg) {

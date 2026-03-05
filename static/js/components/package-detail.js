@@ -33,12 +33,11 @@ export async function init(params) {
     document.getElementById('btn-remove').addEventListener('click', handleRemove);
     document.getElementById('btn-toggle-reason').addEventListener('click', handleToggleReason);
 
-    // Load data
+    // Load data -- loadDeps uses the detail response, so loadPackageInfo must complete first
     await Promise.all([
         loadPackageInfo(name),
         loadPkgbuild(name),
         loadDiff(name),
-        loadDeps(name),
         loadBuilds(name),
     ]);
 }
@@ -103,6 +102,9 @@ async function loadPackageInfo(name) {
         document.getElementById('btn-approve').style.display = canApprove ? '' : 'none';
         document.getElementById('btn-build').style.display = canBuild ? '' : 'none';
         document.getElementById('btn-approve-build-all').style.display = showApproveAndBuildAll ? '' : 'none';
+
+        // Load deps from inlined dependencies in detail response
+        loadDeps(name, pkg.dependencies);
     } catch (error) {
         showToast(`Error loading package: ${error.message}`, 'error');
     }
@@ -112,7 +114,7 @@ async function loadPkgbuild(name) {
     const container = document.getElementById('pkgbuild-content').querySelector('code');
     try {
         const result = await api.packages.pkgbuild(name);
-        container.textContent = result.content || result;
+        container.textContent = result.content;
     } catch (error) {
         container.textContent = `Error loading PKGBUILD: ${error.message}`;
     }
@@ -122,7 +124,7 @@ async function loadDiff(name) {
     const container = document.getElementById('diff-content').querySelector('code');
     try {
         const result = await api.packages.diff(name);
-        const diff = result.diff || result;
+        const diff = result.diff;
 
         if (!diff || diff.trim() === '') {
             container.innerHTML = '<em>No changes since last approval</em>';
@@ -145,10 +147,13 @@ async function loadDiff(name) {
     }
 }
 
-async function loadDeps(name) {
+function loadDeps(name, deps) {
     const container = document.getElementById('deps-content');
     try {
-        const deps = await api.packages.deps(name);
+        if (!deps) {
+            container.innerHTML = '<p class="empty-state">No dependency information available</p>';
+            return;
+        }
 
         // Check for untracked AUR deps across all dep types
         const allDeps = [
@@ -404,7 +409,6 @@ function showMissingDepsBanner(pkgbase, untrackedDeps) {
             await api.packages.add(pkgbase, { withDeps: true });
             showToast('Added missing dependencies', 'success');
             // Refresh the page to show newly added deps
-            await loadDeps(pkgbase);
             await loadPackageInfo(pkgbase);
         } catch (error) {
             showToast(`Error: ${error.message}`, 'error');

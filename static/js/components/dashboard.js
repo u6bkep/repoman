@@ -91,12 +91,12 @@ async function loadStatus() {
     const container = document.getElementById('status-overview');
     if (!container) return;
     try {
-        const [status, orphans] = await Promise.all([
+        const [status, packages] = await Promise.all([
             api.system.status(),
-            api.packages.listOrphans()
+            api.packages.list()
         ]);
 
-        const orphanCount = orphans?.length || 0;
+        const orphanCount = packages.filter(p => p.is_orphan).length;
 
         container.innerHTML = `
             <h2>Repository Status</h2>
@@ -233,14 +233,13 @@ async function loadRecentBuilds() {
             return;
         }
 
-        container.innerHTML = builds.map(b => {
-            const build = b.build || b;
+        container.innerHTML = builds.map(build => {
             const isActive = build.status === 'running' || build.status === 'pending';
             return `
                 <div class="package-item" data-build-id="${escapeHtml(build.id)}">
                     <span class="name">${escapeHtml(build.pkgbase)}</span>
                     <span class="status-badge ${build.status}">${formatStatus(build.status)}</span>
-                    ${isActive && b.current_stage ? `<span class="stage-badge ${escapeHtml(b.current_stage)}">${escapeHtml(formatStage(b.current_stage))}</span>` : ''}
+                    ${isActive && build.current_stage ? `<span class="stage-badge ${escapeHtml(build.current_stage)}">${escapeHtml(formatStage(build.current_stage))}</span>` : ''}
                     <div class="actions">
                         <a href="#/builds/${escapeHtml(build.id)}" class="btn btn-sm">Logs</a>
                     </div>
