@@ -6,6 +6,8 @@ mod config;
 mod db;
 mod models;
 mod repo;
+mod service;
+mod state;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};

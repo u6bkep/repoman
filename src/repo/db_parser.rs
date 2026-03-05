@@ -25,6 +25,7 @@ pub struct RepoPkgEntry {
 }
 
 /// Parsed repo database contents
+#[derive(Default)]
 pub struct RepoDbContents {
     /// All packages indexed by pkgname
     pub packages: HashMap<String, RepoPkgEntry>,

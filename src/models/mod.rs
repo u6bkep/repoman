@@ -2,41 +2,6 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// Package status in the workflow
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
-#[serde(rename_all = "snake_case")]
-#[sqlx(rename_all = "snake_case")]
-pub enum PackageStatus {
-    /// Newly added, PKGBUILD needs review
-    PendingReview,
-    /// PKGBUILD approved, ready to build
-    Approved,
-    /// Currently building
-    Building,
-    /// Build failed
-    Failed,
-    /// Successfully built and in repo
-    UpToDate,
-    /// New upstream commit available
-    UpdateAvailable,
-    /// User rejected the PKGBUILD
-    Rejected,
-}
-
-impl std::fmt::Display for PackageStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::PendingReview => write!(f, "pending_review"),
-            Self::Approved => write!(f, "approved"),
-            Self::Building => write!(f, "building"),
-            Self::Failed => write!(f, "failed"),
-            Self::UpToDate => write!(f, "up_to_date"),
-            Self::UpdateAvailable => write!(f, "update_available"),
-            Self::Rejected => write!(f, "rejected"),
-        }
-    }
-}
-
 /// Why a package was installed (like pacman's --asexplicit/--asdeps)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -74,25 +39,12 @@ impl std::str::FromStr for InstallReason {
 pub struct Package {
     /// The pkgbase (build unit identifier)
     pub pkgbase: String,
-    /// Last approved commit hash
-    pub approved_commit: Option<String>,
-    /// Current HEAD commit hash
-    pub current_commit: Option<String>,
-    /// Package version from .SRCINFO
-    pub pkgver: Option<String>,
-    /// Current workflow status
-    pub status: PackageStatus,
     /// Why this package was installed (explicit or dependency)
     pub install_reason: InstallReason,
     /// Auto-approve updates
     pub auto_approve: bool,
-    /// Whether this package exists in AUR (false for removed/local packages)
-    pub has_upstream: bool,
-    /// Whether this package (or a package with same name) exists in official repos
-    /// Used to detect packages that have migrated from AUR to official
-    pub in_official_repos: bool,
-    /// Reason for rejection (if status is Rejected)
-    pub rejection_reason: Option<String>,
+    /// Last approved commit hash (NULL = never approved)
+    pub approved_commit: Option<String>,
     /// When the package was added
     pub added_at: DateTime<Utc>,
     /// Last update time
@@ -111,29 +63,6 @@ impl Package {
     pub fn clone_path(&self, aur_clones: &std::path::Path) -> PathBuf {
         aur_clones.join(&self.pkgbase)
     }
-}
-
-/// Individual package name produced by a pkgbase
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PackageName {
-    /// The individual package name
-    pub pkgname: String,
-    /// The pkgbase this belongs to
-    pub pkgbase: String,
-    /// Package description
-    pub pkgdesc: Option<String>,
-    /// Package version (usually same as pkgbase)
-    pub pkgver: Option<String>,
-    /// Runtime dependencies (JSON array)
-    pub depends: Option<String>,
-    /// Optional dependencies (JSON array)
-    pub optdepends: Option<String>,
-    /// Packages this provides (JSON array)
-    pub provides: Option<String>,
-    /// Packages this conflicts with (JSON array)
-    pub conflicts: Option<String>,
-    /// Version currently in our repo
-    pub repo_version: Option<String>,
 }
 
 /// Build status

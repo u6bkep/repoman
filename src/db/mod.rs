@@ -1,9 +1,8 @@
 use anyhow::{Context, Result};
 use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
-use std::collections::HashMap;
 use std::path::Path;
 
-use crate::models::{Build, BuildStatus, InstallReason, Package, PackageName, PackageStatus};
+use crate::models::{Build, BuildStatus, InstallReason, Package};
 
 /// Database connection pool
 #[derive(Clone)]
@@ -136,24 +135,6 @@ impl Database {
 
         sqlx::query(
             r#"
-            CREATE TABLE IF NOT EXISTS package_names (
-                pkgname TEXT PRIMARY KEY,
-                pkgbase TEXT NOT NULL REFERENCES packages(pkgbase) ON DELETE CASCADE,
-                pkgdesc TEXT,
-                pkgver TEXT,
-                depends TEXT,
-                optdepends TEXT,
-                provides TEXT,
-                conflicts TEXT,
-                repo_version TEXT
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(
-            r#"
             CREATE TABLE IF NOT EXISTS builds (
                 id TEXT PRIMARY KEY,
                 pkgbase TEXT NOT NULL REFERENCES packages(pkgbase),
@@ -187,15 +168,6 @@ impl Database {
 
         sqlx::query(
             r#"
-            CREATE INDEX IF NOT EXISTS idx_package_names_pkgbase
-            ON package_names(pkgbase)
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(
-            r#"
             CREATE INDEX IF NOT EXISTS idx_builds_pkgbase
             ON builds(pkgbase)
             "#,
@@ -203,57 +175,59 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
+        // ==================== V2 Migration ====================
+        // Drop package_names table and index (data now comes from .SRCINFO cache)
+        sqlx::query("DROP INDEX IF EXISTS idx_package_names_pkgbase")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DROP TABLE IF EXISTS package_names")
+            .execute(&self.pool)
+            .await?;
+
+        // Drop columns removed in V2 (status, current_commit, pkgver, has_upstream, in_official_repos, rejection_reason)
+        let v2_drop_columns = [
+            "current_commit",
+            "pkgver",
+            "status",
+            "has_upstream",
+            "in_official_repos",
+            "rejection_reason",
+        ];
+        for col in &v2_drop_columns {
+            let has_col: Option<(i32,)> = sqlx::query_as(
+                &format!("SELECT 1 FROM pragma_table_info('packages') WHERE name = '{}'", col)
+            )
+            .fetch_optional(&self.pool)
+            .await?;
+
+            if has_col.is_some() {
+                sqlx::query(&format!("ALTER TABLE packages DROP COLUMN {}", col))
+                    .execute(&self.pool)
+                    .await?;
+            }
+        }
+
         Ok(())
     }
 
     // ==================== Package operations ====================
 
-    /// Insert a package and its names atomically in a single transaction
-    pub async fn insert_package_with_names(&self, pkg: &Package, names: &[PackageName]) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
-
+    /// Insert a package into the database
+    pub async fn insert_package(&self, pkg: &Package) -> Result<()> {
         sqlx::query(
             r#"
-            INSERT INTO packages (pkgbase, approved_commit, current_commit, pkgver, status, install_reason, auto_approve, has_upstream, in_official_repos, added_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO packages (pkgbase, install_reason, auto_approve, approved_commit, added_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(&pkg.pkgbase)
-        .bind(&pkg.approved_commit)
-        .bind(&pkg.current_commit)
-        .bind(&pkg.pkgver)
-        .bind(pkg.status.to_string())
         .bind(pkg.install_reason.to_string())
         .bind(pkg.auto_approve)
-        .bind(pkg.has_upstream)
-        .bind(pkg.in_official_repos)
+        .bind(&pkg.approved_commit)
         .bind(pkg.added_at.to_rfc3339())
         .bind(pkg.updated_at.to_rfc3339())
-        .execute(&mut *tx)
+        .execute(&self.pool)
         .await?;
-
-        for name in names {
-            sqlx::query(
-                r#"
-                INSERT OR REPLACE INTO package_names
-                (pkgname, pkgbase, pkgdesc, pkgver, depends, optdepends, provides, conflicts, repo_version)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                "#,
-            )
-            .bind(&name.pkgname)
-            .bind(&name.pkgbase)
-            .bind(&name.pkgdesc)
-            .bind(&name.pkgver)
-            .bind(&name.depends)
-            .bind(&name.optdepends)
-            .bind(&name.provides)
-            .bind(&name.conflicts)
-            .bind(&name.repo_version)
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        tx.commit().await?;
         Ok(())
     }
 
@@ -274,18 +248,6 @@ impl Database {
         let rows = sqlx::query_as::<_, PackageRow>("SELECT * FROM packages ORDER BY pkgbase")
             .fetch_all(&self.pool)
             .await?;
-
-        Ok(rows.into_iter().map(|r| r.into()).collect())
-    }
-
-    /// List packages by status
-    pub async fn list_packages_by_status(&self, status: PackageStatus) -> Result<Vec<Package>> {
-        let rows = sqlx::query_as::<_, PackageRow>(
-            "SELECT * FROM packages WHERE status = ? ORDER BY pkgbase",
-        )
-        .bind(status.to_string())
-        .fetch_all(&self.pool)
-        .await?;
 
         Ok(rows.into_iter().map(|r| r.into()).collect())
     }
@@ -324,116 +286,17 @@ impl Database {
         Ok(())
     }
 
-    /// List orphaned packages (dependencies that are no longer needed)
-    /// A package is orphaned if:
-    /// - It has install_reason = 'dependency'
-    /// - No explicitly installed package depends on it (directly or transitively)
-    pub async fn list_orphans(&self) -> Result<Vec<Package>> {
-        // Get all packages and all package names in two queries (not N+1)
-        let all_packages = self.list_packages().await?;
-        let all_names_by_pkgbase = self.list_all_package_names().await?;
-
-        // Collect dependencies of all explicit packages
-        let mut all_deps: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for pkg in &all_packages {
-            if pkg.install_reason == InstallReason::Explicit {
-                if let Some(names) = all_names_by_pkgbase.get(&pkg.pkgbase) {
-                    for name in names {
-                        if let Some(deps_json) = &name.depends {
-                            if let Ok(deps) = serde_json::from_str::<Vec<String>>(deps_json) {
-                                for dep in deps {
-                                    // Extract package name from versioned dependency (e.g., "foo>=1.0" -> "foo")
-                                    let dep_name = dep.split(|c| c == '>' || c == '<' || c == '=').next().unwrap_or(&dep);
-                                    all_deps.insert(dep_name.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Find dependency packages that aren't depended on by any explicit package
-        let mut orphans = Vec::new();
-        for pkg in all_packages {
-            if pkg.install_reason == InstallReason::Dependency {
-                let names = all_names_by_pkgbase.get(&pkg.pkgbase).map(|v| v.as_slice()).unwrap_or(&[]);
-                let is_needed = names.iter().any(|n| all_deps.contains(&n.pkgname));
-                if !is_needed {
-                    orphans.push(pkg);
-                }
-            }
-        }
-
-        Ok(orphans)
-    }
-
-    /// Update package status
-    pub async fn update_package_status(&self, pkgbase: &str, status: PackageStatus) -> Result<()> {
-        sqlx::query("UPDATE packages SET status = ?, updated_at = ? WHERE pkgbase = ?")
-            .bind(status.to_string())
-            .bind(chrono::Utc::now().to_rfc3339())
-            .bind(pkgbase)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
-    /// Reject a package with an optional reason
-    pub async fn reject_package(&self, pkgbase: &str, reason: Option<&str>) -> Result<()> {
-        sqlx::query(
-            "UPDATE packages SET status = ?, rejection_reason = ?, updated_at = ? WHERE pkgbase = ?",
-        )
-        .bind(PackageStatus::Rejected.to_string())
-        .bind(reason)
-        .bind(chrono::Utc::now().to_rfc3339())
-        .bind(pkgbase)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// Update package commit info
-    pub async fn update_package_commit(
-        &self,
-        pkgbase: &str,
-        current_commit: &str,
-        pkgver: Option<&str>,
-    ) -> Result<()> {
-        sqlx::query(
-            "UPDATE packages SET current_commit = ?, pkgver = ?, updated_at = ? WHERE pkgbase = ?",
-        )
-        .bind(current_commit)
-        .bind(pkgver)
-        .bind(chrono::Utc::now().to_rfc3339())
-        .bind(pkgbase)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// Approve a package (set approved_commit to current_commit)
-    pub async fn approve_package(&self, pkgbase: &str, auto: bool, specific_commit: Option<&str>) -> Result<()> {
-        let pkg = self.get_package(pkgbase).await?
-            .ok_or_else(|| anyhow::anyhow!("Package not found: {}", pkgbase))?;
-
-        // Use specific commit if provided, otherwise use current commit
-        let commit = match specific_commit {
-            Some(c) => c.to_string(),
-            None => pkg.current_commit
-                .ok_or_else(|| anyhow::anyhow!("Package has no current commit"))?,
-        };
-
+    /// Approve a package by setting approved_commit and recording the approval
+    pub async fn approve_package(&self, pkgbase: &str, commit: &str, auto: bool) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
 
         let mut tx = self.pool.begin().await?;
 
-        // Update package
+        // Update approved_commit and updated_at
         sqlx::query(
-            "UPDATE packages SET approved_commit = ?, status = ?, updated_at = ? WHERE pkgbase = ?",
+            "UPDATE packages SET approved_commit = ?, updated_at = ? WHERE pkgbase = ?",
         )
-        .bind(&commit)
-        .bind(PackageStatus::Approved.to_string())
+        .bind(commit)
         .bind(&now)
         .bind(pkgbase)
         .execute(&mut *tx)
@@ -444,7 +307,7 @@ impl Database {
             "INSERT INTO approvals (pkgbase, git_commit, approved_at, auto_approved) VALUES (?, ?, ?, ?)",
         )
         .bind(pkgbase)
-        .bind(&commit)
+        .bind(commit)
         .bind(&now)
         .bind(auto)
         .execute(&mut *tx)
@@ -461,49 +324,6 @@ impl Database {
             .execute(&self.pool)
             .await?;
         Ok(())
-    }
-
-    // ==================== Package names operations ====================
-
-    /// Get all package names for a pkgbase
-    pub async fn get_package_names(&self, pkgbase: &str) -> Result<Vec<PackageName>> {
-        let rows = sqlx::query_as::<_, PackageNameRow>(
-            "SELECT * FROM package_names WHERE pkgbase = ? ORDER BY pkgname",
-        )
-        .bind(pkgbase)
-        .fetch_all(&self.pool)
-        .await?;
-
-        Ok(rows.into_iter().map(|r| r.into()).collect())
-    }
-
-    /// Fetch all package names in a single query and group them by pkgbase.
-    /// Use this instead of calling get_package_names in a loop to avoid N+1 queries.
-    pub async fn list_all_package_names(&self) -> Result<HashMap<String, Vec<PackageName>>> {
-        let rows = sqlx::query_as::<_, PackageNameRow>(
-            "SELECT * FROM package_names ORDER BY pkgbase, pkgname",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
-        let mut map: HashMap<String, Vec<PackageName>> = HashMap::new();
-        for row in rows {
-            let name: PackageName = row.into();
-            map.entry(name.pkgbase.clone()).or_default().push(name);
-        }
-        Ok(map)
-    }
-
-    /// Resolve pkgname to pkgbase
-    pub async fn resolve_pkgbase(&self, pkgname: &str) -> Result<Option<String>> {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT pkgbase FROM package_names WHERE pkgname = ?",
-        )
-        .bind(pkgname)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        Ok(row.map(|(pkgbase,)| pkgbase))
     }
 
     // ==================== Build operations ====================
@@ -615,8 +435,8 @@ impl Database {
     }
 
     /// Recover stale builds left in pending/running state (e.g. after server crash).
-    /// Marks them as cancelled and resets packages stuck in 'building' to 'approved'.
-    /// Returns the number of builds recovered.
+    /// Marks them as cancelled. Returns the number of builds recovered.
+    /// Note: In V2, package status is derived at runtime, so no package status reset is needed.
     pub async fn recover_stale_builds(&self) -> Result<u32> {
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -629,14 +449,6 @@ impl Database {
         .await?;
 
         let recovered = build_result.rows_affected() as u32;
-
-        // Reset packages stuck in 'building' back to 'approved'
-        sqlx::query(
-            "UPDATE packages SET status = 'approved', updated_at = ? WHERE status = 'building'"
-        )
-        .bind(&now)
-        .execute(&self.pool)
-        .await?;
 
         Ok(recovered)
     }
@@ -662,6 +474,20 @@ impl Database {
 
         Ok(names)
     }
+
+    /// Get the latest build for a specific package and commit hash.
+    /// Used for status derivation: determines whether the approved commit has been built.
+    pub async fn get_latest_build_for_commit(&self, pkgbase: &str, commit: &str) -> Result<Option<Build>> {
+        let row = sqlx::query_as::<_, BuildRow>(
+            "SELECT * FROM builds WHERE pkgbase = ? AND git_commit = ? ORDER BY started_at DESC LIMIT 1",
+        )
+        .bind(pkgbase)
+        .bind(commit)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|r| r.into()))
+    }
 }
 
 // ==================== Row types for sqlx ====================
@@ -669,15 +495,9 @@ impl Database {
 #[derive(sqlx::FromRow)]
 struct PackageRow {
     pkgbase: String,
-    approved_commit: Option<String>,
-    current_commit: Option<String>,
-    pkgver: Option<String>,
-    status: String,
     install_reason: String,
     auto_approve: bool,
-    has_upstream: bool,
-    in_official_repos: bool,
-    rejection_reason: Option<String>,
+    approved_commit: Option<String>,
     added_at: String,
     updated_at: String,
 }
@@ -686,15 +506,9 @@ impl From<PackageRow> for Package {
     fn from(row: PackageRow) -> Self {
         Self {
             pkgbase: row.pkgbase,
-            approved_commit: row.approved_commit,
-            current_commit: row.current_commit,
-            pkgver: row.pkgver,
-            status: parse_status(&row.status),
             install_reason: parse_install_reason(&row.install_reason),
             auto_approve: row.auto_approve,
-            has_upstream: row.has_upstream,
-            in_official_repos: row.in_official_repos,
-            rejection_reason: row.rejection_reason,
+            approved_commit: row.approved_commit,
             added_at: chrono::DateTime::parse_from_rfc3339(&row.added_at)
                 .map(|t| t.with_timezone(&chrono::Utc))
                 .unwrap_or_else(|_| chrono::Utc::now()),
@@ -705,52 +519,10 @@ impl From<PackageRow> for Package {
     }
 }
 
-fn parse_status(s: &str) -> PackageStatus {
-    match s {
-        "pending_review" => PackageStatus::PendingReview,
-        "approved" => PackageStatus::Approved,
-        "building" => PackageStatus::Building,
-        "failed" => PackageStatus::Failed,
-        "up_to_date" => PackageStatus::UpToDate,
-        "update_available" => PackageStatus::UpdateAvailable,
-        "rejected" => PackageStatus::Rejected,
-        _ => PackageStatus::PendingReview,
-    }
-}
-
 fn parse_install_reason(s: &str) -> InstallReason {
     match s {
         "dependency" => InstallReason::Dependency,
         _ => InstallReason::Explicit,
-    }
-}
-
-#[derive(sqlx::FromRow)]
-struct PackageNameRow {
-    pkgname: String,
-    pkgbase: String,
-    pkgdesc: Option<String>,
-    pkgver: Option<String>,
-    depends: Option<String>,
-    optdepends: Option<String>,
-    provides: Option<String>,
-    conflicts: Option<String>,
-    repo_version: Option<String>,
-}
-
-impl From<PackageNameRow> for PackageName {
-    fn from(row: PackageNameRow) -> Self {
-        Self {
-            pkgname: row.pkgname,
-            pkgbase: row.pkgbase,
-            pkgdesc: row.pkgdesc,
-            pkgver: row.pkgver,
-            depends: row.depends,
-            optdepends: row.optdepends,
-            provides: row.provides,
-            conflicts: row.conflicts,
-            repo_version: row.repo_version,
-        }
     }
 }
 
