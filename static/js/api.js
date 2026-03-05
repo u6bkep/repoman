@@ -67,6 +67,12 @@ export const packages = {
 export const builds = {
     get: (id) => get(`/builds/${id}`),
     list: (pkgbase) => get(`/packages/${encodeURIComponent(pkgbase)}/builds`),
+    listAll: (params = {}) => {
+        const qs = new URLSearchParams(
+            Object.fromEntries(Object.entries(params).filter(([, v]) => v != null))
+        ).toString();
+        return get(`/builds${qs ? `?${qs}` : ''}`);
+    },
     logs: (id) => get(`/builds/${id}/logs`),
     cancel: (id) => post(`/builds/${id}/cancel`),
 };

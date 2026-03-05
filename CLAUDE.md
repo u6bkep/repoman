@@ -56,6 +56,11 @@ static/           # Web UI (vanilla JS, served by Axum)
 
 SQLite at `~/.local/share/repoman/repoman.db`. Uses sqlx with compile-time query checking disabled (runtime mode). Migrations run automatically on startup in `db/mod.rs`.
 
+**Path derivation**: The database stores only identifiers, not filesystem paths. Paths are derived at runtime:
+- Clone path: `config.resolved_cache().aur_clones / pkgbase` (via `Package::clone_path()`)
+- AUR URL: `https://aur.archlinux.org/{pkgbase}.git` (via `Package::aur_url()`)
+- Build log path: stored as relative filename in `builds.log_path`, resolved via `Build::resolve_log_path(logs_dir)` (legacy absolute paths are handled transparently)
+
 ## Gotchas
 
 1. **Rootless Podman permissions**: Use `:U` suffix on volume mounts to fix permission issues (e.g., `-v /path:/container/path:U`). This chowns the directory to match the container user's UID.

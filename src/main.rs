@@ -227,6 +227,8 @@ async fn main() -> Result<()> {
         build_stages: std::collections::HashMap::new(),
         repo_mutex: Arc::new(tokio::sync::Mutex::new(())),
         events: events_tx,
+        active_builds: std::collections::HashSet::new(),
+        build_cancel_flags: std::collections::HashMap::new(),
     }));
 
     let json_output = cli.json;
@@ -289,63 +291,13 @@ async fn run_server(state: SharedState, config: &Config) -> Result<()> {
     // Check podman availability
     BuildSystem::check_podman()?;
 
-    // Recover from stuck Building/Running states (server crash mid-build)
+    // Recover stale builds left in pending/running state (e.g. after server crash)
     {
         let state_read = state.read().await;
-
-        // Find packages stuck in Building status
-        let building_packages = state_read
-            .db
-            .list_packages_by_status(models::PackageStatus::Building)
-            .await?;
-        for pkg in &building_packages {
-            tracing::warn!(
-                "Recovering stuck package '{}' from Building to Failed (server restarted)",
-                pkg.pkgbase
-            );
-            if let Err(e) = state_read
-                .db
-                .update_package_status(&pkg.pkgbase, models::PackageStatus::Failed)
-                .await
-            {
-                tracing::error!("Failed to recover package '{}': {}", pkg.pkgbase, e);
-            }
-        }
-
-        // Find builds stuck in Running or Pending status
-        let all_packages = state_read.db.list_packages().await?;
-        for pkg in &all_packages {
-            let builds = state_read.db.list_builds(&pkg.pkgbase, 100, 0).await?;
-            for build in &builds {
-                if build.status == models::BuildStatus::Running
-                    || build.status == models::BuildStatus::Pending
-                {
-                    tracing::warn!(
-                        "Recovering stuck build '{}' for '{}' from {:?} to Failed (server restarted)",
-                        build.id,
-                        pkg.pkgbase,
-                        build.status
-                    );
-                    if let Err(e) = state_read
-                        .db
-                        .update_build_status(
-                            &build.id,
-                            models::BuildStatus::Failed,
-                            Some("Server restarted during build"),
-                        )
-                        .await
-                    {
-                        tracing::error!("Failed to recover build '{}': {}", build.id, e);
-                    }
-                }
-            }
-        }
-
-        if !building_packages.is_empty() {
-            tracing::info!(
-                "Recovered {} package(s) from stuck Building state",
-                building_packages.len()
-            );
+        match state_read.db.recover_stale_builds().await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!("Recovered {} stale build(s) from previous run", n),
+            Err(e) => tracing::error!("Failed to recover stale builds: {}", e),
         }
     }
 
@@ -466,9 +418,17 @@ async fn cmd_add(state: SharedState, name: &str, asdeps: bool, with_deps: bool, 
 
                     // Find missing AUR deps
                     let container_image = &state_guard.config.container.image;
+                    let repo_name = &state_guard.config.repo.name;
+                    let repo_path = &state_guard.config.repo.path;
                     let missing = state_guard
                         .aur
-                        .find_missing_aur_deps(&srcinfo, &tracked_pkgnames, container_image)
+                        .find_missing_aur_deps(
+                            &srcinfo,
+                            &tracked_pkgnames,
+                            container_image,
+                            repo_name,
+                            repo_path,
+                        )
                         .await
                         .unwrap_or_default();
 
@@ -632,8 +592,6 @@ async fn add_package_internal(
     let now = chrono::Utc::now();
     let pkg = models::Package {
         pkgbase: pkgbase.clone(),
-        aur_url: format!("https://aur.archlinux.org/{}.git", pkgbase),
-        local_path: clone_path.to_string_lossy().to_string(),
         approved_commit: None,
         current_commit: Some(current_commit),
         pkgver: Some(version.clone()),
@@ -699,11 +657,13 @@ async fn cmd_remove(state: SharedState, name: &str, delete_files: bool, delete_c
         }
     }
 
+    let aur_clones = state.config.resolved_cache().aur_clones;
+
     if delete_clone {
-        let clone_path = std::path::Path::new(&pkg.local_path);
+        let clone_path = pkg.clone_path(&aur_clones);
         if clone_path.exists() {
             println!("Deleting clone: {}", clone_path.display());
-            std::fs::remove_dir_all(clone_path)?;
+            std::fs::remove_dir_all(&clone_path)?;
         }
         // Also clean up cached sources
         state.build.cleanup_all_sources(&pkg.pkgbase)?;
@@ -727,9 +687,9 @@ async fn cmd_remove(state: SharedState, name: &str, delete_files: bool, delete_c
                     }
                 }
                 if delete_clone {
-                    let clone_path = std::path::Path::new(&orphan.local_path);
+                    let clone_path = orphan.clone_path(&aur_clones);
                     if clone_path.exists() {
-                        std::fs::remove_dir_all(clone_path)?;
+                        std::fs::remove_dir_all(&clone_path)?;
                     }
                     // Also clean up cached sources
                     state.build.cleanup_all_sources(&orphan.pkgbase)?;
@@ -851,8 +811,8 @@ async fn cmd_info(state: SharedState, name: &str, json_output: bool) -> Result<(
             "status": pkg.status.to_string(),
             "install_reason": pkg.install_reason.to_string(),
             "auto_approve": pkg.auto_approve,
-            "aur_url": pkg.aur_url,
-            "local_path": pkg.local_path,
+            "aur_url": pkg.aur_url(),
+            "clone_path": pkg.clone_path(&state.config.resolved_cache().aur_clones),
             "current_commit": pkg.current_commit,
             "approved_commit": pkg.approved_commit,
             "added_at": pkg.added_at.to_rfc3339(),
@@ -867,8 +827,8 @@ async fn cmd_info(state: SharedState, name: &str, json_output: bool) -> Result<(
     println!("Status: {}", pkg.status);
     println!("Install reason: {}", pkg.install_reason);
     println!("Auto-approve: {}", pkg.auto_approve);
-    println!("URL: {}", pkg.aur_url);
-    println!("Local path: {}", pkg.local_path);
+    println!("URL: {}", pkg.aur_url());
+    println!("Clone path: {}", pkg.clone_path(&state.config.resolved_cache().aur_clones).display());
     println!("Current commit: {}", pkg.current_commit.as_deref().unwrap_or("-"));
     println!("Approved commit: {}", pkg.approved_commit.as_deref().unwrap_or("-"));
     println!("Added: {}", pkg.added_at);
@@ -895,11 +855,12 @@ async fn cmd_diff(state: SharedState, name: &str) -> Result<()> {
         })
         .ok_or_else(|| anyhow::anyhow!("Package not found"))?;
 
-    let clone_path = std::path::Path::new(&pkg.local_path);
+    let clone_path = pkg.clone_path(&state.config.resolved_cache().aur_clones);
+    aur::AurGit::ensure_cloned(&pkg.pkgbase, &clone_path)?;
 
     if let Some(ref approved) = pkg.approved_commit {
         let current = pkg.current_commit.as_deref().unwrap_or("HEAD");
-        let diff = aur::AurGit::diff(clone_path, approved, current)?;
+        let diff = aur::AurGit::diff(&clone_path, approved, current)?;
 
         if diff.is_empty() {
             println!("No changes since last approval");
@@ -929,7 +890,8 @@ async fn cmd_review(state: SharedState, name: &str, stdout: bool) -> Result<()> 
         })
         .ok_or_else(|| anyhow::anyhow!("Package not found"))?;
 
-    let clone_path = std::path::Path::new(&pkg.local_path);
+    let clone_path = pkg.clone_path(&state.config.resolved_cache().aur_clones);
+    aur::AurGit::ensure_cloned(&pkg.pkgbase, &clone_path)?;
     let pkgbuild_path = clone_path.join("PKGBUILD");
 
     if !pkgbuild_path.exists() {
@@ -1028,7 +990,7 @@ async fn cmd_build(state: SharedState, names: Vec<String>, all: bool, updates: b
     println!("Queuing {} packages for build...", packages_to_build.len());
 
     // Build dependency graph for topological sort
-    let (build_order, deps_graph, _pkg_infos) = {
+    let (build_order, deps_graph) = {
         let state_read = state.read().await;
 
         // Check base image exists
@@ -1090,12 +1052,7 @@ async fn cmd_build(state: SharedState, names: Vec<String>, all: bool, updates: b
         // Topological sort
         let build_order = topological_sort_cli(&pkgbases_set, &deps_graph)?;
 
-        // Collect package info
-        let pkg_infos: Vec<(String, String)> = valid_packages.iter()
-            .map(|p| (p.pkgbase.clone(), p.local_path.clone()))
-            .collect();
-
-        (build_order, deps_graph, pkg_infos)
+        (build_order, deps_graph)
     };
 
     println!("\nBuild order (dependencies first):");
@@ -1244,8 +1201,13 @@ async fn cmd_build_single(state: SharedState, name: &str) -> Result<()> {
 
     println!("Building {}...", pkg.pkgbase);
 
-    let source_path = std::path::Path::new(&pkg.local_path);
-    let result = build_system.run_build_sync(&pkg.pkgbase, source_path, &log_path);
+    let source_path = {
+        let state_read = state.read().await;
+        pkg.clone_path(&state_read.config.resolved_cache().aur_clones)
+    };
+    // Ensure clone exists (re-clone from AUR if missing)
+    aur::AurGit::ensure_cloned(&pkg.pkgbase, &source_path)?;
+    let result = build_system.run_build_sync(&pkg.pkgbase, &source_path, &log_path);
 
     match result {
         Ok(packages) => {
@@ -1296,14 +1258,11 @@ async fn cmd_logs(state: SharedState, id: &str, follow: bool, lines: Option<usiz
     let state = state.read().await;
 
     // Try to find the log path
-    // Determine the log path
+    let logs_dir = state.config.resolved_cache().logs;
     let log_path: PathBuf = if let Some(build) = state.db.get_build(id).await? {
         // Found a build by ID
-        if let Some(path) = build.log_path {
-            PathBuf::from(path)
-        } else {
-            anyhow::bail!("Build {} has no log file", id);
-        }
+        build.resolve_log_path(&logs_dir)
+            .ok_or_else(|| anyhow::anyhow!("Build {} has no log file", id))?
     } else {
         // Try to interpret as package name and get latest build
         let pkgbase: Option<String> = if let Some(pkg) = state.db.get_package(id).await? {
@@ -1318,19 +1277,15 @@ async fn cmd_logs(state: SharedState, id: &str, follow: bool, lines: Option<usiz
             // Get the latest build for this package
             let builds = state.db.list_builds(&pkgbase, 1, 0).await?;
             if let Some(build) = builds.first() {
-                if let Some(path) = &build.log_path {
-                    PathBuf::from(path)
-                } else {
-                    // Fallback to default log path
-                    state.config.resolved_cache().logs.join(format!("{}-build.log", pkgbase))
-                }
+                build.resolve_log_path(&logs_dir)
+                    .unwrap_or_else(|| logs_dir.join(format!("{}-build.log", pkgbase)))
             } else {
                 // No builds yet, try the default log path
-                state.config.resolved_cache().logs.join(format!("{}-build.log", pkgbase))
+                logs_dir.join(format!("{}-build.log", pkgbase))
             }
         } else {
             // Try direct log file path as fallback
-            let direct_log = state.config.resolved_cache().logs.join(format!("{}-build.log", id));
+            let direct_log = logs_dir.join(format!("{}-build.log", id));
             if direct_log.exists() {
                 direct_log
             } else {
@@ -1416,21 +1371,22 @@ async fn cmd_check_updates(state: SharedState, json_output: bool) -> Result<()> 
             continue;
         }
 
-        let clone_path = std::path::Path::new(&pkg.local_path);
+        let clone_path = pkg.clone_path(&state.config.resolved_cache().aur_clones);
+        aur::AurGit::ensure_cloned(&pkg.pkgbase, &clone_path)?;
 
         if !json_output {
             print!("Checking {}... ", pkg.pkgbase);
         }
 
-        if aur::AurGit::has_updates(clone_path)? {
+        if aur::AurGit::has_updates(&clone_path)? {
             // Read old SRCINFO before resetting to remote
-            let old_srcinfo = aur::read_srcinfo(clone_path).ok();
+            let old_srcinfo = aur::read_srcinfo(&clone_path).ok();
             let old_version = old_srcinfo.as_ref().map(|s| s.full_version());
 
-            aur::AurGit::reset_to_remote(clone_path)?;
-            let new_commit = aur::AurGit::head_commit(clone_path)?;
+            aur::AurGit::reset_to_remote(&clone_path)?;
+            let new_commit = aur::AurGit::head_commit(&clone_path)?;
 
-            let srcinfo = aur::read_srcinfo(clone_path)?;
+            let srcinfo = aur::read_srcinfo(&clone_path)?;
             let pkgver = format!("{}-{}", srcinfo.pkgver, srcinfo.pkgrel);
 
             // Clean up stale sources if version changed
@@ -1773,8 +1729,6 @@ async fn cmd_import(state: SharedState, db_path: &std::path::Path, dry_run: bool
 
         let pkg = models::Package {
             pkgbase: pkgbase.to_string(),
-            aur_url: format!("https://aur.archlinux.org/{}.git", pkgbase),
-            local_path: clone_path.to_string_lossy().to_string(),
             // Auto-approve imported packages (they were already built)
             approved_commit: current_commit.clone(),
             current_commit: current_commit.clone(),

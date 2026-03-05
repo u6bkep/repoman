@@ -70,3 +70,19 @@ export function escapeHtml(text) {
     div.textContent = text;
     return div.innerHTML;
 }
+
+export function formatDuration(startedAt, finishedAt) {
+    if (!startedAt) return '-';
+    const start = new Date(startedAt);
+    const end = finishedAt ? new Date(finishedAt) : new Date();
+    const diffMs = end - start;
+    const diffSec = Math.floor(diffMs / 1000);
+
+    if (diffSec < 60) return `${diffSec}s`;
+    const mins = Math.floor(diffSec / 60);
+    const secs = diffSec % 60;
+    if (mins < 60) return `${mins}m ${secs}s`;
+    const hours = Math.floor(mins / 60);
+    const remMins = mins % 60;
+    return `${hours}h ${remMins}m`;
+}

@@ -20,12 +20,17 @@ FROM docker.io/archlinux/archlinux:base-devel
 # Install runtime dependencies
 RUN pacman -Syu --noconfirm \
         podman fuse-overlayfs slirp4netns git pacman-contrib && \
-    pacman -Scc --noconfirm
+    pacman -Scc --noconfirm && \
+    # File capabilities get stripped in container layer ops; restore them
+    setcap cap_setuid+ep /usr/bin/newuidmap && \
+    setcap cap_setgid+ep /usr/bin/newgidmap
 
 # Create repoman user with subuid/subgid for rootless podman
+# Range must fit within the outer container's UID namespace (0-65535 with --userns=keep-id)
+# Use > not >> to overwrite any auto-generated entries from useradd
 RUN useradd -m -s /bin/bash repoman && \
-    echo "repoman:100000:65536" >> /etc/subuid && \
-    echo "repoman:100000:65536" >> /etc/subgid
+    echo "repoman:2000:63536" > /etc/subuid && \
+    echo "repoman:2000:63536" > /etc/subgid
 
 # Configure rootless podman storage
 RUN mkdir -p /home/repoman/.config/containers && \

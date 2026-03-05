@@ -38,8 +38,6 @@ impl Database {
             r#"
             CREATE TABLE IF NOT EXISTS packages (
                 pkgbase TEXT PRIMARY KEY,
-                aur_url TEXT NOT NULL,
-                local_path TEXT NOT NULL,
                 approved_commit TEXT,
                 current_commit TEXT,
                 pkgver TEXT,
@@ -106,6 +104,32 @@ impl Database {
 
         if in_official_repos.is_none() {
             sqlx::query("ALTER TABLE packages ADD COLUMN in_official_repos BOOLEAN NOT NULL DEFAULT FALSE")
+                .execute(&self.pool)
+                .await?;
+        }
+
+        // Migration: drop local_path column (path is now derived from config + pkgbase)
+        let has_local_path: Option<(i32,)> = sqlx::query_as(
+            "SELECT 1 FROM pragma_table_info('packages') WHERE name = 'local_path'"
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if has_local_path.is_some() {
+            sqlx::query("ALTER TABLE packages DROP COLUMN local_path")
+                .execute(&self.pool)
+                .await?;
+        }
+
+        // Migration: drop aur_url column (URL is now derived from pkgbase)
+        let has_aur_url: Option<(i32,)> = sqlx::query_as(
+            "SELECT 1 FROM pragma_table_info('packages') WHERE name = 'aur_url'"
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if has_aur_url.is_some() {
+            sqlx::query("ALTER TABLE packages DROP COLUMN aur_url")
                 .execute(&self.pool)
                 .await?;
         }
@@ -190,13 +214,11 @@ impl Database {
 
         sqlx::query(
             r#"
-            INSERT INTO packages (pkgbase, aur_url, local_path, approved_commit, current_commit, pkgver, status, install_reason, auto_approve, has_upstream, in_official_repos, added_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO packages (pkgbase, approved_commit, current_commit, pkgver, status, install_reason, auto_approve, has_upstream, in_official_repos, added_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(&pkg.pkgbase)
-        .bind(&pkg.aur_url)
-        .bind(&pkg.local_path)
         .bind(&pkg.approved_commit)
         .bind(&pkg.current_commit)
         .bind(&pkg.pkgver)
@@ -532,6 +554,30 @@ impl Database {
         Ok(rows.into_iter().map(|r| r.into()).collect())
     }
 
+    /// List all builds across all packages with optional status filter
+    pub async fn list_all_builds(&self, limit: i32, offset: i32, status: Option<&str>) -> Result<Vec<Build>> {
+        let rows = if let Some(status) = status {
+            sqlx::query_as::<_, BuildRow>(
+                "SELECT * FROM builds WHERE status = ? ORDER BY started_at DESC LIMIT ? OFFSET ?",
+            )
+            .bind(status)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, BuildRow>(
+                "SELECT * FROM builds ORDER BY started_at DESC LIMIT ? OFFSET ?",
+            )
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        Ok(rows.into_iter().map(|r| r.into()).collect())
+    }
+
     /// Update build status
     pub async fn update_build_status(
         &self,
@@ -568,6 +614,33 @@ impl Database {
         Ok(())
     }
 
+    /// Recover stale builds left in pending/running state (e.g. after server crash).
+    /// Marks them as cancelled and resets packages stuck in 'building' to 'approved'.
+    /// Returns the number of builds recovered.
+    pub async fn recover_stale_builds(&self) -> Result<u32> {
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // Cancel stale builds
+        let build_result = sqlx::query(
+            "UPDATE builds SET status = 'cancelled', error_message = 'Server restarted during build', finished_at = ? WHERE status IN ('pending', 'running')"
+        )
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+
+        let recovered = build_result.rows_affected() as u32;
+
+        // Reset packages stuck in 'building' back to 'approved'
+        sqlx::query(
+            "UPDATE packages SET status = 'approved', updated_at = ? WHERE status = 'building'"
+        )
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(recovered)
+    }
+
     /// List all build log file names (base names only) from the builds table
     pub async fn list_build_log_filenames(&self) -> Result<std::collections::HashSet<String>> {
         let rows: Vec<(Option<String>,)> =
@@ -596,8 +669,6 @@ impl Database {
 #[derive(sqlx::FromRow)]
 struct PackageRow {
     pkgbase: String,
-    aur_url: String,
-    local_path: String,
     approved_commit: Option<String>,
     current_commit: Option<String>,
     pkgver: Option<String>,
@@ -615,8 +686,6 @@ impl From<PackageRow> for Package {
     fn from(row: PackageRow) -> Self {
         Self {
             pkgbase: row.pkgbase,
-            aur_url: row.aur_url,
-            local_path: row.local_path,
             approved_commit: row.approved_commit,
             current_commit: row.current_commit,
             pkgver: row.pkgver,

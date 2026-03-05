@@ -1,7 +1,7 @@
 // Dashboard component
 import * as api from '../api.js';
 import { navigate } from '../router.js';
-import { showToast, formatStatus, formatBytes, escapeHtml } from './utils.js';
+import { showToast, formatStatus, formatStage, formatBytes, escapeHtml } from './utils.js';
 
 export async function init() {
     await Promise.all([
@@ -139,7 +139,7 @@ async function loadAttentionNeeded() {
         const packages = await api.packages.list();
 
         const attention = packages.filter(pkg =>
-            ['pending_review', 'update_available', 'failed'].includes(pkg.status)
+            ['pending_review', 'update_available', 'approved', 'failed'].includes(pkg.status)
         );
 
         if (attention.length === 0) {
@@ -147,10 +147,12 @@ async function loadAttentionNeeded() {
             return;
         }
 
-        const updatable = attention.filter(pkg => pkg.status === 'update_available' || pkg.status === 'pending_review');
-        const headerHtml = updatable.length > 0 ? `
+        const buildable = attention.filter(pkg => ['update_available', 'pending_review', 'approved'].includes(pkg.status));
+        const needsApproval = buildable.filter(pkg => pkg.status !== 'approved');
+        const label = needsApproval.length > 0 ? `Approve &amp; Build All (${buildable.length})` : `Build All (${buildable.length})`;
+        const headerHtml = buildable.length > 0 ? `
             <div class="attention-header">
-                <button class="btn btn-primary" id="approve-build-all">Approve &amp; Build All (${updatable.length})</button>
+                <button class="btn btn-primary" id="approve-build-all">${label}</button>
             </div>
         ` : '';
 
@@ -224,31 +226,32 @@ async function loadRecentBuilds() {
     const container = document.getElementById('recent-builds-list');
     if (!container) return;
     try {
-        const packages = await api.packages.list();
+        const builds = await api.builds.listAll({ limit: 10 });
 
-        // Show packages that are currently building or recently failed — they have active build history
-        const active = packages.filter(pkg => ['building', 'failed'].includes(pkg.status));
-
-        if (active.length === 0) {
-            container.innerHTML = '<p class="empty-state">No recent builds. See each package\'s detail page for build history.</p>';
+        if (builds.length === 0) {
+            container.innerHTML = '<p class="empty-state">No builds yet.</p>';
             return;
         }
 
-        container.innerHTML = active.map(pkg => `
-            <div class="package-item" data-pkg="${escapeHtml(pkg.pkgbase)}">
-                <span class="name">${escapeHtml(pkg.pkgbase)}</span>
-                <span class="version">${escapeHtml(pkg.pkgver || '-')}</span>
-                <span class="status-badge ${pkg.status}">${formatStatus(pkg.status)}</span>
-                <div class="actions">
-                    <a href="#/packages/${escapeHtml(pkg.pkgbase)}" class="btn btn-sm">View</a>
+        container.innerHTML = builds.map(b => {
+            const build = b.build || b;
+            const isActive = build.status === 'running' || build.status === 'pending';
+            return `
+                <div class="package-item" data-build-id="${escapeHtml(build.id)}">
+                    <span class="name">${escapeHtml(build.pkgbase)}</span>
+                    <span class="status-badge ${build.status}">${formatStatus(build.status)}</span>
+                    ${isActive && b.current_stage ? `<span class="stage-badge ${escapeHtml(b.current_stage)}">${escapeHtml(formatStage(b.current_stage))}</span>` : ''}
+                    <div class="actions">
+                        <a href="#/builds/${escapeHtml(build.id)}" class="btn btn-sm">Logs</a>
+                    </div>
                 </div>
-            </div>
-        `).join('');
+            `;
+        }).join('');
 
         container.querySelectorAll('.package-item').forEach(item => {
             item.addEventListener('click', (e) => {
                 if (e.target.tagName === 'A' || e.target.tagName === 'BUTTON') return;
-                navigate(`/packages/${item.dataset.pkg}`);
+                navigate(`/builds/${item.dataset.buildId}`);
             });
         });
     } catch (error) {

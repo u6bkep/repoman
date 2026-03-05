@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{Read as _, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -16,6 +16,11 @@ use crate::models::SrcInfo;
 /// - Explicit status messages at key points
 const BUILD_SCRIPT: &str = r#"
 set -e
+
+# Configure local repository at runtime (injected via env var)
+if [ -n "$REPOMAN_REPO_NAME" ]; then
+    printf '\n[%s]\nSigLevel = Optional TrustAll\nServer = file:///repo\n' "$REPOMAN_REPO_NAME" | sudo tee -a /etc/pacman.conf > /dev/null
+fi
 
 echo ""
 echo "╔════════════════════════════════════════════════════════════════╗"
@@ -96,6 +101,54 @@ for f in /pkgdest/*.pkg.tar.*; do
 done
 echo ""
 "#;
+
+/// Stream lines from a reader, splitting on both \n and \r so that progress bars
+/// (curl, wget, etc.) that use \r to overwrite the current line display in real time.
+/// Lines from \r are printed with \r to allow overwriting on the terminal.
+fn stream_lines<R: std::io::Read>(reader: std::io::BufReader<R>, log: &mut std::fs::File, is_stderr: bool) {
+    use std::io::Read;
+    let mut buf = Vec::with_capacity(4096);
+    for byte in reader.bytes() {
+        match byte {
+            Ok(b'\n') => {
+                let line = String::from_utf8_lossy(&buf);
+                if is_stderr {
+                    eprintln!("{}", line);
+                    let _ = writeln!(log, "[stderr] {}", line);
+                } else {
+                    println!("{}", line);
+                    let _ = writeln!(log, "{}", line);
+                }
+                buf.clear();
+            }
+            Ok(b'\r') => {
+                let line = String::from_utf8_lossy(&buf);
+                if !line.is_empty() {
+                    if is_stderr {
+                        eprint!("\r{}", line);
+                    } else {
+                        print!("\r{}", line);
+                    }
+                    // Don't log every \r progress update to avoid log bloat
+                }
+                buf.clear();
+            }
+            Ok(b) => buf.push(b),
+            Err(_) => break,
+        }
+    }
+    // Flush any remaining content
+    if !buf.is_empty() {
+        let line = String::from_utf8_lossy(&buf);
+        if is_stderr {
+            eprintln!("{}", line);
+            let _ = writeln!(log, "[stderr] {}", line);
+        } else {
+            println!("{}", line);
+            let _ = writeln!(log, "{}", line);
+        }
+    }
+}
 
 /// Compare two version strings using pacman's vercmp
 /// Returns Ordering::Greater if ver1 > ver2, etc.
@@ -210,9 +263,10 @@ impl BuildSystem {
     }
 
     /// Generate Dockerfile for base image
+    /// Note: The local repo is configured at container startup via REPOMAN_REPO_NAME env var,
+    /// so the image doesn't need to be rebuilt when the repo name changes.
     fn generate_dockerfile(&self) -> String {
-        format!(
-            r#"FROM archlinux:base-devel
+        r#"FROM archlinux:base-devel
 
 # Update system and install required packages
 RUN pacman -Syu --noconfirm && \
@@ -241,9 +295,6 @@ RUN sed -i 's/^#MAKEFLAGS=.*/MAKEFLAGS="-j$(nproc)"/' /etc/makepkg.conf && \
 RUN sed -i '/^\[options\]/a NoProgressBar' /etc/pacman.conf && \
     sed -i '/^\[options\]/a VerbosePkgLists' /etc/pacman.conf
 
-# Add local repository to pacman.conf (for AUR dependencies we've already built)
-RUN echo -e "\n[{repo_name}]\nSigLevel = Optional TrustAll\nServer = file:///repo" >> /etc/pacman.conf
-
 # Create directories
 RUN mkdir -p /build /build/sources /pkgdest /repo && \
     chown -R builder:builder /build /pkgdest
@@ -253,9 +304,8 @@ WORKDIR /build
 
 # Default command: sync repos and build
 CMD ["bash", "-c", "sudo pacman -Sy --noconfirm && makepkg -s --noconfirm --needed"]
-"#,
-            repo_name = self.config.repo.name
-        )
+"#
+        .to_string()
     }
 
     /// Run a build for a package (synchronous version for CLI)
@@ -326,6 +376,10 @@ CMD ["bash", "-c", "sudo pacman -Sy --noconfirm && makepkg -s --noconfirm --need
             println!("Using tmpfs for build directory");
         }
 
+        // Pass repo name as env var for runtime pacman.conf configuration
+        podman_args.push("-e".to_string());
+        podman_args.push(format!("REPOMAN_REPO_NAME={}", self.config.repo.name));
+
         podman_args.push(self.config.container.image.clone());
         podman_args.push("bash".to_string());
         podman_args.push("-c".to_string());
@@ -345,28 +399,18 @@ CMD ["bash", "-c", "sudo pacman -Sy --noconfirm && makepkg -s --noconfirm --need
         let log_file_clone = log_file.try_clone()?;
 
         // Spawn threads to handle output
+        // Uses stream_lines which splits on both \r and \n so that curl/wget
+        // progress bars (which use \r to overwrite the line) display in real time.
         let stdout_handle = std::thread::spawn(move || {
-            use std::io::BufRead;
             let reader = std::io::BufReader::new(stdout);
             let mut log = log_file;
-            for line in reader.lines() {
-                if let Ok(line) = line {
-                    println!("{}", line);
-                    let _ = writeln!(log, "{}", line);
-                }
-            }
+            stream_lines(reader, &mut log, false);
         });
 
         let stderr_handle = std::thread::spawn(move || {
-            use std::io::BufRead;
             let reader = std::io::BufReader::new(stderr);
             let mut log = log_file_clone;
-            for line in reader.lines() {
-                if let Ok(line) = line {
-                    eprintln!("{}", line);
-                    let _ = writeln!(log, "[stderr] {}", line);
-                }
-            }
+            stream_lines(reader, &mut log, true);
         });
 
         let status = child.wait().context("Failed to wait for build")?;
@@ -414,15 +458,41 @@ CMD ["bash", "-c", "sudo pacman -Sy --noconfirm && makepkg -s --noconfirm --need
     pub fn move_to_repo(&self, packages: &[PathBuf]) -> Result<Vec<PathBuf>> {
         let mut repo_packages = Vec::new();
 
-        for pkg in packages {
+        for (i, pkg) in packages.iter().enumerate() {
             let filename = pkg
                 .file_name()
                 .ok_or_else(|| anyhow::anyhow!("Invalid package path"))?;
             let dest = self.config.repo.path.join(filename);
 
-            // Copy package to repo
-            std::fs::copy(pkg, &dest)
-                .with_context(|| format!("Failed to copy package to repo: {}", pkg.display()))?;
+            let size = std::fs::metadata(pkg)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            let size_str = format_size(size);
+
+            tracing::info!(
+                "[{}/{}] Copying {} ({}) -> {}",
+                i + 1,
+                packages.len(),
+                pkg.display(),
+                size_str,
+                dest.display(),
+            );
+
+            // Copy with progress for large files (>100MB)
+            if size > 100 * 1024 * 1024 {
+                copy_with_progress(pkg, &dest, size)
+                    .with_context(|| format!("Failed to copy package to repo: {}", pkg.display()))?;
+            } else {
+                std::fs::copy(pkg, &dest)
+                    .with_context(|| format!("Failed to copy package to repo: {}", pkg.display()))?;
+            }
+
+            tracing::info!(
+                "[{}/{}] Copied {} to repo",
+                i + 1,
+                packages.len(),
+                filename.to_string_lossy(),
+            );
 
             // Try to delete original, but don't fail if we can't (permission issues with container subuids)
             if let Err(e) = std::fs::remove_file(pkg) {
@@ -907,5 +977,54 @@ pub struct ImageInfo {
 pub struct PruneResult {
     pub removed: Vec<String>,
     pub errors: Vec<String>,
+}
+
+fn format_size(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    const GIB: u64 = 1024 * MIB;
+    if bytes >= GIB {
+        format!("{:.2} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.0} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+fn copy_with_progress(src: &Path, dest: &Path, total: u64) -> Result<()> {
+    let mut reader = std::fs::File::open(src)?;
+    let mut writer = std::fs::File::create(dest)?;
+
+    let mut buf = vec![0u8; 8 * 1024 * 1024]; // 8 MiB buffer
+    let mut copied: u64 = 0;
+    let mut last_log_pct: u64 = 0;
+
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        std::io::Write::write_all(&mut writer, &buf[..n])?;
+        copied += n as u64;
+
+        if total > 0 {
+            let pct = copied * 100 / total;
+            // Log every 10%
+            if pct >= last_log_pct + 10 {
+                last_log_pct = pct / 10 * 10;
+                tracing::info!(
+                    "  copy progress: {} / {} ({}%)",
+                    format_size(copied),
+                    format_size(total),
+                    last_log_pct,
+                );
+            }
+        }
+    }
+
+    Ok(())
 }
 

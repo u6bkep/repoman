@@ -13,6 +13,7 @@
             <div class="nav-links">
                 <a href="#/">Dashboard</a>
                 <a href="#/packages">Packages</a>
+                <a href="#/builds">Builds</a>
                 <a href="#/add">Add Package</a>
                 <a href="#/settings">Settings</a>
             </div>
@@ -181,6 +182,21 @@
                     <span id="build-pkg">-</span>
                     <span id="build-status" class="status-badge">-</span>
                     <span id="build-stage" class="stage-badge" style="display: none;">-</span>
+                    <button id="cancel-build" class="btn btn-danger btn-sm" style="display: none;">Cancel Build</button>
+                </div>
+            </div>
+            <div class="build-meta" id="build-meta" style="display: none;">
+                <div class="meta-item">
+                    <span class="meta-label">Started</span>
+                    <span class="meta-value" id="build-started">-</span>
+                </div>
+                <div class="meta-item">
+                    <span class="meta-label">Duration</span>
+                    <span class="meta-value" id="build-duration">-</span>
+                </div>
+                <div class="meta-item">
+                    <span class="meta-label">Commit</span>
+                    <span class="meta-value mono" id="build-commit">-</span>
                 </div>
             </div>
             <div class="stage-progress" id="stage-progress" style="display: none;">
@@ -192,8 +208,34 @@
                 <div class="stage-item" data-stage="updating_index">Indexing</div>
                 <div class="stage-item" data-stage="complete">Complete</div>
             </div>
+            <div class="error-banner" id="error-banner" style="display: none;">
+                <div class="error-banner-header">Build Failed</div>
+                <pre class="error-banner-message" id="build-error-message"></pre>
+            </div>
+            <div class="outputs-panel" id="outputs-panel" style="display: none;">
+                <div class="outputs-header">Built Packages</div>
+                <ul class="outputs-list" id="outputs-list"></ul>
+            </div>
             <div class="log-container">
                 <pre id="log-content" class="log-output"></pre>
+            </div>
+        </div>
+    </template>
+
+    <template id="tmpl-builds">
+        <div class="builds-page">
+            <div class="page-header">
+                <h1>Builds</h1>
+            </div>
+            <div id="build-filter-tabs" class="filter-tabs">
+                <button class="tab active" data-filter="all">All</button>
+                <button class="tab" data-filter="running">Running</button>
+                <button class="tab" data-filter="success">Success</button>
+                <button class="tab" data-filter="failed">Failed</button>
+                <button class="tab" data-filter="cancelled">Cancelled</button>
+            </div>
+            <div id="builds-table">
+                <div class="status-loading">Loading...</div>
             </div>
         </div>
     </template>

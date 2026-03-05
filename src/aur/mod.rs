@@ -87,6 +87,8 @@ impl AurClient {
         srcinfo: &SrcInfo,
         tracked_pkgnames: &std::collections::HashSet<String>,
         container_image: &str,
+        repo_name: &str,
+        repo_path: &Path,
     ) -> Result<Vec<MissingDep>> {
         // Get all dependencies
         let all_deps = DepResolver::get_all_deps(srcinfo);
@@ -95,7 +97,8 @@ impl AurClient {
         }
 
         // Filter out deps satisfied by repos (official + our local repo, checked in container)
-        let foreign_deps = DepResolver::filter_foreign_deps(&all_deps, container_image)?;
+        let foreign_deps =
+            DepResolver::filter_foreign_deps(&all_deps, container_image, repo_name, repo_path)?;
         if foreign_deps.is_empty() {
             return Ok(vec![]);
         }
@@ -189,6 +192,17 @@ impl AurGit {
         }
 
         Ok(())
+    }
+
+    /// Ensure a clone exists, re-cloning from AUR if the directory is missing.
+    /// Returns Ok(true) if a fresh clone was performed, Ok(false) if it already existed.
+    pub fn ensure_cloned(pkgbase: &str, dest: &Path) -> Result<bool> {
+        if dest.exists() {
+            return Ok(false);
+        }
+        tracing::info!("Clone missing for {}, re-cloning from AUR", pkgbase);
+        Self::clone(pkgbase, dest)?;
+        Ok(true)
     }
 
     /// Fetch updates for an AUR package
@@ -412,8 +426,14 @@ impl DepResolver {
 
     /// Check if dependencies are satisfied by repos (official + our local repo)
     /// Runs inside a single podman container to use the correct pacman configuration.
+    /// The local repo is configured at runtime via env var and volume mount.
     /// Returns the list of deps NOT satisfied by any configured repos.
-    pub fn filter_foreign_deps(deps: &[String], container_image: &str) -> Result<Vec<String>> {
+    pub fn filter_foreign_deps(
+        deps: &[String],
+        container_image: &str,
+        repo_name: &str,
+        repo_path: &Path,
+    ) -> Result<Vec<String>> {
         if deps.is_empty() {
             return Ok(vec![]);
         }
@@ -423,9 +443,30 @@ impl DepResolver {
         // When a dep is not found, pacman prints to stderr: "error: target not found: <name>"
         let dep_names: Vec<&str> = deps.iter().map(|d| Self::dep_name(d)).collect();
 
+        // Build a bash script that configures the local repo at runtime, syncs, then checks deps
+        let repo_setup = if !repo_name.is_empty() {
+            format!(
+                "printf '\\n[{}]\\nSigLevel = Optional TrustAll\\nServer = file:///repo\\n' | sudo tee -a /etc/pacman.conf > /dev/null; ",
+                repo_name
+            )
+        } else {
+            String::new()
+        };
+        let bash_script = format!(
+            "{}sudo pacman -Sy --noconfirm > /dev/null 2>&1; pacman -Sddp --noconfirm -- {}",
+            repo_setup,
+            dep_names.join(" ")
+        );
+
+        let repo_mount = format!("{}:/repo:z", repo_path.display());
+
         let mut cmd = Command::new("podman");
-        cmd.args(["run", "--rm", "-i", container_image, "pacman", "-Sddp", "--noconfirm", "--"]);
-        cmd.args(&dep_names);
+        cmd.args([
+            "run", "--rm", "-i",
+            "-v", &repo_mount,
+            container_image,
+            "bash", "-c", &bash_script,
+        ]);
 
         let output = match cmd.output() {
             Ok(o) => o,

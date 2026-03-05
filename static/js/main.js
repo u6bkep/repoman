@@ -6,6 +6,7 @@ import * as packageList from './components/package-list.js';
 import * as packageDetail from './components/package-detail.js';
 import * as addPackage from './components/add-package.js';
 import * as buildLog from './components/build-log.js';
+import * as buildsPage from './components/builds.js';
 import * as settings from './components/settings.js';
 
 // Register routes
@@ -27,6 +28,11 @@ register('/packages/:name', async (params) => {
 register('/add', async () => {
     render('tmpl-add-package');
     await addPackage.init();
+});
+
+register('/builds', async () => {
+    render('tmpl-builds');
+    return await buildsPage.init();
 });
 
 register('/builds/:id', async (params) => {

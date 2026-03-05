@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 /// Package status in the workflow
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
@@ -73,10 +74,6 @@ impl std::str::FromStr for InstallReason {
 pub struct Package {
     /// The pkgbase (build unit identifier)
     pub pkgbase: String,
-    /// Git clone URL
-    pub aur_url: String,
-    /// Local path to git clone
-    pub local_path: String,
     /// Last approved commit hash
     pub approved_commit: Option<String>,
     /// Current HEAD commit hash
@@ -100,6 +97,20 @@ pub struct Package {
     pub added_at: DateTime<Utc>,
     /// Last update time
     pub updated_at: DateTime<Utc>,
+}
+
+const AUR_GIT_BASE: &str = "https://aur.archlinux.org";
+
+impl Package {
+    /// Derive the AUR git clone URL from pkgbase
+    pub fn aur_url(&self) -> String {
+        format!("{}/{}.git", AUR_GIT_BASE, self.pkgbase)
+    }
+
+    /// Derive the local clone path from config's aur_clones dir + pkgbase
+    pub fn clone_path(&self, aur_clones: &std::path::Path) -> PathBuf {
+        aur_clones.join(&self.pkgbase)
+    }
 }
 
 /// Individual package name produced by a pkgbase
@@ -228,12 +239,27 @@ pub struct Build {
     pub started_at: DateTime<Utc>,
     /// When the build finished
     pub finished_at: Option<DateTime<Utc>>,
-    /// Path to build log file
+    /// Log filename (relative to logs dir), e.g. "{build_id}.log"
     pub log_path: Option<String>,
     /// Built package filenames (JSON array)
     pub outputs: Option<String>,
     /// Error message if failed
     pub error_message: Option<String>,
+}
+
+impl Build {
+    /// Resolve the log file path against the logs directory
+    pub fn resolve_log_path(&self, logs_dir: &std::path::Path) -> Option<PathBuf> {
+        self.log_path.as_ref().map(|p| {
+            let path = std::path::Path::new(p);
+            if path.is_absolute() {
+                // Legacy absolute path — use as-is
+                path.to_path_buf()
+            } else {
+                logs_dir.join(p)
+            }
+        })
+    }
 }
 
 /// AUR package info from RPC API
