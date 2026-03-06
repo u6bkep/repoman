@@ -67,6 +67,7 @@ impl RepoState {
     /// and reload if so.
     ///
     /// Returns `true` if a reload was performed, `false` if the file is unchanged.
+    #[allow(dead_code)]
     pub fn reload_if_changed(&mut self) -> Result<bool> {
         let current_mtime = if self.db_path.exists() {
             std::fs::metadata(&self.db_path)
@@ -104,6 +105,7 @@ impl RepoState {
     }
 
     /// Get all repo entries for a given pkgbase.
+    #[allow(dead_code)]
     pub fn get_packages_for_pkgbase(&self, pkgbase: &str) -> Vec<&RepoPkgEntry> {
         self.contents
             .by_pkgbase
@@ -113,6 +115,7 @@ impl RepoState {
     }
 
     /// Access the full parsed repo database contents.
+    #[allow(dead_code)]
     pub fn contents(&self) -> &RepoDbContents {
         &self.contents
     }

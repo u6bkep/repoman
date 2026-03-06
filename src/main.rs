@@ -196,7 +196,6 @@ struct EnrichedPackage {
     status: DerivedStatus,
     pkgver: Option<String>,
     current_commit: Option<String>,
-    pkgnames: Vec<String>,
 }
 
 async fn enrich_package(
@@ -211,15 +210,6 @@ async fn enrich_package(
     let head_commit = SrcInfoCache::get_head_commit(&clone_dir).ok().flatten();
     let srcinfo = srcinfo_cache.get(&pkg.pkgbase);
     let pkgver = srcinfo.map(|s| s.srcinfo.full_version());
-    let pkgnames = srcinfo
-        .map(|s| {
-            s.srcinfo
-                .packages
-                .iter()
-                .map(|p| p.pkgname.clone())
-                .collect()
-        })
-        .unwrap_or_default();
 
     let latest_build = if let Some(ref commit) = pkg.approved_commit {
         db.get_latest_build_for_commit(&pkg.pkgbase, commit)
@@ -243,7 +233,6 @@ async fn enrich_package(
         status,
         pkgver,
         current_commit: head_commit,
-        pkgnames,
     }
 }
 

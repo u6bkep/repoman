@@ -50,6 +50,7 @@ impl SrcInfoCache {
     }
 
     /// Return the number of cached entries.
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -58,6 +59,7 @@ impl SrcInfoCache {
     ///
     /// This is used after a git fetch: if HEAD moved, the cached .SRCINFO
     /// is stale and should be re-parsed.
+    #[allow(dead_code)]
     pub fn invalidate_if_changed(&mut self, pkgbase: &str, current_commit: &str) {
         let should_remove = self
             .entries
