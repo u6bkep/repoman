@@ -228,7 +228,7 @@ async function loadBuildInfo(buildId) {
         // Show outputs panel for successful builds
         const outputsPanel = document.getElementById('outputs-panel');
         if (outputsPanel) {
-            const outputs = build.outputs_list;
+            const outputs = build.outputs;
             if (build.status === 'success' && outputs && outputs.length > 0) {
                 const list = document.getElementById('outputs-list');
                 list.innerHTML = outputs.map(f => `<li>${escapeHtml(f)}</li>`).join('');

@@ -281,12 +281,23 @@ pub struct BuildResponse {
 
 #[derive(Serialize, Clone)]
 pub struct BuildDetailResponse {
-    #[serde(flatten)]
-    pub build: crate::models::Build,
+    pub id: String,
+    pub pkgbase: String,
+    pub commit: String,
+    pub status: crate::models::BuildStatus,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_path: Option<String>,
+    /// Outputs as a real JSON array (replaces stringified outputs)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outputs: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
     /// Current stage of the build (for running builds)
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub current_stage: Option<String>,
-    /// Outputs as a real JSON array (not stringified)
-    pub outputs_list: Option<Vec<String>>,
 }
 
 #[derive(Serialize)]
@@ -575,14 +586,21 @@ async fn build_detail_response(state: &AppState, build: crate::models::Build) ->
     };
 
     // Parse outputs from JSON string into real array
-    let outputs_list = build.outputs.as_ref().and_then(|s| {
+    let outputs = build.outputs.as_ref().and_then(|s| {
         serde_json::from_str::<Vec<String>>(s).ok()
     });
 
     BuildDetailResponse {
-        build,
+        id: build.id,
+        pkgbase: build.pkgbase,
+        commit: build.commit,
+        status: build.status,
+        started_at: build.started_at,
+        finished_at: build.finished_at,
+        log_path: build.log_path,
+        outputs,
+        error_message: build.error_message,
         current_stage,
-        outputs_list,
     }
 }
 
@@ -882,6 +900,10 @@ async fn do_remove(
             let pkgname_refs: Vec<&str> = pkgnames.iter().map(|s| s.as_str()).collect();
             let _repo_lock = state.repo_mutex.lock().await;
             let _ = state.build.repo_remove(&pkgname_refs);
+            // Reload RepoState so derive_status sees the package is gone
+            let mut repo = state.repo_state.write().await;
+            let _ = repo.reload();
+            drop(repo);
             drop(_repo_lock);
             for name in &pkgnames {
                 let _ = state.repo.delete_package_files(name);
@@ -1087,6 +1109,10 @@ async fn check_and_build(
     for pkg in &packages {
         let status = derive_package_status(&state, pkg).await;
         match status {
+            DerivedStatus::Approved => {
+                // Already approved, just queue for building
+                approved_pkgbases.push(pkg.pkgbase.clone());
+            }
             DerivedStatus::UpdateAvailable | DerivedStatus::PendingReview => {
                 let cache = state.srcinfo_cache.read().await;
                 let head = cache.get(&pkg.pkgbase).map(|c| c.commit.clone());
@@ -1148,9 +1174,10 @@ async fn trigger_build(
         }
     }
 
-    // Check status is appropriate for building
+    // Check status is appropriate for building — only Approved packages can build.
+    // UpdateAvailable means HEAD differs from approved_commit, so approval is needed first.
     let status = derive_package_status(&state, &pkg).await;
-    if status != DerivedStatus::Approved && status != DerivedStatus::UpdateAvailable {
+    if status != DerivedStatus::Approved {
         return Err(AppError::bad_request(
             "Package must be approved before building",
         ));
@@ -1172,17 +1199,10 @@ async fn trigger_build(
         }
     }
 
-    // Get commit from cache or disk
-    let commit = {
-        let cache = state.srcinfo_cache.read().await;
-        cache.get(&pkg.pkgbase).map(|c| c.commit.clone())
-    };
-    let commit = commit.or_else(|| {
-        let clone_dir = pkg.clone_path(&state.config.resolved_cache().aur_clones);
-        SrcInfoCache::get_head_commit(&clone_dir).ok().flatten()
-    });
-    let commit =
-        commit.ok_or_else(|| AppError::bad_request("Package has no current commit"))?;
+    // Use the approved commit for the build record — we verified status is Approved,
+    // so approved_commit must match HEAD.
+    let commit = pkg.approved_commit.clone()
+        .ok_or_else(|| AppError::bad_request("Package has no approved commit"))?;
 
     let build_id = uuid::Uuid::new_v4().to_string();
     let log_filename = format!("{}.log", build_id);

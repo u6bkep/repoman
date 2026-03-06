@@ -8,10 +8,7 @@ use crate::build::BuildSystem;
 use crate::models::{BuildStage, BuildStatus};
 use crate::state::SharedState;
 
-/// Emit a server event on the broadcast channel. Ignores send errors (no receivers).
-pub fn emit_event(tx: &tokio::sync::broadcast::Sender<ServerEvent>, event: ServerEvent) {
-    let _ = tx.send(event);
-}
+use crate::api::emit_event;
 
 /// Helper to update build stage in memory and emit SSE event.
 pub async fn set_build_stage(
