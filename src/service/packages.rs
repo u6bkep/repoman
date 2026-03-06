@@ -164,13 +164,7 @@ pub async fn add_package_single(
     }
 
     // Emit event
-    crate::api::emit_event(
-        &state.events,
-        crate::api::ServerEvent::PackageStatusChanged {
-            pkgbase: pkgbase.clone(),
-            new_status: "pending_review".to_string(),
-        },
-    );
+    crate::api::emit_status_changed(state, &pkgbase).await;
 
     Ok(AddPackageResult { pkg, version })
 }

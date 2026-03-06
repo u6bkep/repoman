@@ -30,8 +30,7 @@ pub use crate::state::{AppState, SharedState, SrcInfoCache};
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerEvent {
     PackageStatusChanged {
-        pkgbase: String,
-        new_status: String,
+        package: PackageResponse,
     },
     BuildStarted {
         build_id: String,
@@ -143,6 +142,16 @@ pub fn emit_event(tx: &tokio::sync::broadcast::Sender<ServerEvent>, event: Serve
     let _ = tx.send(event);
 }
 
+/// Emit a PackageStatusChanged event with the full enriched package object.
+pub async fn emit_status_changed(state: &AppState, pkgbase: &str) {
+    let pkg = match state.db.get_package(pkgbase).await {
+        Ok(Some(pkg)) => pkg,
+        _ => return, // Package may have been deleted or DB error
+    };
+    let resp = assemble_package_response(state, &pkg).await;
+    emit_event(&state.events, ServerEvent::PackageStatusChanged { package: resp });
+}
+
 // ==================== Request/Response types ====================
 
 #[derive(Deserialize)]
@@ -207,7 +216,7 @@ pub struct ApproveQuery {
     pub commit: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone, Debug)]
 pub struct PkgNameResponse {
     pub pkgname: String,
     pub pkgdesc: Option<String>,
@@ -215,7 +224,7 @@ pub struct PkgNameResponse {
     pub repo_version: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone, Debug)]
 pub struct PackageResponse {
     pub pkgbase: String,
     pub install_reason: String,
@@ -529,7 +538,7 @@ fn merge_deps(global: &[String], per_pkg: &[String]) -> Vec<String> {
 }
 
 /// Assemble a PackageResponse from a Package + caches. Does NOT set is_orphan.
-async fn assemble_package_response(state: &AppState, pkg: &Package) -> PackageResponse {
+pub async fn assemble_package_response(state: &AppState, pkg: &Package) -> PackageResponse {
     let cache = state.srcinfo_cache.read().await;
     let repo = state.repo_state.read().await;
 
@@ -1029,13 +1038,7 @@ async fn approve_package(
         .approve_package(&pkg.pkgbase, &commit, false)
         .await?;
 
-    emit_event(
-        &state.events,
-        ServerEvent::PackageStatusChanged {
-            pkgbase: pkg.pkgbase.clone(),
-            new_status: "approved".to_string(),
-        },
-    );
+    emit_status_changed(&state, &pkg.pkgbase).await;
 
     Ok(StatusCode::OK)
 }
@@ -1058,13 +1061,7 @@ async fn approve_and_build_updates(
 
                 if let Some(commit) = head {
                     state.db.approve_package(&pkg.pkgbase, &commit, false).await?;
-                    emit_event(
-                        &state.events,
-                        ServerEvent::PackageStatusChanged {
-                            pkgbase: pkg.pkgbase.clone(),
-                            new_status: "approved".to_string(),
-                        },
-                    );
+                    emit_status_changed(&state, &pkg.pkgbase).await;
                     approved_pkgbases.push(pkg.pkgbase.clone());
                     buildable_pkgbases.push(pkg.pkgbase.clone());
                 }
@@ -1120,13 +1117,7 @@ async fn check_and_build(
 
                 if let Some(commit) = head {
                     state.db.approve_package(&pkg.pkgbase, &commit, false).await?;
-                    emit_event(
-                        &state.events,
-                        ServerEvent::PackageStatusChanged {
-                            pkgbase: pkg.pkgbase.clone(),
-                            new_status: "approved".to_string(),
-                        },
-                    );
+                    emit_status_changed(&state, &pkg.pkgbase).await;
                     approved_pkgbases.push(pkg.pkgbase.clone());
                 }
             }
@@ -1243,13 +1234,7 @@ async fn trigger_build(
             pkgbase: pkg.pkgbase.clone(),
         },
     );
-    emit_event(
-        &state.events,
-        ServerEvent::PackageStatusChanged {
-            pkgbase: pkg.pkgbase.clone(),
-            new_status: "building".to_string(),
-        },
-    );
+    emit_status_changed(&state, &pkg.pkgbase).await;
 
     let config = state.config.clone();
     let state_clone = state.clone();

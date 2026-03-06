@@ -41,55 +41,11 @@ export async function init() {
 
     const statusHandler = (e) => {
         const event = e.detail;
-        if (event.type === 'package_status_changed') {
-            const row = document.querySelector(`.package-item[data-pkg="${event.pkgbase}"]`);
+        if (event.type === 'package_status_changed' && event.package) {
+            const pkg = event.package;
+            const row = document.querySelector(`.package-item[data-pkg="${pkg.pkgbase}"]`);
             if (row) {
-                const badge = row.querySelector('.status-badge');
-                if (badge) {
-                    badge.className = `status-badge ${event.new_status}`;
-                    badge.textContent = formatStatus(event.new_status);
-                }
-                const actions = row.querySelector('.actions');
-                if (actions) {
-                    actions.innerHTML = '';
-                    if (canApprove(event.new_status)) {
-                        const approveBtn = document.createElement('button');
-                        approveBtn.className = 'btn btn-sm btn-primary';
-                        approveBtn.dataset.action = 'approve';
-                        approveBtn.dataset.pkg = event.pkgbase;
-                        approveBtn.textContent = 'Approve';
-                        actions.appendChild(approveBtn);
-                    }
-                    if (canBuild(event.new_status)) {
-                        const buildBtn = document.createElement('button');
-                        buildBtn.className = 'btn btn-sm btn-success';
-                        buildBtn.dataset.action = 'build';
-                        buildBtn.dataset.pkg = event.pkgbase;
-                        buildBtn.textContent = 'Build';
-                        actions.appendChild(buildBtn);
-                    }
-                    actions.querySelectorAll('[data-action]').forEach(btn => {
-                        btn.addEventListener('click', async (e) => {
-                            e.stopPropagation();
-                            const action = btn.dataset.action;
-                            const pkg = btn.dataset.pkg;
-                            btn.disabled = true;
-                            try {
-                                if (action === 'approve') {
-                                    await api.packages.approve(pkg);
-                                    showToast(`Approved ${pkg}`, 'success');
-                                } else if (action === 'build') {
-                                    await api.packages.build(pkg);
-                                    showToast(`Build started for ${pkg}`, 'success');
-                                }
-                                await loadPackages();
-                            } catch (error) {
-                                showToast(`Error: ${error.message}`, 'error');
-                                btn.disabled = false;
-                            }
-                        });
-                    });
-                }
+                updatePackageRow(row, pkg);
             }
         }
         if (event.type === 'build_completed') {
@@ -274,6 +230,57 @@ function formatVersionColumn(pkg) {
         }
     }
     return pkgver;
+}
+
+/// Update a package row in-place from an enriched SSE event.
+function updatePackageRow(row, pkg) {
+    const version = row.querySelector('.version');
+    if (version) version.innerHTML = formatVersionColumn(pkg);
+
+    const badge = row.querySelector('.status-badge');
+    if (badge) {
+        badge.className = `status-badge ${pkg.status}`;
+        badge.textContent = formatStatus(pkg.status);
+    }
+
+    const reason = row.querySelector('.reason-badge');
+    if (reason) {
+        reason.className = `reason-badge ${pkg.install_reason}`;
+        reason.textContent = pkg.install_reason;
+    }
+
+    const actions = row.querySelector('.actions');
+    if (actions) {
+        actions.innerHTML = '';
+        if (canApprove(pkg.status)) {
+            actions.insertAdjacentHTML('beforeend',
+                `<button class="btn btn-sm btn-primary" data-action="approve" data-pkg="${escapeHtml(pkg.pkgbase)}">Approve</button>`);
+        }
+        if (canBuild(pkg.status)) {
+            actions.insertAdjacentHTML('beforeend',
+                `<button class="btn btn-sm btn-success" data-action="build" data-pkg="${escapeHtml(pkg.pkgbase)}">Build</button>`);
+        }
+        actions.querySelectorAll('[data-action]').forEach(btn => {
+            btn.addEventListener('click', async (e) => {
+                e.stopPropagation();
+                const action = btn.dataset.action;
+                const p = btn.dataset.pkg;
+                btn.disabled = true;
+                try {
+                    if (action === 'approve') {
+                        await api.packages.approve(p);
+                        showToast(`Approved ${p}`, 'success');
+                    } else if (action === 'build') {
+                        await api.packages.build(p);
+                        showToast(`Build started for ${p}`, 'success');
+                    }
+                } catch (error) {
+                    showToast(`Error: ${error.message}`, 'error');
+                    btn.disabled = false;
+                }
+            });
+        });
+    }
 }
 
 function formatUpstreamBadge(pkg) {

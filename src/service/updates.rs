@@ -209,25 +209,9 @@ pub async fn check_updates_inner(state: &SharedState) -> Result<CheckUpdatesResu
                         .map_err(|e| {
                             AppError::internal(format!("DB error: {}", e))
                         })?;
-                    crate::api::emit_event(
-                        &state.events,
-                        ServerEvent::PackageStatusChanged {
-                            pkgbase: pkgbase.clone(),
-                            new_status: "approved".to_string(),
-                        },
-                    );
+                    crate::api::emit_status_changed(&state, &pkgbase).await;
                 } else {
-                    crate::api::emit_event(
-                        &state.events,
-                        ServerEvent::PackageStatusChanged {
-                            pkgbase: pkgbase.clone(),
-                            new_status: if approved_commit.is_some() {
-                                "update_available".to_string()
-                            } else {
-                                "pending_review".to_string()
-                            },
-                        },
-                    );
+                    crate::api::emit_status_changed(&state, &pkgbase).await;
                 }
 
                 Some(pkgbase.clone())
@@ -383,25 +367,9 @@ async fn check_updates_git_only(
                         .map_err(|e| {
                             AppError::internal(format!("DB error: {}", e))
                         })?;
-                    crate::api::emit_event(
-                        &state.events,
-                        ServerEvent::PackageStatusChanged {
-                            pkgbase: pkgbase.clone(),
-                            new_status: "approved".to_string(),
-                        },
-                    );
+                    crate::api::emit_status_changed(&state, &pkgbase).await;
                 } else {
-                    crate::api::emit_event(
-                        &state.events,
-                        ServerEvent::PackageStatusChanged {
-                            pkgbase: pkgbase.clone(),
-                            new_status: if approved_commit.is_some() {
-                                "update_available".to_string()
-                            } else {
-                                "pending_review".to_string()
-                            },
-                        },
-                    );
+                    crate::api::emit_status_changed(&state, &pkgbase).await;
                 }
 
                 Some(pkgbase.clone())

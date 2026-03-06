@@ -78,13 +78,7 @@ pub async fn update_build_failed(
             status: "failed".to_string(),
         },
     );
-    emit_event(
-        &state.events,
-        ServerEvent::PackageStatusChanged {
-            pkgbase: pkgbase.to_string(),
-            new_status: "failed".to_string(),
-        },
-    );
+    crate::api::emit_status_changed(state, pkgbase).await;
 }
 
 /// Background task that executes a single build.
@@ -262,13 +256,7 @@ pub async fn run_build_task(
                                 status: "success".to_string(),
                             },
                         );
-                        emit_event(
-                            &state.events,
-                            ServerEvent::PackageStatusChanged {
-                                pkgbase: pkgbase.clone(),
-                                new_status: "up_to_date".to_string(),
-                            },
-                        );
+                        crate::api::emit_status_changed(&state, &pkgbase).await;
                     }
 
                     clear_build_stage(&state, &build_id).await;
@@ -499,13 +487,7 @@ pub async fn run_queued_builds(
                 pkgbase: pkgbase.clone(),
             },
         );
-        emit_event(
-            &state.events,
-            ServerEvent::PackageStatusChanged {
-                pkgbase: pkgbase.clone(),
-                new_status: "building".to_string(),
-            },
-        );
+        crate::api::emit_status_changed(&state, pkgbase).await;
 
         tracing::info!("Starting queued build {} for {}", build_id, pkgbase);
 
@@ -629,13 +611,7 @@ pub async fn run_queued_builds(
                                     status: "success".to_string(),
                                 },
                             );
-                            emit_event(
-                                &state.events,
-                                ServerEvent::PackageStatusChanged {
-                                    pkgbase: pkgbase.clone(),
-                                    new_status: "up_to_date".to_string(),
-                                },
-                            );
+                            crate::api::emit_status_changed(&state, pkgbase).await;
                         }
 
                         clear_build_stage(&state, build_id).await;
