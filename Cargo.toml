@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 description = "AUR package repository manager with containerized builds"
 license = "MIT"
+authors = ["Ben Kepner <u6bkep@gmail.com>"]
+repository = "https://github.com/u6bkep/repoman"
 
 [dependencies]
 # Web framework

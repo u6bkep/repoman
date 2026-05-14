@@ -117,10 +117,7 @@ impl AurClient {
         }
 
         // Query AUR for the untracked deps
-        let dep_names: Vec<&str> = untracked
-            .iter()
-            .map(|d| DepResolver::dep_name(d))
-            .collect();
+        let dep_names: Vec<&str> = untracked.iter().map(|d| DepResolver::dep_name(d)).collect();
 
         let aur_results = self.info(&dep_names).await?;
 
@@ -284,15 +281,19 @@ impl AurGit {
     pub fn diff(repo_path: &Path, from: &str, to: &str) -> Result<String> {
         // Validate commit hashes to prevent flag injection
         let is_valid_hash = |s: &str| {
-            s.len() >= 7
-                && s.len() <= 64
-                && s.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
+            s.len() >= 7 && s.len() <= 64 && s.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
         };
         if !is_valid_hash(from) {
-            anyhow::bail!("Invalid commit hash '{}': must be 7-64 lowercase hex characters", from);
+            anyhow::bail!(
+                "Invalid commit hash '{}': must be 7-64 lowercase hex characters",
+                from
+            );
         }
         if !is_valid_hash(to) {
-            anyhow::bail!("Invalid commit hash '{}': must be 7-64 lowercase hex characters", to);
+            anyhow::bail!(
+                "Invalid commit hash '{}': must be 7-64 lowercase hex characters",
+                to
+            );
         }
 
         let output = Command::new("git")
@@ -419,9 +420,7 @@ impl DepResolver {
     /// e.g., "python>=3.10" -> "python"
     pub fn dep_name(dep: &str) -> &str {
         // Find first occurrence of <, >, =, :
-        dep.split(|c| c == '<' || c == '>' || c == '=' || c == ':')
-            .next()
-            .unwrap_or(dep)
+        dep.split(['<', '>', '=', ':']).next().unwrap_or(dep)
     }
 
     /// Check if dependencies are satisfied by repos (official + our local repo)
@@ -462,10 +461,15 @@ impl DepResolver {
 
         let mut cmd = Command::new("podman");
         cmd.args([
-            "run", "--rm", "-i",
-            "-v", &repo_mount,
+            "run",
+            "--rm",
+            "-i",
+            "-v",
+            &repo_mount,
             container_image,
-            "bash", "-c", &bash_script,
+            "bash",
+            "-c",
+            &bash_script,
         ]);
 
         let output = match cmd.output() {

@@ -25,15 +25,15 @@ impl RepoManager {
             let entry = entry?;
             let path = entry.path();
 
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.ends_with(".pkg.tar.zst") || name.ends_with(".pkg.tar.xz") {
-                    let metadata = entry.metadata()?;
-                    total_size += metadata.len();
-                    package_count += 1;
+            if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && (name.ends_with(".pkg.tar.zst") || name.ends_with(".pkg.tar.xz"))
+            {
+                let metadata = entry.metadata()?;
+                total_size += metadata.len();
+                package_count += 1;
 
-                    if let Some(pkg_info) = parse_package_filename(name) {
-                        packages.push(pkg_info);
-                    }
+                if let Some(pkg_info) = parse_package_filename(name) {
+                    packages.push(pkg_info);
                 }
             }
         }
@@ -55,14 +55,13 @@ impl RepoManager {
             let entry = entry?;
             let path = entry.path();
 
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if (name.ends_with(".pkg.tar.zst") || name.ends_with(".pkg.tar.xz"))
-                    && package_name_matches(name, pkgname)
-                {
-                    std::fs::remove_file(&path)
-                        .with_context(|| format!("Failed to delete {}", path.display()))?;
-                    deleted.push(name.to_string());
-                }
+            if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && (name.ends_with(".pkg.tar.zst") || name.ends_with(".pkg.tar.xz"))
+                && package_name_matches(name, pkgname)
+            {
+                std::fs::remove_file(&path)
+                    .with_context(|| format!("Failed to delete {}", path.display()))?;
+                deleted.push(name.to_string());
             }
         }
 
@@ -81,21 +80,21 @@ impl RepoManager {
             let entry = entry?;
             let path = entry.path();
 
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.ends_with(".pkg.tar.zst") || name.ends_with(".pkg.tar.xz") {
-                    if let Some(info) = parse_package_filename(name) {
-                        let metadata = entry.metadata()?;
-                        by_name.entry(info.pkgname.clone()).or_default().push(
-                            PackageFileInfo {
-                                filename: name.to_string(),
-                                pkgname: info.pkgname,
-                                version: info.version,
-                                arch: info.arch,
-                                size: metadata.len(),
-                            },
-                        );
-                    }
-                }
+            if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && (name.ends_with(".pkg.tar.zst") || name.ends_with(".pkg.tar.xz"))
+                && let Some(info) = parse_package_filename(name)
+            {
+                let metadata = entry.metadata()?;
+                by_name
+                    .entry(info.pkgname.clone())
+                    .or_default()
+                    .push(PackageFileInfo {
+                        filename: name.to_string(),
+                        pkgname: info.pkgname,
+                        version: info.version,
+                        arch: info.arch,
+                        size: metadata.len(),
+                    });
             }
         }
 
@@ -135,10 +134,10 @@ impl RepoManager {
             let entry = entry?;
             let path = entry.path();
 
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.ends_with(".pkg.tar.zst") || name.ends_with(".pkg.tar.xz") {
-                    packages.push(path);
-                }
+            if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && (name.ends_with(".pkg.tar.zst") || name.ends_with(".pkg.tar.xz"))
+            {
+                packages.push(path);
             }
         }
 

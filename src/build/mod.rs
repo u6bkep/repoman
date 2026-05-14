@@ -105,7 +105,11 @@ echo ""
 /// Stream lines from a reader, splitting on both \n and \r so that progress bars
 /// (curl, wget, etc.) that use \r to overwrite the current line display in real time.
 /// Lines from \r are printed with \r to allow overwriting on the terminal.
-fn stream_lines<R: std::io::Read>(reader: std::io::BufReader<R>, log: &mut std::fs::File, is_stderr: bool) {
+fn stream_lines<R: std::io::Read>(
+    reader: std::io::BufReader<R>,
+    log: &mut std::fs::File,
+    is_stderr: bool,
+) {
     use std::io::Read;
     let mut buf = Vec::with_capacity(4096);
     for byte in reader.bytes() {
@@ -154,9 +158,7 @@ fn stream_lines<R: std::io::Read>(reader: std::io::BufReader<R>, log: &mut std::
 /// Returns Ordering::Greater if ver1 > ver2, etc.
 /// Falls back to lexicographic comparison if vercmp is not available
 pub fn vercmp(ver1: &str, ver2: &str) -> Ordering {
-    let output = Command::new("vercmp")
-        .args([ver1, ver2])
-        .output();
+    let output = Command::new("vercmp").args([ver1, ver2]).output();
 
     match output {
         Ok(out) if out.status.success() => {
@@ -220,14 +222,16 @@ impl BuildSystem {
 
         // Write Dockerfile to temp location
         let dockerfile_path = self.cache.logs.join("Dockerfile.repoman");
-        std::fs::write(&dockerfile_path, &dockerfile)
-            .context("Failed to write Dockerfile")?;
+        std::fs::write(&dockerfile_path, &dockerfile).context("Failed to write Dockerfile")?;
 
         // Generate date tag (YYYY-MM-DD)
         let date_tag = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let dated_image = format!("{}:{}", self.config.container.image, date_tag);
 
-        println!("Building base image: {} ({})", self.config.container.image, dated_image);
+        println!(
+            "Building base image: {} ({})",
+            self.config.container.image, dated_image
+        );
 
         // Build with date tag
         let status = Command::new("podman")
@@ -258,7 +262,10 @@ impl BuildSystem {
             anyhow::bail!("Failed to tag base image as latest");
         }
 
-        println!("Image built and tagged: {}, {}", dated_image, self.config.container.image);
+        println!(
+            "Image built and tagged: {}, {}",
+            dated_image, self.config.container.image
+        );
         Ok(())
     }
 
@@ -344,7 +351,10 @@ CMD ["bash", "-c", "sudo pacman -Sy --noconfirm && makepkg -s --noconfirm --need
         let log_file = std::fs::File::create(log_path)
             .with_context(|| format!("Failed to create log file: {}", log_path.display()))?;
 
-        println!("Starting build for {} in container {}", pkgbase, container_name);
+        println!(
+            "Starting build for {} in container {}",
+            pkgbase, container_name
+        );
         println!("Logs: {}", log_path.display());
 
         // Build podman args dynamically
@@ -415,8 +425,12 @@ CMD ["bash", "-c", "sudo pacman -Sy --noconfirm && makepkg -s --noconfirm --need
 
         let status = child.wait().context("Failed to wait for build")?;
 
-        stdout_handle.join().map_err(|_| anyhow::anyhow!("stdout thread panicked"))?;
-        stderr_handle.join().map_err(|_| anyhow::anyhow!("stderr thread panicked"))?;
+        stdout_handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("stdout thread panicked"))?;
+        stderr_handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("stderr thread panicked"))?;
 
         if !status.success() {
             anyhow::bail!("Build failed with exit code: {:?}", status.code());
@@ -431,7 +445,10 @@ CMD ["bash", "-c", "sudo pacman -Sy --noconfirm && makepkg -s --noconfirm --need
 
         println!("Built {} package(s):", packages.len());
         for pkg in &packages {
-            println!("  - {}", pkg.file_name().unwrap_or_default().to_string_lossy());
+            println!(
+                "  - {}",
+                pkg.file_name().unwrap_or_default().to_string_lossy()
+            );
         }
 
         Ok(packages)
@@ -444,10 +461,10 @@ CMD ["bash", "-c", "sudo pacman -Sy --noconfirm && makepkg -s --noconfirm --need
         for entry in std::fs::read_dir(pkgdest)? {
             let entry = entry?;
             let path = entry.path();
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.ends_with(".pkg.tar.zst") || name.ends_with(".pkg.tar.xz") {
-                    packages.push(path);
-                }
+            if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && (name.ends_with(".pkg.tar.zst") || name.ends_with(".pkg.tar.xz"))
+            {
+                packages.push(path);
             }
         }
 
@@ -464,9 +481,7 @@ CMD ["bash", "-c", "sudo pacman -Sy --noconfirm && makepkg -s --noconfirm --need
                 .ok_or_else(|| anyhow::anyhow!("Invalid package path"))?;
             let dest = self.config.repo.path.join(filename);
 
-            let size = std::fs::metadata(pkg)
-                .map(|m| m.len())
-                .unwrap_or(0);
+            let size = std::fs::metadata(pkg).map(|m| m.len()).unwrap_or(0);
             let size_str = format_size(size);
 
             tracing::info!(
@@ -480,11 +495,13 @@ CMD ["bash", "-c", "sudo pacman -Sy --noconfirm && makepkg -s --noconfirm --need
 
             // Copy with progress for large files (>100MB)
             if size > 100 * 1024 * 1024 {
-                copy_with_progress(pkg, &dest, size)
-                    .with_context(|| format!("Failed to copy package to repo: {}", pkg.display()))?;
+                copy_with_progress(pkg, &dest, size).with_context(|| {
+                    format!("Failed to copy package to repo: {}", pkg.display())
+                })?;
             } else {
-                std::fs::copy(pkg, &dest)
-                    .with_context(|| format!("Failed to copy package to repo: {}", pkg.display()))?;
+                std::fs::copy(pkg, &dest).with_context(|| {
+                    format!("Failed to copy package to repo: {}", pkg.display())
+                })?;
             }
 
             tracing::info!(
@@ -496,7 +513,11 @@ CMD ["bash", "-c", "sudo pacman -Sy --noconfirm && makepkg -s --noconfirm --need
 
             // Try to delete original, but don't fail if we can't (permission issues with container subuids)
             if let Err(e) = std::fs::remove_file(pkg) {
-                tracing::warn!("Could not remove original package {}: {} (will be cleaned up later)", pkg.display(), e);
+                tracing::warn!(
+                    "Could not remove original package {}: {} (will be cleaned up later)",
+                    pkg.display(),
+                    e
+                );
             }
 
             repo_packages.push(dest);
@@ -544,10 +565,8 @@ CMD ["bash", "-c", "sudo pacman -Sy --noconfirm && makepkg -s --noconfirm --need
         }
 
         // Build map of filename -> checksum for new sources
-        let new_sources: HashMap<String, Option<String>> = new_srcinfo
-            .sources_with_checksums()
-            .into_iter()
-            .collect();
+        let new_sources: HashMap<String, Option<String>> =
+            new_srcinfo.sources_with_checksums().into_iter().collect();
 
         // If no old srcinfo, check if version changed and clean all
         let old_sources: HashMap<String, Option<String>> = old_srcinfo
@@ -630,7 +649,10 @@ CMD ["bash", "-c", "sudo pacman -Sy --noconfirm && makepkg -s --noconfirm --need
             return Ok(());
         }
 
-        println!("Initializing empty repository database: {}", db_path.display());
+        println!(
+            "Initializing empty repository database: {}",
+            db_path.display()
+        );
 
         // Create an empty tar.gz file as the repo database
         // repo-add will create a proper one when we add the first package
@@ -661,10 +683,7 @@ CMD ["bash", "-c", "sudo pacman -Sy --noconfirm && makepkg -s --noconfirm --need
             .repo
             .path
             .join(format!("{}.db", self.config.repo.name));
-        match std::os::unix::fs::symlink(
-            format!("{}.db.tar.gz", self.config.repo.name),
-            &db_link,
-        ) {
+        match std::os::unix::fs::symlink(format!("{}.db.tar.gz", self.config.repo.name), &db_link) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e.into()),
@@ -685,7 +704,10 @@ CMD ["bash", "-c", "sudo pacman -Sy --noconfirm && makepkg -s --noconfirm --need
             .path
             .join(format!("{}.db.tar.gz", self.config.repo.name));
 
-        println!("Adding packages to repository database: {}", db_path.display());
+        println!(
+            "Adding packages to repository database: {}",
+            db_path.display()
+        );
 
         let mut cmd = Command::new("repo-add");
         cmd.arg(&db_path);
@@ -766,9 +788,12 @@ CMD ["bash", "-c", "sudo pacman -Sy --noconfirm && makepkg -s --noconfirm --need
     pub fn list_containers(&self) -> Result<Vec<ContainerInfo>> {
         let output = Command::new("podman")
             .args([
-                "ps", "-a",
-                "--filter", "name=repoman-build-",
-                "--format", "{{.ID}}\t{{.Names}}\t{{.Status}}\t{{.CreatedAt}}",
+                "ps",
+                "-a",
+                "--filter",
+                "name=repoman-build-",
+                "--format",
+                "{{.ID}}\t{{.Names}}\t{{.Status}}\t{{.CreatedAt}}",
             ])
             .output()
             .context("Failed to list containers")?;
@@ -848,7 +873,8 @@ CMD ["bash", "-c", "sudo pacman -Sy --noconfirm && makepkg -s --noconfirm --need
         let output = Command::new("podman")
             .args([
                 "images",
-                "--format", "{{.ID}}\t{{.Repository}}\t{{.Tag}}\t{{.CreatedAt}}\t{{.Size}}",
+                "--format",
+                "{{.ID}}\t{{.Repository}}\t{{.Tag}}\t{{.CreatedAt}}\t{{.Size}}",
                 base_name,
             ])
             .output()
@@ -897,10 +923,20 @@ CMD ["bash", "-c", "sudo pacman -Sy --noconfirm && makepkg -s --noconfirm --need
         // Sort by tag (date tags sort chronologically as YYYY-MM-DD)
         // Put "latest" and non-date tags at the beginning to preserve them
         images.sort_by(|a, b| {
-            let a_is_date = a.tag.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false);
-            let b_is_date = b.tag.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false);
+            let a_is_date = a
+                .tag
+                .chars()
+                .next()
+                .map(|c| c.is_ascii_digit())
+                .unwrap_or(false);
+            let b_is_date = b
+                .tag
+                .chars()
+                .next()
+                .map(|c| c.is_ascii_digit())
+                .unwrap_or(false);
             match (a_is_date, b_is_date) {
-                (false, true) => Ordering::Less,    // non-date tags first
+                (false, true) => Ordering::Less, // non-date tags first
                 (true, false) => Ordering::Greater,
                 _ => b.tag.cmp(&a.tag), // newest dates first
             }
@@ -913,10 +949,8 @@ CMD ["bash", "-c", "sudo pacman -Sy --noconfirm && makepkg -s --noconfirm --need
         let mut kept_count = 0;
 
         for image in &images {
-            if kept_count < keep {
-                if kept_ids.insert(image.id.clone()) {
-                    kept_count += 1;
-                }
+            if kept_count < keep && kept_ids.insert(image.id.clone()) {
+                kept_count += 1;
             }
         }
 
@@ -927,9 +961,7 @@ CMD ["bash", "-c", "sudo pacman -Sy --noconfirm && makepkg -s --noconfirm --need
             }
 
             let image_ref = format!("{}:{}", image.repository, image.tag);
-            let output = Command::new("podman")
-                .args(["rmi", &image_ref])
-                .output();
+            let output = Command::new("podman").args(["rmi", &image_ref]).output();
 
             match output {
                 Ok(o) if o.status.success() => {
@@ -939,7 +971,9 @@ CMD ["bash", "-c", "sudo pacman -Sy --noconfirm && makepkg -s --noconfirm --need
                     let stderr = String::from_utf8_lossy(&o.stderr);
                     // Ignore "image is in use" errors
                     if !stderr.contains("image is being used") {
-                        result.errors.push(format!("{}: {}", image_ref, stderr.trim()));
+                        result
+                            .errors
+                            .push(format!("{}: {}", image_ref, stderr.trim()));
                     }
                 }
                 Err(e) => {
@@ -1027,4 +1061,3 @@ fn copy_with_progress(src: &Path, dest: &Path, total: u64) -> Result<()> {
 
     Ok(())
 }
-

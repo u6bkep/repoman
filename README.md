@@ -2,6 +2,8 @@
 
 An AUR (Arch User Repository) package repository manager. Repoman tracks AUR packages, provides a PKGBUILD review workflow, runs isolated builds in rootless Podman containers, and serves a web interface for management.
 
+> **Project status:** personal project under active development. The CLI and web interface are usable but APIs, schemas, and storage layouts may still shift between commits. Feedback and issues are welcome, but expect rough edges.
+
 ## Features
 
 - **PKGBUILD Review Workflow**: Review and approve changes before building
@@ -21,11 +23,23 @@ An AUR (Arch User Repository) package repository manager. Repoman tracks AUR pac
 ## Installation
 
 ```bash
+# Clone
+git clone https://github.com/u6bkep/repoman.git
+cd repoman
+
 # Build from source
 cargo build --release
 
 # Binary will be at ./target/release/repoman
 ```
+
+A `PKGBUILD` is also included for Arch users who want to install via `makepkg`.
+
+### Running in a container (work in progress)
+
+Containerized deployment lives under [`docker/`](docker/README.md). It works
+but isn't the recommended way to run repoman yet — building and running
+directly on the host is the supported path.
 
 ## Quick Start
 
@@ -259,6 +273,10 @@ repoman config show         # Show effective configuration
 repoman config path         # Find config file location
 ```
 
+## Contributing
+
+Issues and pull requests are welcome. For larger changes please open an issue first to discuss the approach, since the internals are still in flux.
+
 ## License
 
-MIT
+[MIT](LICENSE) © Ben Kepner

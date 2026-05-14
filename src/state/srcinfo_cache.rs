@@ -36,7 +36,8 @@ impl SrcInfoCache {
 
     /// Add or update a cache entry
     pub fn insert(&mut self, pkgbase: String, srcinfo: SrcInfo, commit: String) {
-        self.entries.insert(pkgbase, CachedSrcInfo { srcinfo, commit });
+        self.entries
+            .insert(pkgbase, CachedSrcInfo { srcinfo, commit });
     }
 
     /// Remove a cache entry

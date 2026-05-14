@@ -103,22 +103,23 @@ pub fn derive_status(inputs: &StatusInputs) -> DerivedStatus {
             debug_assert!(
                 build.commit == approved_commit,
                 "latest_build commit ({}) should match approved_commit ({})",
-                build.commit, approved_commit
+                build.commit,
+                approved_commit
             );
             match build.status {
-            BuildStatus::Cancelled => DerivedStatus::Approved,
-            BuildStatus::Running | BuildStatus::Pending => DerivedStatus::Building,
-            BuildStatus::Failed => DerivedStatus::Failed,
-            BuildStatus::Success => {
-                if inputs.in_repo {
-                    DerivedStatus::UpToDate
-                } else {
-                    // Built successfully but not in repo -- repo-add may have failed
-                    DerivedStatus::Approved
+                BuildStatus::Cancelled => DerivedStatus::Approved,
+                BuildStatus::Running | BuildStatus::Pending => DerivedStatus::Building,
+                BuildStatus::Failed => DerivedStatus::Failed,
+                BuildStatus::Success => {
+                    if inputs.in_repo {
+                        DerivedStatus::UpToDate
+                    } else {
+                        // Built successfully but not in repo -- repo-add may have failed
+                        DerivedStatus::Approved
+                    }
                 }
             }
         }
-        },
     }
 }
 
@@ -189,7 +190,7 @@ mod tests {
     fn test_active_build_takes_priority_over_missing_clone() {
         let inputs = StatusInputs {
             approved_commit: None,
-            head_commit: None,  // clone missing
+            head_commit: None, // clone missing
             latest_build: None,
             is_active_build: true,
             in_repo: false,

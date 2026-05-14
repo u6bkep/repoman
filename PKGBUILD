@@ -1,10 +1,10 @@
-# Maintainer: Your Name <your.email@example.com>
+# Maintainer: Ben Kepner <u6bkep@gmail.com>
 pkgname=repoman
 pkgver=0.1.0
 pkgrel=1
 pkgdesc="AUR package repository manager with containerized builds and web interface"
 arch=('x86_64')
-url="https://github.com/yourusername/repoman"
+url="https://github.com/u6bkep/repoman"
 license=('MIT')
 depends=('podman' 'git' 'pacman')
 makedepends=('cargo' 'rust')

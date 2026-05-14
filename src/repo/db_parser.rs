@@ -37,26 +37,18 @@ pub struct RepoDbContents {
 ///
 /// Supports .db.tar.zst, .db.tar.gz, .db.tar.xz, and uncompressed .db.tar
 pub fn parse_repo_db(path: &Path) -> Result<RepoDbContents> {
-    let filename = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
+    let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
 
     let file = std::fs::File::open(path)
         .with_context(|| format!("Failed to open repo database: {}", path.display()))?;
 
     // Detect compression from extension and create appropriate reader
     let reader: Box<dyn Read> = if filename.ends_with(".tar.zst") || filename.ends_with(".zst") {
-        Box::new(
-            zstd::Decoder::new(file)
-                .context("Failed to create zstd decoder")?,
-        )
+        Box::new(zstd::Decoder::new(file).context("Failed to create zstd decoder")?)
     } else if filename.ends_with(".tar.gz") || filename.ends_with(".gz") {
         Box::new(flate2::read::GzDecoder::new(file))
     } else if filename.ends_with(".tar.xz") || filename.ends_with(".xz") {
-        Box::new(
-            xz2::read::XzDecoder::new(file),
-        )
+        Box::new(xz2::read::XzDecoder::new(file))
     } else {
         // Assume uncompressed tar
         Box::new(file)
@@ -206,9 +198,7 @@ fn apply_field(entry: &mut RepoPkgEntry, field: &str, values: &[String]) {
 /// Strip version constraint from a dependency string
 /// e.g., "foo>=1.0" -> "foo", "bar" -> "bar"
 pub fn strip_version_constraint(dep: &str) -> &str {
-    dep.split(|c| c == '>' || c == '<' || c == '=' || c == ':')
-        .next()
-        .unwrap_or(dep)
+    dep.split(['>', '<', '=', ':']).next().unwrap_or(dep)
 }
 
 #[cfg(test)]

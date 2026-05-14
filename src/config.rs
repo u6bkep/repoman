@@ -119,9 +119,15 @@ impl CacheConfig {
 
         ResolvedCacheConfig {
             aur_clones: self.aur_clones.clone().unwrap_or_else(|| cache.join("aur")),
-            pacman_cache: self.pacman_cache.clone().unwrap_or_else(|| cache.join("pacman")),
+            pacman_cache: self
+                .pacman_cache
+                .clone()
+                .unwrap_or_else(|| cache.join("pacman")),
             logs: self.logs.clone().unwrap_or_else(|| data.join("logs")),
-            sources: self.sources.clone().unwrap_or_else(|| cache.join("sources")),
+            sources: self
+                .sources
+                .clone()
+                .unwrap_or_else(|| cache.join("sources")),
         }
     }
 }
@@ -153,10 +159,10 @@ impl Config {
 
         let mut builder = <Config as ConfigTrait>::builder();
 
-        if let Some(ref path) = config_path {
-            if path.exists() {
-                builder = builder.file(path);
-            }
+        if let Some(ref path) = config_path
+            && path.exists()
+        {
+            builder = builder.file(path);
         }
 
         // Add environment variable support with REPOMAN_ prefix
@@ -234,14 +240,10 @@ impl Config {
                 cache.pacman_cache.display()
             )
         })?;
-        std::fs::create_dir_all(&cache.logs).with_context(|| {
-            format!("Failed to create logs dir: {}", cache.logs.display())
-        })?;
+        std::fs::create_dir_all(&cache.logs)
+            .with_context(|| format!("Failed to create logs dir: {}", cache.logs.display()))?;
         std::fs::create_dir_all(&cache.sources).with_context(|| {
-            format!(
-                "Failed to create sources dir: {}",
-                cache.sources.display()
-            )
+            format!("Failed to create sources dir: {}", cache.sources.display())
         })?;
         Ok(())
     }
@@ -284,8 +286,8 @@ pub fn get_config_path() -> Option<PathBuf> {
 ///
 /// Uses toml_edit to preserve formatting and comments.
 pub fn update_config_repo(repo_path: &Path, repo_name: &str) -> Result<PathBuf> {
-    let config_path = get_config_path()
-        .ok_or_else(|| anyhow::anyhow!("Could not determine config path"))?;
+    let config_path =
+        get_config_path().ok_or_else(|| anyhow::anyhow!("Could not determine config path"))?;
 
     // Read existing config or create empty
     let config_str = if config_path.exists() {

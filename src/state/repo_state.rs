@@ -3,7 +3,7 @@ use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 
-use crate::repo::db_parser::{parse_repo_db, RepoPkgEntry, RepoDbContents};
+use crate::repo::db_parser::{RepoDbContents, RepoPkgEntry, parse_repo_db};
 
 /// Cached view of the repo.db.tar file.
 ///
@@ -48,10 +48,7 @@ impl RepoState {
     pub fn reload(&mut self) -> Result<()> {
         if self.db_path.exists() {
             self.contents = parse_repo_db(&self.db_path).with_context(|| {
-                format!(
-                    "Failed to parse repo database: {}",
-                    self.db_path.display()
-                )
+                format!("Failed to parse repo database: {}", self.db_path.display())
             })?;
             self.last_modified = std::fs::metadata(&self.db_path)
                 .ok()

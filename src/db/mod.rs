@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
+use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
 use std::path::Path;
 
 use crate::models::{Build, BuildStatus, InstallReason, Package};
@@ -15,8 +15,9 @@ impl Database {
     pub async fn connect(path: &Path) -> Result<Self> {
         // Ensure parent directory exists
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create database directory: {}", parent.display()))?;
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create database directory: {}", parent.display())
+            })?;
         }
 
         let url = format!("sqlite:{}?mode=rwc", path.display());
@@ -55,14 +56,14 @@ impl Database {
         // Migration: add install_reason column to existing databases
         // SQLite doesn't support ADD COLUMN IF NOT EXISTS, so we check first
         let has_column: Option<(i32,)> = sqlx::query_as(
-            "SELECT 1 FROM pragma_table_info('packages') WHERE name = 'install_reason'"
+            "SELECT 1 FROM pragma_table_info('packages') WHERE name = 'install_reason'",
         )
         .fetch_optional(&self.pool)
         .await?;
 
         if has_column.is_none() {
             sqlx::query(
-                "ALTER TABLE packages ADD COLUMN install_reason TEXT NOT NULL DEFAULT 'explicit'"
+                "ALTER TABLE packages ADD COLUMN install_reason TEXT NOT NULL DEFAULT 'explicit'",
             )
             .execute(&self.pool)
             .await?;
@@ -70,7 +71,7 @@ impl Database {
 
         // Migration: add rejection_reason column
         let has_rejection_reason: Option<(i32,)> = sqlx::query_as(
-            "SELECT 1 FROM pragma_table_info('packages') WHERE name = 'rejection_reason'"
+            "SELECT 1 FROM pragma_table_info('packages') WHERE name = 'rejection_reason'",
         )
         .fetch_optional(&self.pool)
         .await?;
@@ -83,36 +84,39 @@ impl Database {
 
         // Migration: add has_upstream column
         let has_upstream: Option<(i32,)> = sqlx::query_as(
-            "SELECT 1 FROM pragma_table_info('packages') WHERE name = 'has_upstream'"
+            "SELECT 1 FROM pragma_table_info('packages') WHERE name = 'has_upstream'",
         )
         .fetch_optional(&self.pool)
         .await?;
 
         if has_upstream.is_none() {
-            sqlx::query("ALTER TABLE packages ADD COLUMN has_upstream BOOLEAN NOT NULL DEFAULT TRUE")
-                .execute(&self.pool)
-                .await?;
+            sqlx::query(
+                "ALTER TABLE packages ADD COLUMN has_upstream BOOLEAN NOT NULL DEFAULT TRUE",
+            )
+            .execute(&self.pool)
+            .await?;
         }
 
         // Migration: add in_official_repos column
         let in_official_repos: Option<(i32,)> = sqlx::query_as(
-            "SELECT 1 FROM pragma_table_info('packages') WHERE name = 'in_official_repos'"
+            "SELECT 1 FROM pragma_table_info('packages') WHERE name = 'in_official_repos'",
         )
         .fetch_optional(&self.pool)
         .await?;
 
         if in_official_repos.is_none() {
-            sqlx::query("ALTER TABLE packages ADD COLUMN in_official_repos BOOLEAN NOT NULL DEFAULT FALSE")
-                .execute(&self.pool)
-                .await?;
+            sqlx::query(
+                "ALTER TABLE packages ADD COLUMN in_official_repos BOOLEAN NOT NULL DEFAULT FALSE",
+            )
+            .execute(&self.pool)
+            .await?;
         }
 
         // Migration: drop local_path column (path is now derived from config + pkgbase)
-        let has_local_path: Option<(i32,)> = sqlx::query_as(
-            "SELECT 1 FROM pragma_table_info('packages') WHERE name = 'local_path'"
-        )
-        .fetch_optional(&self.pool)
-        .await?;
+        let has_local_path: Option<(i32,)> =
+            sqlx::query_as("SELECT 1 FROM pragma_table_info('packages') WHERE name = 'local_path'")
+                .fetch_optional(&self.pool)
+                .await?;
 
         if has_local_path.is_some() {
             sqlx::query("ALTER TABLE packages DROP COLUMN local_path")
@@ -121,11 +125,10 @@ impl Database {
         }
 
         // Migration: drop aur_url column (URL is now derived from pkgbase)
-        let has_aur_url: Option<(i32,)> = sqlx::query_as(
-            "SELECT 1 FROM pragma_table_info('packages') WHERE name = 'aur_url'"
-        )
-        .fetch_optional(&self.pool)
-        .await?;
+        let has_aur_url: Option<(i32,)> =
+            sqlx::query_as("SELECT 1 FROM pragma_table_info('packages') WHERE name = 'aur_url'")
+                .fetch_optional(&self.pool)
+                .await?;
 
         if has_aur_url.is_some() {
             sqlx::query("ALTER TABLE packages DROP COLUMN aur_url")
@@ -194,9 +197,10 @@ impl Database {
             "rejection_reason",
         ];
         for col in &v2_drop_columns {
-            let has_col: Option<(i32,)> = sqlx::query_as(
-                &format!("SELECT 1 FROM pragma_table_info('packages') WHERE name = '{}'", col)
-            )
+            let has_col: Option<(i32,)> = sqlx::query_as(&format!(
+                "SELECT 1 FROM pragma_table_info('packages') WHERE name = '{}'",
+                col
+            ))
             .fetch_optional(&self.pool)
             .await?;
 
@@ -233,12 +237,10 @@ impl Database {
 
     /// Get a package by pkgbase
     pub async fn get_package(&self, pkgbase: &str) -> Result<Option<Package>> {
-        let row = sqlx::query_as::<_, PackageRow>(
-            "SELECT * FROM packages WHERE pkgbase = ?",
-        )
-        .bind(pkgbase)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = sqlx::query_as::<_, PackageRow>("SELECT * FROM packages WHERE pkgbase = ?")
+            .bind(pkgbase)
+            .fetch_optional(&self.pool)
+            .await?;
 
         Ok(row.map(|r| r.into()))
     }
@@ -293,14 +295,12 @@ impl Database {
         let mut tx = self.pool.begin().await?;
 
         // Update approved_commit and updated_at
-        sqlx::query(
-            "UPDATE packages SET approved_commit = ?, updated_at = ? WHERE pkgbase = ?",
-        )
-        .bind(commit)
-        .bind(&now)
-        .bind(pkgbase)
-        .execute(&mut *tx)
-        .await?;
+        sqlx::query("UPDATE packages SET approved_commit = ?, updated_at = ? WHERE pkgbase = ?")
+            .bind(commit)
+            .bind(&now)
+            .bind(pkgbase)
+            .execute(&mut *tx)
+            .await?;
 
         // Record approval
         sqlx::query(
@@ -375,7 +375,12 @@ impl Database {
     }
 
     /// List all builds across all packages with optional status filter
-    pub async fn list_all_builds(&self, limit: i32, offset: i32, status: Option<&str>) -> Result<Vec<Build>> {
+    pub async fn list_all_builds(
+        &self,
+        limit: i32,
+        offset: i32,
+        status: Option<&str>,
+    ) -> Result<Vec<Build>> {
         let rows = if let Some(status) = status {
             sqlx::query_as::<_, BuildRow>(
                 "SELECT * FROM builds WHERE status = ? ORDER BY started_at DESC LIMIT ? OFFSET ?",
@@ -477,7 +482,11 @@ impl Database {
 
     /// Get the latest build for a specific package and commit hash.
     /// Used for status derivation: determines whether the approved commit has been built.
-    pub async fn get_latest_build_for_commit(&self, pkgbase: &str, commit: &str) -> Result<Option<Build>> {
+    pub async fn get_latest_build_for_commit(
+        &self,
+        pkgbase: &str,
+        commit: &str,
+    ) -> Result<Option<Build>> {
         let row = sqlx::query_as::<_, BuildRow>(
             "SELECT * FROM builds WHERE pkgbase = ? AND git_commit = ? ORDER BY started_at DESC LIMIT 1",
         )

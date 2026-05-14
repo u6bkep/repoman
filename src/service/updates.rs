@@ -108,8 +108,7 @@ pub async fn check_updates_inner(state: &SharedState) -> Result<CheckUpdatesResu
 
     for pkg in packages {
         if building_pkgbases.contains(&pkg.pkgbase) {
-            let n =
-                checked_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let n = checked_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             crate::api::emit_event(
                 &events_tx,
                 ServerEvent::CheckUpdatesProgress {
@@ -122,8 +121,7 @@ pub async fn check_updates_inner(state: &SharedState) -> Result<CheckUpdatesResu
         }
 
         if !needs_fetch.contains(&pkg.pkgbase) {
-            let n =
-                checked_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let n = checked_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             crate::api::emit_event(
                 &events_tx,
                 ServerEvent::CheckUpdatesProgress {
@@ -156,11 +154,7 @@ pub async fn check_updates_inner(state: &SharedState) -> Result<CheckUpdatesResu
             .await
             .map_err(|e| AppError::internal(format!("Task join error: {}", e)))?
             .map_err(|e| {
-                AppError::internal(format!(
-                    "git fetch failed for {}: {}",
-                    pkgbase.clone(),
-                    e
-                ))
+                AppError::internal(format!("git fetch failed for {}: {}", pkgbase.clone(), e))
             })?;
 
             let result = if has_updates {
@@ -206,9 +200,7 @@ pub async fn check_updates_inner(state: &SharedState) -> Result<CheckUpdatesResu
                         .db
                         .approve_package(&pkgbase, &new_commit, true)
                         .await
-                        .map_err(|e| {
-                            AppError::internal(format!("DB error: {}", e))
-                        })?;
+                        .map_err(|e| AppError::internal(format!("DB error: {}", e)))?;
                     crate::api::emit_status_changed(&state, &pkgbase).await;
                 } else {
                     crate::api::emit_status_changed(&state, &pkgbase).await;
@@ -219,8 +211,7 @@ pub async fn check_updates_inner(state: &SharedState) -> Result<CheckUpdatesResu
                 None
             };
 
-            let n =
-                checked_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let n = checked_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             crate::api::emit_event(
                 &events_tx,
                 ServerEvent::CheckUpdatesProgress {
@@ -282,8 +273,7 @@ async fn check_updates_git_only(
 
     for pkg in packages {
         if building_pkgbases.contains(&pkg.pkgbase) {
-            let n =
-                checked_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let n = checked_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             crate::api::emit_event(
                 &events_tx,
                 ServerEvent::CheckUpdatesProgress {
@@ -316,11 +306,7 @@ async fn check_updates_git_only(
             .await
             .map_err(|e| AppError::internal(format!("Task join error: {}", e)))?
             .map_err(|e| {
-                AppError::internal(format!(
-                    "git fetch failed for {}: {}",
-                    pkgbase.clone(),
-                    e
-                ))
+                AppError::internal(format!("git fetch failed for {}: {}", pkgbase.clone(), e))
             })?;
 
             let result = if has_updates {
@@ -364,9 +350,7 @@ async fn check_updates_git_only(
                         .db
                         .approve_package(&pkgbase, &new_commit, true)
                         .await
-                        .map_err(|e| {
-                            AppError::internal(format!("DB error: {}", e))
-                        })?;
+                        .map_err(|e| AppError::internal(format!("DB error: {}", e)))?;
                     crate::api::emit_status_changed(&state, &pkgbase).await;
                 } else {
                     crate::api::emit_status_changed(&state, &pkgbase).await;
@@ -377,8 +361,7 @@ async fn check_updates_git_only(
                 None
             };
 
-            let n =
-                checked_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let n = checked_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             crate::api::emit_event(
                 &events_tx,
                 ServerEvent::CheckUpdatesProgress {

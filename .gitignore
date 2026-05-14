@@ -1,3 +1,25 @@
+# Build artifacts
 /target
+
+# Local dev data
 /test-repo
 /references
+/data
+
+# Databases & logs
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.log
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Claude Code local settings
+.claude/

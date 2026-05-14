@@ -14,7 +14,7 @@ use clap::{Parser, Subcommand};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, broadcast};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::aur::AurClient;
@@ -23,7 +23,7 @@ use crate::config::Config;
 use crate::db::Database;
 use crate::models::InstallReason;
 use crate::repo::RepoManager;
-use crate::service::status::{derive_status, is_orphan, DerivedStatus, StatusInputs};
+use crate::service::status::{DerivedStatus, StatusInputs, derive_status, is_orphan};
 use crate::state::{RepoState, SrcInfoCache};
 
 #[derive(Parser)]
@@ -260,15 +260,15 @@ fn find_orphans(packages: &[models::Package], cache: &SrcInfoCache) -> Vec<Strin
     // Collect all deps of explicit packages
     let mut explicit_deps = HashSet::new();
     for pkg in packages {
-        if pkg.install_reason == InstallReason::Explicit {
-            if let Some(cached) = cache.get(&pkg.pkgbase) {
-                for dep in &cached.srcinfo.depends {
+        if pkg.install_reason == InstallReason::Explicit
+            && let Some(cached) = cache.get(&pkg.pkgbase)
+        {
+            for dep in &cached.srcinfo.depends {
+                explicit_deps.insert(strip_version_constraint(dep).to_string());
+            }
+            for p in &cached.srcinfo.packages {
+                for dep in &p.depends {
                     explicit_deps.insert(strip_version_constraint(dep).to_string());
-                }
-                for p in &cached.srcinfo.packages {
-                    for dep in &p.depends {
-                        explicit_deps.insert(strip_version_constraint(dep).to_string());
-                    }
                 }
             }
         }
@@ -281,7 +281,13 @@ fn find_orphans(packages: &[models::Package], cache: &SrcInfoCache) -> Vec<Strin
         .filter(|p| {
             let pkgnames: Vec<String> = cache
                 .get(&p.pkgbase)
-                .map(|c| c.srcinfo.packages.iter().map(|p| p.pkgname.clone()).collect())
+                .map(|c| {
+                    c.srcinfo
+                        .packages
+                        .iter()
+                        .map(|p| p.pkgname.clone())
+                        .collect()
+                })
                 .unwrap_or_default();
             is_orphan(&pkgnames, &explicit_deps)
         })
@@ -454,7 +460,11 @@ async fn main() -> Result<()> {
         Some(Commands::Approve { name }) => {
             cmd_approve(&mut cli_state, &name).await?;
         }
-        Some(Commands::Build { names, all, updates }) => {
+        Some(Commands::Build {
+            names,
+            all,
+            updates,
+        }) => {
             cmd_build(&mut cli_state, names, all, updates).await?;
         }
         Some(Commands::Logs { id, follow, lines }) => {
@@ -580,21 +590,21 @@ async fn cmd_add(
         return Ok(());
     }
 
-    if let Some(pkgbase) = resolve_pkgbase_from_cache(&state.srcinfo_cache, name) {
-        if state.db.get_package(&pkgbase).await?.is_some() {
-            if json_output {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "status": "already_tracked",
-                        "pkgbase": pkgbase
-                    })
-                );
-            } else {
-                println!("Package {} already tracked (as {})", name, pkgbase);
-            }
-            return Ok(());
+    if let Some(pkgbase) = resolve_pkgbase_from_cache(&state.srcinfo_cache, name)
+        && state.db.get_package(&pkgbase).await?.is_some()
+    {
+        if json_output {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "status": "already_tracked",
+                    "pkgbase": pkgbase
+                })
+            );
+        } else {
+            println!("Package {} already tracked (as {})", name, pkgbase);
         }
+        return Ok(());
     }
 
     // Add the main package
@@ -604,7 +614,14 @@ async fn cmd_add(
         InstallReason::Explicit
     };
 
-    add_package_internal(state, name, install_reason, &mut added_packages, json_output).await?;
+    add_package_internal(
+        state,
+        name,
+        install_reason,
+        &mut added_packages,
+        json_output,
+    )
+    .await?;
 
     // If --with-deps, recursively add missing AUR dependencies
     if with_deps {
@@ -784,10 +801,10 @@ async fn add_package_internal(
     if state.db.get_package(name).await?.is_some() {
         return Ok(()); // Already tracked
     }
-    if let Some(pkgbase) = resolve_pkgbase_from_cache(&state.srcinfo_cache, name) {
-        if state.db.get_package(&pkgbase).await?.is_some() {
-            return Ok(()); // Already tracked
-        }
+    if let Some(pkgbase) = resolve_pkgbase_from_cache(&state.srcinfo_cache, name)
+        && state.db.get_package(&pkgbase).await?.is_some()
+    {
+        return Ok(()); // Already tracked
     }
 
     // Query AUR
@@ -907,15 +924,15 @@ async fn cmd_remove(
                         state.repo.delete_package_files(pkgname)?;
                     }
                 }
-                if delete_clone {
-                    if let Some(orphan_pkg) = state.db.get_package(&orphan_pkgbase).await? {
-                        let clone_path = orphan_pkg.clone_path(&aur_clones);
-                        if clone_path.exists() {
-                            std::fs::remove_dir_all(&clone_path)?;
-                        }
-                        // Also clean up cached sources
-                        state.build_system.cleanup_all_sources(&orphan_pkgbase)?;
+                if delete_clone
+                    && let Some(orphan_pkg) = state.db.get_package(&orphan_pkgbase).await?
+                {
+                    let clone_path = orphan_pkg.clone_path(&aur_clones);
+                    if clone_path.exists() {
+                        std::fs::remove_dir_all(&clone_path)?;
                     }
+                    // Also clean up cached sources
+                    state.build_system.cleanup_all_sources(&orphan_pkgbase)?;
                 }
                 state.srcinfo_cache.remove(&orphan_pkgbase);
                 state.db.delete_package(&orphan_pkgbase).await?;
@@ -1116,18 +1133,12 @@ async fn cmd_info(state: &CliState, name: &str, json_output: bool) -> Result<()>
     }
 
     println!("Package: {}", pkg.pkgbase);
-    println!(
-        "Version: {}",
-        enriched.pkgver.as_deref().unwrap_or("-")
-    );
+    println!("Version: {}", enriched.pkgver.as_deref().unwrap_or("-"));
     println!("Status: {}", enriched.status);
     println!("Install reason: {}", pkg.install_reason);
     println!("Auto-approve: {}", pkg.auto_approve);
     println!("URL: {}", pkg.aur_url());
-    println!(
-        "Clone path: {}",
-        pkg.clone_path(&aur_clones).display()
-    );
+    println!("Clone path: {}", pkg.clone_path(&aur_clones).display());
     println!(
         "Current commit: {}",
         enriched.current_commit.as_deref().unwrap_or("-")
@@ -1168,8 +1179,8 @@ async fn cmd_diff(state: &CliState, name: &str) -> Result<()> {
     aur::AurGit::ensure_cloned(&pkg.pkgbase, &clone_path)?;
 
     if let Some(ref approved) = pkg.approved_commit {
-        let current = SrcInfoCache::get_head_commit(&clone_path)?
-            .unwrap_or_else(|| "HEAD".to_string());
+        let current =
+            SrcInfoCache::get_head_commit(&clone_path)?.unwrap_or_else(|| "HEAD".to_string());
         let diff = aur::AurGit::diff(&clone_path, approved, &current)?;
 
         if diff.is_empty() {
@@ -1254,7 +1265,12 @@ async fn cmd_approve(state: &mut CliState, name: &str) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_build(state: &mut CliState, names: Vec<String>, all: bool, updates: bool) -> Result<()> {
+async fn cmd_build(
+    state: &mut CliState,
+    names: Vec<String>,
+    all: bool,
+    updates: bool,
+) -> Result<()> {
     let active_builds: HashSet<String> = HashSet::new();
     let aur_clones = state.config.resolved_cache().aur_clones.clone();
 
@@ -1363,8 +1379,7 @@ async fn cmd_build(state: &mut CliState, names: Vec<String>, all: bool, updates:
     }
 
     // Build pkgname -> pkgbase mapping from SrcInfoCache
-    let pkgbases_set: HashSet<String> =
-        valid_packages.iter().map(|p| p.pkgbase.clone()).collect();
+    let pkgbases_set: HashSet<String> = valid_packages.iter().map(|p| p.pkgbase.clone()).collect();
     let mut pkgname_to_pkgbase: HashMap<String, String> = HashMap::new();
     for pkg in &valid_packages {
         let pkgnames = state.get_pkgnames(&pkg.pkgbase);
@@ -1381,20 +1396,22 @@ async fn cmd_build(state: &mut CliState, names: Vec<String>, all: bool, updates:
             // Global deps
             for dep in &cached.srcinfo.depends {
                 let dep_name = aur::DepResolver::dep_name(dep);
-                if let Some(dep_pkgbase) = pkgname_to_pkgbase.get(dep_name) {
-                    if dep_pkgbase != &pkg.pkgbase && pkgbases_set.contains(dep_pkgbase) {
-                        pkg_deps.push(dep_pkgbase.clone());
-                    }
+                if let Some(dep_pkgbase) = pkgname_to_pkgbase.get(dep_name)
+                    && dep_pkgbase != &pkg.pkgbase
+                    && pkgbases_set.contains(dep_pkgbase)
+                {
+                    pkg_deps.push(dep_pkgbase.clone());
                 }
             }
             // Per-package deps
             for sp in &cached.srcinfo.packages {
                 for dep in &sp.depends {
                     let dep_name = aur::DepResolver::dep_name(dep);
-                    if let Some(dep_pkgbase) = pkgname_to_pkgbase.get(dep_name) {
-                        if dep_pkgbase != &pkg.pkgbase && pkgbases_set.contains(dep_pkgbase) {
-                            pkg_deps.push(dep_pkgbase.clone());
-                        }
+                    if let Some(dep_pkgbase) = pkgname_to_pkgbase.get(dep_name)
+                        && dep_pkgbase != &pkg.pkgbase
+                        && pkgbases_set.contains(dep_pkgbase)
+                    {
+                        pkg_deps.push(dep_pkgbase.clone());
                     }
                 }
             }
@@ -1495,13 +1512,14 @@ fn topological_sort_cli(
         processed.insert(node.clone());
 
         for other in nodes {
-            if let Some(other_deps) = deps.get(other) {
-                if other_deps.contains(&node) && !processed.contains(other) {
-                    let degree = in_degree.get_mut(other).unwrap();
-                    *degree -= 1;
-                    if *degree == 0 {
-                        queue.push_back(other.clone());
-                    }
+            if let Some(other_deps) = deps.get(other)
+                && other_deps.contains(&node)
+                && !processed.contains(other)
+            {
+                let degree = in_degree.get_mut(other).unwrap();
+                *degree -= 1;
+                if *degree == 0 {
+                    queue.push_back(other.clone());
                 }
             }
         }
@@ -1574,10 +1592,7 @@ async fn cmd_build_single(state: &mut CliState, name: &str) -> Result<()> {
                     for pkg_path in &repo_packages {
                         println!(
                             "  - {}",
-                            pkg_path
-                                .file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy()
+                            pkg_path.file_name().unwrap_or_default().to_string_lossy()
                         );
                     }
                     Ok(())
@@ -2184,9 +2199,7 @@ async fn cmd_import(
                         .srcinfo_opt
                         .as_ref()
                         .map(|s| s.full_version())
-                        .or_else(|| {
-                            imp.pkg_entries.first().map(|e| e.version.clone())
-                        });
+                        .or_else(|| imp.pkg_entries.first().map(|e| e.version.clone()));
                     let pkgnames: Vec<&str> = imp
                         .srcinfo_opt
                         .as_ref()
@@ -2343,11 +2356,7 @@ async fn cmd_import(
                     .as_ref()
                     .map(|s| s.full_version())
                     .or_else(|| imp.pkg_entries.first().map(|e| e.version.clone()));
-                println!(
-                    "  {} {}",
-                    imp.pkg.pkgbase,
-                    pkgver.as_deref().unwrap_or("-")
-                );
+                println!("  {} {}", imp.pkg.pkgbase, pkgver.as_deref().unwrap_or("-"));
             }
         }
 
@@ -2364,11 +2373,7 @@ async fn cmd_import(
                     .as_ref()
                     .map(|s| s.full_version())
                     .or_else(|| imp.pkg_entries.first().map(|e| e.version.clone()));
-                println!(
-                    "  {} {}",
-                    imp.pkg.pkgbase,
-                    pkgver.as_deref().unwrap_or("-")
-                );
+                println!("  {} {}", imp.pkg.pkgbase, pkgver.as_deref().unwrap_or("-"));
             }
         }
     }
@@ -2444,10 +2449,10 @@ fn check_official_repos(pkgnames: &[String]) -> HashSet<String> {
             .args(["-Si", pkgname])
             .output();
 
-        if let Ok(output) = output {
-            if output.status.success() {
-                in_official.insert(pkgname.clone());
-            }
+        if let Ok(output) = output
+            && output.status.success()
+        {
+            in_official.insert(pkgname.clone());
         }
     }
 
@@ -2477,7 +2482,10 @@ fn infer_install_reasons_v2(packages: &mut [ImportedPackage]) {
     // Mark packages as in_official_repos if any of their pkgnames are in official repos
     for imp in packages.iter_mut() {
         if !imp.has_upstream {
-            let is_in_official = imp.pkg_entries.iter().any(|e| in_official.contains(&e.name));
+            let is_in_official = imp
+                .pkg_entries
+                .iter()
+                .any(|e| in_official.contains(&e.name));
             imp.in_official_repos = is_in_official;
         }
     }
@@ -2501,13 +2509,13 @@ fn infer_install_reasons_v2(packages: &mut [ImportedPackage]) {
         for entry in &imp.pkg_entries {
             for dep in &entry.depends {
                 let dep_name = strip_version_constraint(dep);
-                if let Some(dep_pkgbase) = pkgname_to_pkgbase.get(dep_name) {
-                    if *dep_pkgbase != imp.pkg.pkgbase {
-                        reverse_deps
-                            .entry(dep_pkgbase.clone())
-                            .or_default()
-                            .insert(imp.pkg.pkgbase.clone());
-                    }
+                if let Some(dep_pkgbase) = pkgname_to_pkgbase.get(dep_name)
+                    && *dep_pkgbase != imp.pkg.pkgbase
+                {
+                    reverse_deps
+                        .entry(dep_pkgbase.clone())
+                        .or_default()
+                        .insert(imp.pkg.pkgbase.clone());
                 }
             }
         }
@@ -2533,11 +2541,7 @@ fn infer_install_reasons_v2(packages: &mut [ImportedPackage]) {
                 .last()
                 .map(|c| c.is_ascii_digit())
                 .unwrap_or(false)
-                && pkgbase
-                    .chars()
-                    .filter(|c| c.is_ascii_digit())
-                    .count()
-                    >= 2;
+                && pkgbase.chars().filter(|c| c.is_ascii_digit()).count() >= 2;
 
         if looks_like_compat && !imp.has_upstream {
             imp.pkg.install_reason = InstallReason::Dependency;

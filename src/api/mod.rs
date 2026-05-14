@@ -1,28 +1,28 @@
 use axum::{
+    Json, Router,
     extract::{
-        ws::{CloseFrame, Message, WebSocket},
         Path, Query, State, WebSocketUpgrade,
+        ws::{CloseFrame, Message, WebSocket},
     },
     http::StatusCode,
     response::{
-        sse::{Event as SseEvent, KeepAlive, Sse},
         IntoResponse,
+        sse::{Event as SseEvent, KeepAlive, Sse},
     },
     routing::{delete, get, post},
-    Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncSeekExt};
-use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::BroadcastStream;
 
 use crate::aur::{AurClient, AurGit, DepResolver, read_srcinfo};
-use crate::build::{vercmp, BuildSystem};
+use crate::build::{BuildSystem, vercmp};
 use crate::models::{BuildStage, InstallReason, Package};
-use crate::service::status::{derive_status, DerivedStatus, StatusInputs};
+use crate::service::status::{DerivedStatus, StatusInputs, derive_status};
 pub use crate::state::{AppState, SharedState, SrcInfoCache};
 
 /// Server-sent event for real-time status updates
@@ -64,7 +64,9 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/packages", get(list_packages).post(add_package))
         .route(
             "/api/packages/{pkgbase}",
-            get(get_package).delete(remove_package).patch(update_package),
+            get(get_package)
+                .delete(remove_package)
+                .patch(update_package),
         )
         .route("/api/packages/{pkgbase}/pkgbuild", get(get_pkgbuild))
         .route("/api/packages/{pkgbase}/diff", get(get_diff))
@@ -149,7 +151,10 @@ pub async fn emit_status_changed(state: &AppState, pkgbase: &str) {
         _ => return, // Package may have been deleted or DB error
     };
     let resp = assemble_package_response(state, &pkg).await;
-    emit_event(&state.events, ServerEvent::PackageStatusChanged { package: resp });
+    emit_event(
+        &state.events,
+        ServerEvent::PackageStatusChanged { package: resp },
+    );
 }
 
 // ==================== Request/Response types ====================
@@ -456,7 +461,13 @@ impl AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
-        (self.status, Json(ErrorResponse { error: self.message })).into_response()
+        (
+            self.status,
+            Json(ErrorResponse {
+                error: self.message,
+            }),
+        )
+            .into_response()
     }
 }
 
@@ -584,7 +595,10 @@ pub async fn assemble_package_response(state: &AppState, pkg: &Package) -> Packa
 }
 
 /// Build a BuildDetailResponse with current_stage and parsed outputs.
-async fn build_detail_response(state: &AppState, build: crate::models::Build) -> BuildDetailResponse {
+async fn build_detail_response(
+    state: &AppState,
+    build: crate::models::Build,
+) -> BuildDetailResponse {
     let current_stage = if build.status == crate::models::BuildStatus::Running
         || build.status == crate::models::BuildStatus::Pending
     {
@@ -595,9 +609,10 @@ async fn build_detail_response(state: &AppState, build: crate::models::Build) ->
     };
 
     // Parse outputs from JSON string into real array
-    let outputs = build.outputs.as_ref().and_then(|s| {
-        serde_json::from_str::<Vec<String>>(s).ok()
-    });
+    let outputs = build
+        .outputs
+        .as_ref()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok());
 
     BuildDetailResponse {
         id: build.id,
@@ -742,12 +757,11 @@ async fn add_package(
                             .await
                     {
                         for m in dep_missing {
-                            if m.in_aur {
-                                if let Some(pb) = &m.pkgbase {
-                                    if !processed.contains(pb) {
-                                        to_check.push((pb.clone(), m.name.clone()));
-                                    }
-                                }
+                            if m.in_aur
+                                && let Some(pb) = &m.pkgbase
+                                && !processed.contains(pb)
+                            {
+                                to_check.push((pb.clone(), m.name.clone()));
                             }
                         }
                     }
@@ -820,7 +834,13 @@ async fn remove_package(
     let cache = state.srcinfo_cache.read().await;
     let pkgnames_set: HashSet<String> = cache
         .get(&pkg.pkgbase)
-        .map(|c| c.srcinfo.packages.iter().map(|p| p.pkgname.clone()).collect())
+        .map(|c| {
+            c.srcinfo
+                .packages
+                .iter()
+                .map(|p| p.pkgname.clone())
+                .collect()
+        })
         .unwrap_or_default();
 
     let all_packages = state.db.list_packages().await?;
@@ -901,7 +921,13 @@ async fn do_remove(
         let cache = state.srcinfo_cache.read().await;
         let pkgnames: Vec<String> = cache
             .get(pkgbase)
-            .map(|c| c.srcinfo.packages.iter().map(|p| p.pkgname.clone()).collect())
+            .map(|c| {
+                c.srcinfo
+                    .packages
+                    .iter()
+                    .map(|p| p.pkgname.clone())
+                    .collect()
+            })
             .unwrap_or_default();
         drop(cache);
 
@@ -953,10 +979,10 @@ async fn get_pkgbuild(
     let mut files = Vec::new();
     for entry in std::fs::read_dir(&clone_path)? {
         let entry = entry?;
-        if let Some(name) = entry.file_name().to_str() {
-            if !name.starts_with('.') || name == ".SRCINFO" {
-                files.push(name.to_string());
-            }
+        if let Some(name) = entry.file_name().to_str()
+            && (!name.starts_with('.') || name == ".SRCINFO")
+        {
+            files.push(name.to_string());
         }
     }
 
@@ -1019,9 +1045,7 @@ async fn approve_package(
     } else {
         // Use HEAD commit from cache or disk
         let cache = state.srcinfo_cache.read().await;
-        let head = cache
-            .get(&pkg.pkgbase)
-            .map(|c| c.commit.clone());
+        let head = cache.get(&pkg.pkgbase).map(|c| c.commit.clone());
         drop(cache);
 
         match head {
@@ -1060,7 +1084,10 @@ async fn approve_and_build_updates(
                 drop(cache);
 
                 if let Some(commit) = head {
-                    state.db.approve_package(&pkg.pkgbase, &commit, false).await?;
+                    state
+                        .db
+                        .approve_package(&pkg.pkgbase, &commit, false)
+                        .await?;
                     emit_status_changed(&state, &pkg.pkgbase).await;
                     approved_pkgbases.push(pkg.pkgbase.clone());
                     buildable_pkgbases.push(pkg.pkgbase.clone());
@@ -1116,7 +1143,10 @@ async fn check_and_build(
                 drop(cache);
 
                 if let Some(commit) = head {
-                    state.db.approve_package(&pkg.pkgbase, &commit, false).await?;
+                    state
+                        .db
+                        .approve_package(&pkg.pkgbase, &commit, false)
+                        .await?;
                     emit_status_changed(&state, &pkg.pkgbase).await;
                     approved_pkgbases.push(pkg.pkgbase.clone());
                 }
@@ -1192,7 +1222,9 @@ async fn trigger_build(
 
     // Use the approved commit for the build record — we verified status is Approved,
     // so approved_commit must match HEAD.
-    let commit = pkg.approved_commit.clone()
+    let commit = pkg
+        .approved_commit
+        .clone()
         .ok_or_else(|| AppError::bad_request("Package has no approved commit"))?;
 
     let build_id = uuid::Uuid::new_v4().to_string();
@@ -1381,10 +1413,10 @@ async fn build_deps_response(
             .args(["-Si", name])
             .output();
 
-        if let Ok(output) = pacman_check {
-            if output.status.success() {
-                return ("official".to_string(), in_repo);
-            }
+        if let Ok(output) = pacman_check
+            && output.status.success()
+        {
+            return ("official".to_string(), in_repo);
         }
 
         if let Ok(Some(_)) = aur.info_single(name).await {
@@ -1398,10 +1430,11 @@ async fn build_deps_response(
             .args(["-Ss", &format!("^{}$", name)])
             .output();
 
-        if let Ok(output) = pacman_search {
-            if output.status.success() && !output.stdout.is_empty() {
-                return ("official".to_string(), in_repo);
-            }
+        if let Ok(output) = pacman_search
+            && output.status.success()
+            && !output.stdout.is_empty()
+        {
+            return ("official".to_string(), in_repo);
         }
 
         ("unknown".to_string(), in_repo)
@@ -1627,9 +1660,7 @@ async fn stream_build_logs(
     let build_id = build.id;
     let pkgbase = build.pkgbase;
 
-    Ok(ws.on_upgrade(move |socket| {
-        handle_log_stream(socket, state, build_id, pkgbase, log_path)
-    }))
+    Ok(ws.on_upgrade(move |socket| handle_log_stream(socket, state, build_id, pkgbase, log_path)))
 }
 
 #[derive(Serialize)]
@@ -1665,10 +1696,10 @@ async fn handle_log_stream(
     // Send the current stage if build is already in progress
     {
         let stages = state.build_stages.read().await;
-        if let Some(&stage) = stages.get(&build_id) {
-            if send_stage_change(&mut socket, stage).await {
-                last_sent_stage = Some(stage);
-            }
+        if let Some(&stage) = stages.get(&build_id)
+            && send_stage_change(&mut socket, stage).await
+        {
+            last_sent_stage = Some(stage);
         }
     }
 
@@ -1713,10 +1744,10 @@ async fn handle_log_stream(
                         )
                         .await;
 
-                        if last_sent_stage != Some(new_stage) {
-                            if send_stage_change(&mut socket, new_stage).await {
-                                last_sent_stage = Some(new_stage);
-                            }
+                        if last_sent_stage != Some(new_stage)
+                            && send_stage_change(&mut socket, new_stage).await
+                        {
+                            last_sent_stage = Some(new_stage);
                         }
                     }
 
@@ -1725,18 +1756,13 @@ async fn handle_log_stream(
                         .await
                         .is_err()
                     {
-                        tracing::info!(
-                            "WebSocket client disconnected for build {}",
-                            build_id
-                        );
+                        tracing::info!("WebSocket client disconnected for build {}", build_id);
                         return;
                     }
                 }
                 Err(e) => {
                     let _ = socket
-                        .send(Message::Text(
-                            format!("[Error reading log: {}]", e).into(),
-                        ))
+                        .send(Message::Text(format!("[Error reading log: {}]", e).into()))
                         .await;
                     break;
                 }
@@ -1760,12 +1786,11 @@ async fn handle_log_stream(
             (status, stage)
         };
 
-        if let Some(stage) = current_stage {
-            if last_sent_stage != Some(stage) {
-                if send_stage_change(&mut socket, stage).await {
-                    last_sent_stage = Some(stage);
-                }
-            }
+        if let Some(stage) = current_stage
+            && last_sent_stage != Some(stage)
+            && send_stage_change(&mut socket, stage).await
+        {
+            last_sent_stage = Some(stage);
         }
 
         match build_status {
@@ -1791,12 +1816,11 @@ async fn handle_log_stream(
                     match reader.read_line(&mut line_buf).await {
                         Ok(0) => break,
                         Ok(_) => {
-                            if let Some(new_stage) = BuildStage::from_log_line(&line_buf) {
-                                if last_sent_stage != Some(new_stage) {
-                                    if send_stage_change(&mut socket, new_stage).await {
-                                        last_sent_stage = Some(new_stage);
-                                    }
-                                }
+                            if let Some(new_stage) = BuildStage::from_log_line(&line_buf)
+                                && last_sent_stage != Some(new_stage)
+                                && send_stage_change(&mut socket, new_stage).await
+                            {
+                                last_sent_stage = Some(new_stage);
                             }
                             let _ = socket.send(Message::Text(line_buf.clone().into())).await;
                         }
@@ -1831,12 +1855,7 @@ async fn handle_log_stream(
             }
         }
 
-        match tokio::time::timeout(
-            tokio::time::Duration::from_millis(10),
-            socket.recv(),
-        )
-        .await
-        {
+        match tokio::time::timeout(tokio::time::Duration::from_millis(10), socket.recv()).await {
             Ok(Some(Ok(Message::Close(_)))) => {
                 tracing::info!("WebSocket close requested for build {}", build_id);
                 break;
@@ -1913,8 +1932,7 @@ async fn queue_builds_inner(
                     drop(cache);
 
                     if !has_commit {
-                        let clone_dir =
-                            pkg.clone_path(&state.config.resolved_cache().aur_clones);
+                        let clone_dir = pkg.clone_path(&state.config.resolved_cache().aur_clones);
                         if SrcInfoCache::get_head_commit(&clone_dir)
                             .ok()
                             .flatten()
@@ -1982,20 +2000,22 @@ async fn queue_builds_inner(
                 .chain(cached.srcinfo.checkdepends.iter())
             {
                 let dep_name = DepResolver::dep_name(dep);
-                if let Some(dep_pkgbase) = pkgname_to_pkgbase.get(dep_name) {
-                    if dep_pkgbase != &pkg.pkgbase && pkgbases_set.contains(dep_pkgbase) {
-                        pkg_deps.push(dep_pkgbase.clone());
-                    }
+                if let Some(dep_pkgbase) = pkgname_to_pkgbase.get(dep_name)
+                    && dep_pkgbase != &pkg.pkgbase
+                    && pkgbases_set.contains(dep_pkgbase)
+                {
+                    pkg_deps.push(dep_pkgbase.clone());
                 }
             }
             // Per-package deps
             for sp in &cached.srcinfo.packages {
                 for dep in &sp.depends {
                     let dep_name = DepResolver::dep_name(dep);
-                    if let Some(dep_pkgbase) = pkgname_to_pkgbase.get(dep_name) {
-                        if dep_pkgbase != &pkg.pkgbase && pkgbases_set.contains(dep_pkgbase) {
-                            pkg_deps.push(dep_pkgbase.clone());
-                        }
+                    if let Some(dep_pkgbase) = pkgname_to_pkgbase.get(dep_name)
+                        && dep_pkgbase != &pkg.pkgbase
+                        && pkgbases_set.contains(dep_pkgbase)
+                    {
+                        pkg_deps.push(dep_pkgbase.clone());
                     }
                 }
             }
@@ -2173,7 +2193,13 @@ async fn remove_from_repo(
     let cache = state.srcinfo_cache.read().await;
     let pkgnames: Vec<String> = cache
         .get(&pkg.pkgbase)
-        .map(|c| c.srcinfo.packages.iter().map(|p| p.pkgname.clone()).collect())
+        .map(|c| {
+            c.srcinfo
+                .packages
+                .iter()
+                .map(|p| p.pkgname.clone())
+                .collect()
+        })
         .unwrap_or_default();
     drop(cache);
 
@@ -2239,14 +2265,15 @@ async fn system_status(
         }
     }
 
-    let pacman_cache =
-        calculate_pacman_cache_stats(&state.config.resolved_cache().pacman_cache);
-    let source_cache =
-        calculate_source_cache_stats(&state.config.resolved_cache().sources);
+    let pacman_cache = calculate_pacman_cache_stats(&state.config.resolved_cache().pacman_cache);
+    let source_cache = calculate_source_cache_stats(&state.config.resolved_cache().sources);
 
-    let known_log_files = state.db.list_build_log_filenames().await.unwrap_or_default();
-    let orphaned_data =
-        detect_orphaned_data(&state.config, &tracked_pkgbases, &known_log_files);
+    let known_log_files = state
+        .db
+        .list_build_log_filenames()
+        .await
+        .unwrap_or_default();
+    let orphaned_data = detect_orphaned_data(&state.config, &tracked_pkgbases, &known_log_files);
 
     Ok(Json(SystemStatusResponse {
         podman,
@@ -2275,12 +2302,12 @@ fn calculate_pacman_cache_stats(cache_path: &std::path::Path) -> Option<PacmanCa
     if let Ok(entries) = std::fs::read_dir(cache_path) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.ends_with(".pkg.tar.zst") || name.ends_with(".pkg.tar.xz") {
-                    package_count += 1;
-                    if let Ok(meta) = entry.metadata() {
-                        total_size += meta.len();
-                    }
+            if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && (name.ends_with(".pkg.tar.zst") || name.ends_with(".pkg.tar.xz"))
+            {
+                package_count += 1;
+                if let Ok(meta) = entry.metadata() {
+                    total_size += meta.len();
                 }
             }
         }
@@ -2375,10 +2402,7 @@ fn clean_pacman_cache(cache_path: &std::path::Path, keep: usize) -> CleanCacheRe
         for entry in entries.flatten() {
             let path = entry.path();
             if let Some((pkgname, version)) = parse_pacman_pkg_filename(&path) {
-                by_name
-                    .entry(pkgname)
-                    .or_default()
-                    .push((path, version));
+                by_name.entry(pkgname).or_default().push((path, version));
             }
         }
     }
@@ -2413,28 +2437,28 @@ async fn clean_sources(
     let mut cleaned_count = 0u32;
     let mut cleaned_size = 0u64;
 
-    if sources_path.exists() {
-        if let Ok(entries) = std::fs::read_dir(sources_path) {
-            for entry in entries.flatten() {
-                if entry.path().is_dir() {
-                    if let Ok(files) = std::fs::read_dir(entry.path()) {
-                        for file in files.flatten() {
-                            if let Ok(meta) = file.metadata() {
-                                cleaned_size += meta.len();
-                            }
+    if sources_path.exists()
+        && let Ok(entries) = std::fs::read_dir(sources_path)
+    {
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                if let Ok(files) = std::fs::read_dir(entry.path()) {
+                    for file in files.flatten() {
+                        if let Ok(meta) = file.metadata() {
+                            cleaned_size += meta.len();
                         }
                     }
-                    let path_str = entry.path().to_string_lossy().to_string();
-                    let status = std::process::Command::new("podman")
-                        .args(["unshare", "rm", "-rf", &path_str])
-                        .status();
+                }
+                let path_str = entry.path().to_string_lossy().to_string();
+                let status = std::process::Command::new("podman")
+                    .args(["unshare", "rm", "-rf", &path_str])
+                    .status();
 
-                    match status {
-                        Ok(s) if s.success() => cleaned_count += 1,
-                        _ => {
-                            if std::fs::remove_dir_all(entry.path()).is_ok() {
-                                cleaned_count += 1;
-                            }
+                match status {
+                    Ok(s) if s.success() => cleaned_count += 1,
+                    _ => {
+                        if std::fs::remove_dir_all(entry.path()).is_ok() {
+                            cleaned_count += 1;
                         }
                     }
                 }
@@ -2469,26 +2493,24 @@ fn detect_orphaned_data(
 
     if let Ok(entries) = std::fs::read_dir(&config.resolved_cache().aur_clones) {
         for entry in entries.flatten() {
-            if entry.path().is_dir() {
-                if let Some(name) = entry.file_name().to_str() {
-                    if !tracked_pkgbases.contains(name) {
-                        orphaned.total_size += dir_size(&entry.path());
-                        orphaned.clones.push(name.to_string());
-                    }
-                }
+            if entry.path().is_dir()
+                && let Some(name) = entry.file_name().to_str()
+                && !tracked_pkgbases.contains(name)
+            {
+                orphaned.total_size += dir_size(&entry.path());
+                orphaned.clones.push(name.to_string());
             }
         }
     }
 
     if let Ok(entries) = std::fs::read_dir(&config.resolved_cache().sources) {
         for entry in entries.flatten() {
-            if entry.path().is_dir() {
-                if let Some(name) = entry.file_name().to_str() {
-                    if !tracked_pkgbases.contains(name) {
-                        orphaned.total_size += dir_size(&entry.path());
-                        orphaned.sources.push(name.to_string());
-                    }
-                }
+            if entry.path().is_dir()
+                && let Some(name) = entry.file_name().to_str()
+                && !tracked_pkgbases.contains(name)
+            {
+                orphaned.total_size += dir_size(&entry.path());
+                orphaned.sources.push(name.to_string());
             }
         }
     }
@@ -2543,7 +2565,11 @@ async fn clean_orphans(
     let packages = state.db.list_packages().await?;
     let tracked_pkgbases: HashSet<String> = packages.iter().map(|p| p.pkgbase.clone()).collect();
 
-    let known_log_files = state.db.list_build_log_filenames().await.unwrap_or_default();
+    let known_log_files = state
+        .db
+        .list_build_log_filenames()
+        .await
+        .unwrap_or_default();
     let orphaned = detect_orphaned_data(&state.config, &tracked_pkgbases, &known_log_files);
 
     let mut cleaned = CleanOrphansResponse {

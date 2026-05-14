@@ -10,16 +10,16 @@ pub async fn static_handler(uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
 
     // Try exact file match first
-    if !path.is_empty() {
-        if let Some(file) = StaticAssets::get(path) {
-            let mime_type = file.metadata.mimetype();
-            return (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, mime_type)],
-                file.data,
-            )
-                .into_response();
-        }
+    if !path.is_empty()
+        && let Some(file) = StaticAssets::get(path)
+    {
+        let mime_type = file.metadata.mimetype();
+        return (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, mime_type)],
+            file.data,
+        )
+            .into_response();
     }
 
     // SPA fallback: serve index.html for unmatched routes

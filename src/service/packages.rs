@@ -27,10 +27,10 @@ pub async fn resolve_package(state: &AppState, name: &str) -> Result<Package, Ap
     }
 
     // Try by pkgname via srcinfo cache
-    if let Some(pkgbase) = resolve_pkgbase(state, name).await {
-        if let Some(pkg) = state.db.get_package(&pkgbase).await? {
-            return Ok(pkg);
-        }
+    if let Some(pkgbase) = resolve_pkgbase(state, name).await
+        && let Some(pkg) = state.db.get_package(&pkgbase).await?
+    {
+        return Ok(pkg);
     }
 
     Err(AppError::not_found("Package not found"))
@@ -77,15 +77,15 @@ pub async fn add_package_single(
     }
 
     // Try by pkgname
-    if let Some(pkgbase) = resolve_pkgbase(state, name).await {
-        if let Some(pkg) = state.db.get_package(&pkgbase).await? {
-            let cache = state.srcinfo_cache.read().await;
-            let version = cache
-                .get(&pkg.pkgbase)
-                .map(|c| c.srcinfo.full_version())
-                .unwrap_or_default();
-            return Ok(AddPackageResult { pkg, version });
-        }
+    if let Some(pkgbase) = resolve_pkgbase(state, name).await
+        && let Some(pkg) = state.db.get_package(&pkgbase).await?
+    {
+        let cache = state.srcinfo_cache.read().await;
+        let version = cache
+            .get(&pkg.pkgbase)
+            .map(|c| c.srcinfo.full_version())
+            .unwrap_or_default();
+        return Ok(AddPackageResult { pkg, version });
     }
 
     // Query AUR
@@ -212,23 +212,23 @@ pub async fn list_orphans(state: &AppState) -> Result<Vec<Package>, AppError> {
     // Collect all dep names of explicitly installed packages
     let mut explicit_deps: HashSet<String> = HashSet::new();
     for pkg in &packages {
-        if pkg.install_reason == InstallReason::Explicit {
-            if let Some(cached) = cache.get(&pkg.pkgbase) {
-                // Global deps
-                for dep in &cached.srcinfo.depends {
+        if pkg.install_reason == InstallReason::Explicit
+            && let Some(cached) = cache.get(&pkg.pkgbase)
+        {
+            // Global deps
+            for dep in &cached.srcinfo.depends {
+                explicit_deps.insert(DepResolver::dep_name(dep).to_string());
+            }
+            for dep in &cached.srcinfo.makedepends {
+                explicit_deps.insert(DepResolver::dep_name(dep).to_string());
+            }
+            for dep in &cached.srcinfo.checkdepends {
+                explicit_deps.insert(DepResolver::dep_name(dep).to_string());
+            }
+            // Per-package deps
+            for sp in &cached.srcinfo.packages {
+                for dep in &sp.depends {
                     explicit_deps.insert(DepResolver::dep_name(dep).to_string());
-                }
-                for dep in &cached.srcinfo.makedepends {
-                    explicit_deps.insert(DepResolver::dep_name(dep).to_string());
-                }
-                for dep in &cached.srcinfo.checkdepends {
-                    explicit_deps.insert(DepResolver::dep_name(dep).to_string());
-                }
-                // Per-package deps
-                for sp in &cached.srcinfo.packages {
-                    for dep in &sp.depends {
-                        explicit_deps.insert(DepResolver::dep_name(dep).to_string());
-                    }
                 }
             }
         }

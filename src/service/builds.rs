@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::api::{AppError, ServerEvent};
 use crate::aur::AurGit;
@@ -51,12 +51,7 @@ pub async fn clear_active_build(state: &SharedState, pkgbase: &str, build_id: &s
 }
 
 /// Helper to update build and package status on failure.
-pub async fn update_build_failed(
-    state: &SharedState,
-    build_id: &str,
-    pkgbase: &str,
-    error: &str,
-) {
+pub async fn update_build_failed(state: &SharedState, build_id: &str, pkgbase: &str, error: &str) {
     tracing::error!("Build {} failed: {}", build_id, error);
     if let Err(e) = state
         .db
@@ -209,7 +204,8 @@ pub async fn run_build_task(
                         .filter_map(|p| p.file_name())
                         .map(|n| n.to_string_lossy().to_string())
                         .collect();
-                    let outputs_json = serde_json::to_string(&outputs).unwrap_or_else(|_| "[]".to_string());
+                    let outputs_json =
+                        serde_json::to_string(&outputs).unwrap_or_else(|_| "[]".to_string());
 
                     set_build_stage(&state, &build_id, &pkgbase, BuildStage::Complete).await;
 
@@ -234,7 +230,10 @@ pub async fn run_build_task(
                                 e
                             );
                         }
-                        if let Err(e) = state.db.update_build_outputs(&build_id, &outputs_json).await
+                        if let Err(e) = state
+                            .db
+                            .update_build_outputs(&build_id, &outputs_json)
+                            .await
                         {
                             tracing::error!("Failed to update build {} outputs: {}", build_id, e);
                         }
@@ -339,13 +338,14 @@ pub fn topological_sort(
         processed.insert(node.clone());
 
         for other in nodes {
-            if let Some(other_deps) = deps.get(other) {
-                if other_deps.contains(&node) && !processed.contains(other) {
-                    let degree = in_degree.get_mut(other).unwrap();
-                    *degree -= 1;
-                    if *degree == 0 {
-                        queue.push_back(other.clone());
-                    }
+            if let Some(other_deps) = deps.get(other)
+                && other_deps.contains(&node)
+                && !processed.contains(other)
+            {
+                let degree = in_degree.get_mut(other).unwrap();
+                *degree -= 1;
+                if *degree == 0 {
+                    queue.push_back(other.clone());
                 }
             }
         }
@@ -381,11 +381,7 @@ pub async fn run_queued_builds(
 
             let _ = state
                 .db
-                .update_build_status(
-                    build_id,
-                    BuildStatus::Cancelled,
-                    Some("Queue cancelled"),
-                )
+                .update_build_status(build_id, BuildStatus::Cancelled, Some("Queue cancelled"))
                 .await;
             // V2: No update_package_status
             emit_event(
@@ -510,10 +506,7 @@ pub async fn run_queued_builds(
                     .update_build_status(
                         build_id,
                         BuildStatus::Failed,
-                        Some(&format!(
-                            "Clone missing and re-clone failed: {}",
-                            err_msg
-                        )),
+                        Some(&format!("Clone missing and re-clone failed: {}", err_msg)),
                     )
                     .await;
                 // V2: No update_package_status
@@ -571,8 +564,7 @@ pub async fn run_queued_builds(
                             .filter_map(|p| p.file_name())
                             .map(|n| n.to_string_lossy().to_string())
                             .collect();
-                        let outputs_json =
-                            serde_json::to_string(&outputs).unwrap_or_default();
+                        let outputs_json = serde_json::to_string(&outputs).unwrap_or_default();
 
                         set_build_stage(&state, build_id, pkgbase, BuildStage::Complete).await;
 
@@ -589,10 +581,7 @@ pub async fn run_queued_builds(
                                 .db
                                 .update_build_status(build_id, BuildStatus::Success, None)
                                 .await;
-                            let _ = state
-                                .db
-                                .update_build_outputs(build_id, &outputs_json)
-                                .await;
+                            let _ = state.db.update_build_outputs(build_id, &outputs_json).await;
                             // V2: No update_package_status
 
                             // Reload RepoState

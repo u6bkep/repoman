@@ -1,0 +1,28 @@
+# NOTE: Containerized deployment is a work in progress and is not the
+# recommended way to run repoman right now. See docker/README.md.
+#
+# Volumes default to ./data/ in the project root. Override with a .env file
+# or by editing the paths below to point at your own storage.
+
+services:
+  repoman:
+    build:
+      context: ..
+      dockerfile: docker/Containerfile
+    ports:
+      - "8088:8080"
+    userns_mode: keep-id
+    security_opt:
+      - label=disable
+      - seccomp=unconfined
+    devices:
+      - /dev/fuse
+    volumes:
+      - ../data/repoman:/data
+      - ../data/repo:/srv/repo/aur
+      - ../data/cache/aur-clones:/var/cache/repoman/aur
+      - ../data/cache/pacman:/var/cache/repoman/pacman
+      - ../data/cache/sources:/var/cache/repoman/sources
+      - ../data/logs:/var/log/repoman
+      - ../data/podman-storage:/home/repoman/.local/share/containers
+    restart: unless-stopped

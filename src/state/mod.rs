@@ -6,9 +6,9 @@ pub use repo_state::RepoState;
 pub use srcinfo_cache::SrcInfoCache;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use tokio::sync::{broadcast, Mutex, RwLock};
+use std::sync::atomic::AtomicBool;
+use tokio::sync::{Mutex, RwLock, broadcast};
 
 use crate::api::ServerEvent;
 use crate::aur::AurClient;
