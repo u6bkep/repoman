@@ -34,16 +34,20 @@ must use `SigLevel = Optional` for the repoman repos.
 ## Worker (build host)
 
 The executor needs mounts, namespaces, and cgroup delegation, so the worker
-runs as root under systemd. One-time setup:
+runs as root under systemd. repoman ships as the `repoman-git` package built
+by repoman itself from this branch (root `PKGBUILD`), so a build host installs
+it like any other package once the client stanza below is in place:
 
 ```sh
-cargo build --release
-sudo deploy/install-worker.sh          # uses ~/.config/repoman/worker.toml
+sudo pacman -Syu repoman-git
+sudo deploy/install-worker.sh          # config from ~/.config/repoman/worker.toml
 ```
 
-The script installs the binary, derives `/etc/repoman/worker.toml` from the
-user config, installs the hardened unit, and stops the user-level unit so
-only one process connects under the worker's name.
+The package installs `/usr/bin/repoman`, the hardened unit, and an example
+`/etc/repoman/worker.toml`. The script writes the real config (token,
+coordinator URL), enables the unit, and stops the user-level unit so only one
+process connects under the worker's name. Without the package it falls back to
+installing a local release build under `/usr/local/bin`.
 
 Iteration afterwards is a release build, `install` of the binary, and
 `systemctl restart repoman-worker`.

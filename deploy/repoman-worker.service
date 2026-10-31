@@ -8,7 +8,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=/usr/local/bin/repoman worker --config /etc/repoman/worker.toml
+ExecStart=/usr/bin/repoman worker --config /etc/repoman/worker.toml
 Restart=always
 RestartSec=5
 Environment=RUST_LOG=info
