@@ -148,7 +148,10 @@ pub async fn build_image(
     ];
     argv.extend(packages.iter().cloned());
     let cmd = boot.command(&argv, RunAs::Root, "/", &[])?;
-    let (status, tail) = run_logged(ctx, cmd, Some(ctx.timeout())).await?;
+    let (status, tail) = {
+        let _cache_guard = ctx.lock_pacman().await;
+        run_logged(ctx, cmd, Some(ctx.timeout())).await?
+    };
     if !status.success() {
         bail!("bootstrap failed ({status}): {}", tail.join(" | "));
     }

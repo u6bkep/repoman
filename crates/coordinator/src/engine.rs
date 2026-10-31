@@ -480,6 +480,9 @@ pub struct BuildItem {
     pub pkgnames: Vec<String>,
     pub validpgpkeys: Vec<String>,
     pub skip_pgp: bool,
+    /// Repos this build is published to: its own stream, or every member
+    /// stream for an arch=any build-once package.
+    pub publish_streams: Vec<String>,
 }
 
 #[derive(Default)]
@@ -487,6 +490,37 @@ pub struct Planned {
     pub per_stream: BTreeMap<String, Vec<BuildItem>>,
     pub discovered: usize,
     pub skipped: Vec<serde_json::Value>,
+}
+
+/// Runtime interpreters whose install paths encode a version; an arch=any
+/// package depending on one is not stream independent.
+const VERSIONED_INTERPRETERS: &[&str] = &["python", "python2", "perl", "ruby", "lua", "lua51", "lua53", "lua54", "php", "ghc", "nodejs"];
+
+/// Build once and publish to every member stream?
+fn build_once(si: &Srcinfo, policy: &serde_json::Value, arch: &str) -> bool {
+    if let Some(v) = policy.get("build_once").and_then(|v| v.as_bool()) {
+        return v;
+    }
+    if si.architectures() != ["any"] {
+        return false;
+    }
+    !si.pkgnames()
+        .iter()
+        .flat_map(|n| si.runtime_deps(n, arch))
+        .any(|d| VERSIONED_INTERPRETERS.contains(&d.name.as_str()))
+}
+
+/// Member streams of a package in sort order.
+fn member_streams(app: &AppState, pkgbase: &str) -> Result<Vec<String>> {
+    let mut v: Vec<(i32, String)> = app
+        .store
+        .memberships(pkgbase)?
+        .into_iter()
+        .filter(|m| m.wanted || m.required)
+        .filter_map(|m| app.config.stream(&m.stream).map(|s| (s.sort_order, s.name.clone())))
+        .collect();
+    v.sort();
+    Ok(v.into_iter().map(|(_, n)| n).collect())
 }
 
 fn target_commit(cands: &[CandidateRow], baseline: Option<&str>) -> Option<(String, Option<String>)> {
@@ -535,21 +569,48 @@ async fn plan_all(app: &AppState, run_id: &str) -> Result<Planned> {
         let members = app.store.members_of_stream(&stream.name)?;
         let member_names: BTreeSet<String> = members.iter().map(|m| m.pkgbase.clone()).collect();
 
+        // arch=any packages without versioned-interpreter dependencies build
+        // once, on their lowest-sort member stream, and publish everywhere.
+        let mut once_targets: HashMap<String, Vec<String>> = HashMap::new();
+        let mut skip_here: HashSet<String> = HashSet::new();
+        for m in &members {
+            let Some((_, si)) = srcinfos.get(&m.pkgbase) else { continue };
+            let policy = packages
+                .iter()
+                .find(|p| p.pkgbase == m.pkgbase)
+                .map(|p| p.policy.clone())
+                .unwrap_or(serde_json::Value::Null);
+            if build_once(si, &policy, &app.config.arch) {
+                let targets = member_streams(app, &m.pkgbase)?;
+                if targets.first() == Some(&stream.name) {
+                    once_targets.insert(m.pkgbase.clone(), targets);
+                } else {
+                    skip_here.insert(m.pkgbase.clone());
+                }
+            }
+        }
+
         // Which members need a build on this stream?
         let mut needs: BTreeSet<String> = BTreeSet::new();
         for m in &members {
+            if skip_here.contains(&m.pkgbase) {
+                continue;
+            }
             let Some((commit, si)) = srcinfos.get(&m.pkgbase) else { continue };
             let approved = candidate_of.get(&m.pkgbase).cloned().flatten().is_some();
-            let published = si
-                .pkgnames()
-                .iter()
-                .all(|n| {
+            let targets = once_targets
+                .get(&m.pkgbase)
+                .cloned()
+                .unwrap_or_else(|| vec![stream.name.clone()]);
+            let published = targets.iter().all(|t| {
+                si.pkgnames().iter().all(|n| {
                     app.store
-                        .live_artifact(&stream.name, n)
+                        .live_artifact(t, n)
                         .ok()
                         .flatten()
                         .is_some_and(|a| a.aur_commit.as_deref() == Some(commit.as_str()))
-                });
+                })
+            });
             if approved || !published {
                 needs.insert(m.pkgbase.clone());
             }
@@ -569,6 +630,7 @@ async fn plan_all(app: &AppState, run_id: &str) -> Result<Planned> {
         let empty = HashMap::new();
         let inputs: Vec<Input> = members
             .iter()
+            .filter(|m| !skip_here.contains(&m.pkgbase))
             .filter_map(|m| {
                 srcinfos.get(&m.pkgbase).map(|(_, si)| Input {
                     pkgbase: &m.pkgbase,
@@ -693,6 +755,10 @@ async fn plan_all(app: &AppState, run_id: &str) -> Result<Planned> {
                 pkgnames: si.pkgnames().iter().map(|s| s.to_string()).collect(),
                 validpgpkeys: si.base.values("validpgpkeys").into_iter().map(str::to_string).collect(),
                 skip_pgp,
+                publish_streams: once_targets
+                    .get(&b.pkgbase)
+                    .cloned()
+                    .unwrap_or_else(|| vec![stream.name.clone()]),
             });
         }
         for c in &plan.cycles {
@@ -883,8 +949,11 @@ async fn publish_all(app: &AppState, _run_id: &str, planned: &Planned, built: &B
     if !signing {
         tracing::warn!("signing_key not configured; publishing unsigned packages");
     }
+    // Sign every built artifact once and collect what goes to which repo: a
+    // normal build publishes to its own stream, a build-once item to every
+    // member stream of its package.
+    let mut per_target: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
     for (stream, items) in &planned.per_stream {
-        let mut to_add: Vec<(String, String)> = Vec::new();
         for item in items {
             let Some(Ok(shas)) = built.get(&(stream.clone(), item.pkgbase.clone())) else {
                 continue;
@@ -896,20 +965,27 @@ async fn publish_all(app: &AppState, _run_id: &str, planned: &Planned, built: &B
                     let sig_sha = hex::encode(Sha256::digest(std::fs::read(&sig)?));
                     app.store.set_artifact_signature(sha, &sig_sha)?;
                 }
-                to_add.push((sha.clone(), art.filename.clone()));
+                for target in &item.publish_streams {
+                    per_target
+                        .entry(target.clone())
+                        .or_default()
+                        .push((sha.clone(), art.filename.clone()));
+                }
             }
         }
+    }
+    for (stream, to_add) in &per_target {
         if to_add.is_empty() {
             continue;
         }
         // Publication rows first, so every file the new database references
         // already resolves; then the database.
         let mut retired_all = Vec::new();
-        for (sha, _) in &to_add {
+        for (sha, _) in to_add {
             retired_all.extend(app.store.publish(sha, stream)?);
         }
         if app.publisher.has_db(stream) {
-            app.publisher.publish(&app.blobs, stream, &to_add).await?;
+            app.publisher.publish(&app.blobs, stream, to_add).await?;
         } else {
             // Missing or renamed database: rebuild it from every live artifact.
             let live: Vec<(String, String)> = app

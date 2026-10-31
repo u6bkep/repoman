@@ -56,7 +56,16 @@ if [ -n "${REPOMAN_CGROUP:-}" ]; then echo $$ > "$REPOMAN_CGROUP/cgroup.procs"; 
 ROOT="$REPOMAN_ROOT"
 mkdir -p "$ROOT"
 if [ -n "${REPOMAN_UPPER:-}" ]; then
-  mount -t overlay overlay -o "lowerdir=$REPOMAN_LOWER,upperdir=$REPOMAN_UPPER,workdir=$REPOMAN_WORK" "$ROOT"
+    # The previous phase's namespace may still be tearing down (processes
+  # killed with the PID namespace exit asynchronously), which makes the
+  # workdir briefly busy. Retry for up to ten seconds.
+  i=0
+  while :; do
+    if err=$(mount -t overlay overlay -o "lowerdir=$REPOMAN_LOWER,upperdir=$REPOMAN_UPPER,workdir=$REPOMAN_WORK" "$ROOT" 2>&1); then break; fi
+    i=$((i+1))
+    if [ "$i" -ge 100 ]; then echo "$err" >&2; exit 32; fi
+    sleep 0.1
+  done
 else
   mount --bind "$REPOMAN_LOWER" "$ROOT"
 fi

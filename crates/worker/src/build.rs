@@ -120,7 +120,10 @@ pub async fn run_build(ctx: &JobCtx, p: BuildParams<'_>) -> Result<JobResult> {
     argv.extend(p.install.iter().cloned());
     ctx.log(Fd::System, format!("installing {} dependencies", p.install.len()));
     let cmd = sandbox(true).command(&argv, RunAs::Root, "/", &[])?;
-    let (status, tail) = run_logged(ctx, cmd, Some(ctx.timeout())).await?;
+    let (status, tail) = {
+        let _cache_guard = ctx.lock_pacman().await;
+        run_logged(ctx, cmd, Some(ctx.timeout())).await?
+    };
     if !status.success() {
         bail!("dependency installation failed ({status}): {}", tail.join(" | "));
     }

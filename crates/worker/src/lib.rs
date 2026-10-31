@@ -41,6 +41,9 @@ pub struct WorkerState {
     pub cgroups: cgroup::CgroupManager,
     pub capabilities: Vec<String>,
     pub runner: Arc<dyn exec::JobRunner>,
+    /// Serialises pacman runs that write the shared package cache: two
+    /// instances downloading the same file into one cache corrupt it.
+    pub pacman_lock: tokio::sync::Mutex<()>,
 }
 
 impl WorkerState {
@@ -87,6 +90,7 @@ impl WorkerState {
             cgroups,
             capabilities,
             runner,
+            pacman_lock: tokio::sync::Mutex::new(()),
         })
     }
 
