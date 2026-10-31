@@ -107,8 +107,11 @@ pub async fn build_image(
 
     ctx.stage("pacstrap");
     ctx.log(Fd::System, format!("pacstrap {} packages for {stream}", packages.len()));
-    let mut cmd = tokio::process::Command::new("pacstrap");
-    cmd.arg("-C")
+    // pacstrap mounts proc, sys, and dev into the target; give it a PID and
+    // mount namespace of its own so that works under a user namespace too and
+    // its mounts vanish when it exits.
+    let mut cmd = tokio::process::Command::new("unshare");
+    cmd.args(["--fork", "--pid", "--mount", "--propagation", "private", "--", "pacstrap", "-C"])
         .arg(&conf_path)
         .args(["-G", "-M", "-K"])
         .arg(&target)

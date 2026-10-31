@@ -61,7 +61,7 @@ can reopen a decision on evidence rather than drift.
 |------|--------|-------------------|
 | Streams and repos | One repo per stream. Every member package is built on every member stream. `arch=any` packages without a versioned-interpreter dependency are built once and the same file is published to every member stream's repo via the content store. | A shared `common` repo with per-stream fallbacks, decided by an ELF soname scan (proposed 2026-10-31, reversed same day). Rejected because: the soname check is necessary but not sufficient (Qt/KDE private ABI, plugin dirs, Go/Haskell hashed interfaces break with no soname change, so a false `common` verdict fails silently on clients); pacman resolves a name to the first listed repo regardless of version, so layout flips need `repo-remove` bookkeeping or stale entries shadow forever; identically named per-stream builds collide in a single staging repo or filename-keyed cache; the saving was 3.7 build-hours per nine months on machines that are now concurrent. The ELF scan survives for a sound use: soname-bump rebuild triggers. |
 | Build root provisioning | Per-stream immutable base image, snapshotted per build via overlayfs; deps installed by pacman from the shared cache. Provisioner is a trait. | Per-package overlay layers: 500-layer kernel cap, lookup cost, hook replay complexity. composefs/erofs content-addressed roots: elegant, but measured dep install is 10–60 s and not the bottleneck. Revisit if dep sets or build frequency grow 10x. |
-| Base image construction | Built by the coordinator's Arch container with `pacstrap`, packed as a content-addressed tarball, downloaded by workers into a fresh directory per image. Never mutated in place. | `pacman -Syu` inside the image on the worker: mutating the lower layer of an active overlay is undefined behaviour, and `pacstrap` needs a host pacman, which contradicts non-Arch workers. |
+| Base image construction | Built by a worker advertising the `image` capability (root with `pacstrap`), packed as a content-addressed tarball, uploaded to the coordinator, and downloaded by other workers into a fresh directory per image. Never mutated in place. (Revised 2026-10-31 during M1: the plan first said the coordinator container would run pacstrap, but pacstrap needs mounts and the NAS container is unprivileged.) | `pacman -Syu` inside the image on the worker: mutating the lower layer of an active overlay is undefined behaviour. Building in the coordinator container: needs a privileged container on the NAS. |
 | Isolation primitives | Own executor on `unshare`, bind mounts, overlayfs, network namespace, one cgroup per job. Worker runs as root under systemd hardening; makepkg runs as an unprivileged uid inside for every phase, since makepkg refuses root in all modes. | devtools `makechrootpkg`: cannot give a network-off build phase, upper-dir inspection, or per-stage timing without fighting it. Docker/podman: moves root to a daemon we don't control and blocks the same introspection. |
 | Worker transport | Worker opens a persistent WebSocket to the coordinator and holds it open. Token auth. | Coordinator-driven SSH: fragile for long jobs, no capability advertisement. HTTP polling: pointless with two or three workers. |
 | Coordinator location | Container on the NAS (Ubuntu docker host, always on, hosts the repos and reverse proxy). Arch-based image so `pacstrap`, `repo-add`, `gpg`, `bsdtar` are present. | Coordinator on the desktop: v1 ran there only because it builds well; the desktop is now a worker. Publishing over NFS: removed a failure class. |
@@ -258,10 +258,12 @@ interrupted run shows where it stopped.
 
 ### 8.1 Base images
 
-The coordinator builds one image per stream: `pacstrap -C <stream
-pacman.conf> -M -G` into a directory with `base`, `base-devel`, and the
-operator's `makepkg.conf`, then packs it as a zstd tarball named by sha256.
-The coordinator's container trusts each stream's keyring package. A new image
+An `image` job on a capable worker builds one image per stream: `pacstrap -C
+<stream pacman.conf> -G -M -K` into a directory with `base` and `base-devel`,
+populates the stream's keyrings, creates the build user, writes the repoman
+makepkg.conf.d drop-in, then packs it as a zstd tarball named by sha256 and
+uploads it to the coordinator's blob store. The worker host's pacman keyring
+(or `pacstrap_gpgdir`) must trust the stream's packages. A new image
 is built when the stream's databases change and the current image is older
 than a day. Workers download images by hash into `images/<sha256>/` and never
 modify them. Images with no in-flight job and a newer successor are deleted
