@@ -1,0 +1,25 @@
+pkgbase = repoman-git
+	pkgdesc = AUR build coordinator, worker, and CLI with isolated builds and signed per-stream repos
+	pkgver = r0
+	pkgrel = 1
+	url = https://github.com/u6bkep/repoman
+	arch = x86_64
+	license = MIT
+	makedepends = cargo
+	makedepends = git
+	depends = pacman
+	depends = git
+	depends = gnupg
+	depends = util-linux
+	depends = libarchive
+	depends = zstd
+	depends = coreutils
+	depends = iproute2
+	optdepends = arch-install-scripts: not required; images are bootstrapped with pacman
+	provides = repoman
+	conflicts = repoman
+	backup = etc/repoman/worker.toml
+	source = repoman::git+https://github.com/u6bkep/repoman.git#branch=v2-main
+	sha256sums = SKIP
+
+pkgname = repoman-git

@@ -257,6 +257,9 @@ pub struct AddPackage {
     pub class: Option<String>,
     #[serde(default)]
     pub kind: Option<String>,
+    /// Git URL of a repository with the PKGBUILD at its root; default AUR.
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 async fn add_package(State(st): State<AppState>, axum::Json(req): axum::Json<AddPackage>) -> Result<(StatusCode, axum::Json<PackageView>), ApiError> {
@@ -278,10 +281,21 @@ async fn add_package(State(st): State<AppState>, axum::Json(req): axum::Json<Add
         .kind
         .clone()
         .unwrap_or_else(|| if pkgbase.ends_with("-git") { "vcs".into() } else { "release".into() });
-    let created = st.store.add_package(pkgbase, &kind, req.class.as_deref()).map_err(internal)?;
+    if let Some(src) = &req.source {
+        if !(src.starts_with("https://") || src.starts_with("http://") || src.starts_with("file://") || src.starts_with("git://")) {
+            return Err(bad_request("source must be an http(s), git, or file URL"));
+        }
+    }
+    let created = st
+        .store
+        .add_package_from(pkgbase, &kind, req.class.as_deref(), req.source.as_deref())
+        .map_err(internal)?;
     if !created {
         if let Some(c) = &req.class {
             st.store.set_package_class(pkgbase, c).map_err(internal)?;
+        }
+        if req.source.is_some() {
+            st.store.set_package_source(pkgbase, req.source.as_deref()).map_err(internal)?;
         }
     }
     for s in &streams {

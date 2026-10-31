@@ -295,11 +295,11 @@ upper directory at teardown.
 4. **build** — enter a network namespace with loopback only (M2: plus an
    nftables rule that counts and logs any non-loopback egress), unless the
    package's policy sets `allow_network_build`, which the log records; then run
-   `makepkg --holdver --noconfirm` as the build uid. Sources are already in
-   `SRCDEST`, so extraction, `prepare()`, `pkgver()`, `build()`, `check()`,
-   and `package()` all run offline. `--holdver` prevents the VCS re-fetch
-   that would otherwise abort. A `prepare()` that fetches at build time fails
-   here and is recorded.
+   `makepkg --noextract --holdver --noconfirm` as the build uid. `--noextract`
+   skips the download, verification, extraction, and `prepare()` done in the
+   previous phase; `--holdver` prevents the VCS re-fetch that would otherwise
+   abort. `pkgver()`, `build()`, `check()`, and `package()` run offline, so
+   anything that fetches from them fails here and is recorded.
 5. **collect** — gather `*.pkg.tar.*`, `.BUILDINFO`, logs, cgroup peaks, net
    counters. Compute the upper-directory diff and record paths written
    outside `srcdir`, `pkgdir`, `SRCDEST`, and pacman's own directories.

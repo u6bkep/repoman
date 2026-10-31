@@ -246,6 +246,37 @@ async fn poll_aur(app: &AppState) -> Result<()> {
     if packages.is_empty() {
         return Ok(());
     }
+    // Packages from other git repositories: no RPC, the commit is the clock.
+    for p in packages.iter().filter(|p| p.source_url.is_some()) {
+        let url = p.source_url.as_deref().unwrap();
+        let head = match app.aur.sync_from(&p.pkgbase, url).await {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!(pkgbase = %p.pkgbase, %url, error = %e, "syncing git source");
+                continue;
+            }
+        };
+        let last_modified = app.aur.commit_time(&p.pkgbase, &head).await.unwrap_or(0);
+        let version = srcinfo_at(app, &p.pkgbase, &head).await.ok().map(|s| s.version());
+        let prev = app.store.get_snapshot(&p.pkgbase)?;
+        app.store.upsert_snapshot(&SnapshotRow {
+            pkgbase: p.pkgbase.clone(),
+            fetched_at: clock::now(),
+            version,
+            last_modified,
+            maintainer: prev.as_ref().and_then(|s| s.maintainer.clone()),
+            submitter: None,
+            comaintainers: vec![],
+            out_of_date: None,
+            votes: None,
+            popularity: None,
+            head_commit: Some(head),
+        })?;
+    }
+    let packages: Vec<PackageRow> = packages.into_iter().filter(|p| p.source_url.is_none()).collect();
+    if packages.is_empty() {
+        return Ok(());
+    }
     let names: Vec<String> = packages.iter().map(|p| p.pkgbase.clone()).collect();
     let infos = app.aur.info(&names).await.context("AUR RPC")?;
     // Only pkgbase rows matter; the RPC returns one entry per pkgname.

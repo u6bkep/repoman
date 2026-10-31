@@ -173,6 +173,13 @@ impl Aur {
     /// Clone the bare mirror if missing, otherwise fetch. Returns the head
     /// commit after the update.
     pub async fn sync(&self, pkgbase: &str) -> Result<String> {
+        let url = format!("{}/{pkgbase}.git", self.git_url);
+        self.sync_from(pkgbase, &url).await
+    }
+
+    /// Mirror an arbitrary git repository holding a PKGBUILD at its root,
+    /// for packages that are not on the AUR (such as repoman itself).
+    pub async fn sync_from(&self, pkgbase: &str, url: &str) -> Result<String> {
         validate_pkgbase(pkgbase)?;
         let path = self.mirror_path(pkgbase);
         if path.join("HEAD").exists() {
@@ -180,7 +187,6 @@ impl Aur {
                 .await
                 .with_context(|| format!("fetching {pkgbase}"))?;
         } else {
-            let url = format!("{}/{pkgbase}.git", self.git_url);
             let tmp = self.dir.join(format!("{pkgbase}.git.part"));
             let _ = std::fs::remove_dir_all(&tmp);
             self.git(
@@ -192,6 +198,13 @@ impl Aur {
             std::fs::rename(&tmp, &path)?;
         }
         self.head(pkgbase).await
+    }
+
+    /// Commit timestamp (seconds since the epoch) of a commit in a mirror.
+    pub async fn commit_time(&self, pkgbase: &str, commit: &str) -> Result<i64> {
+        let path = self.mirror_path(pkgbase);
+        let out = self.git(&["show", "-s", "--format=%ct", commit], Some(&path)).await?;
+        out.trim().parse().with_context(|| format!("parsing commit time {out:?}"))
     }
 
     pub async fn head(&self, pkgbase: &str) -> Result<String> {

@@ -469,6 +469,25 @@ async fn onboarding_build_publish_update_cycle() {
     assert_eq!(r3["state"], "done");
     assert_eq!(r3["summary"]["builds_planned"], 0, "{}", r3["summary"]);
 
+    // A package from a git repository that is not on the AUR: the stub RPC
+    // knows nothing about it, so polling must use the commit itself.
+    h.aur.publish("selfhosted", "0.1", &["glibc"], &[]);
+    let src = format!("{}/selfhosted.git", h.aur.git_url());
+    h.post("/api/packages", json!({"pkgbase": "selfhosted", "streams": ["s1"], "source": src})).await;
+    let rg = h.run().await;
+    assert_eq!(rg["state"], "needs_input", "{rg}");
+    let pending = h.get("/api/candidates").await;
+    let c = &pending.as_array().unwrap()[0];
+    assert_eq!(c["pkgbase"], "selfhosted");
+    assert!(c["first_seen_last_modified"].as_i64().unwrap() > 1_600_000_000, "commit time used as the clock");
+    h.post(&format!("/api/candidates/{}/decide", c["id"].as_str().unwrap()), json!({"decision": "approve", "class": "authored"})).await;
+    let rg2 = h.run().await;
+    assert_eq!(rg2["state"], "done", "{rg2}");
+    assert!(h.repo_db().iter().any(|p| p.name == "selfhosted"));
+    let pkg = h.get("/api/packages/selfhosted").await;
+    assert_eq!(pkg["source_url"], src);
+    assert!(pkg["snapshot"]["maintainer"].is_null());
+
     // Upstream bumps foo. The candidate review shows the version change,
     // bar is rebuilt as a dependent, and the repo carries the new versions.
     h.publish_pkg("foo", "1.1", &["glibc"], &["cmake"]);
@@ -492,7 +511,7 @@ async fn onboarding_build_publish_update_cycle() {
     assert_eq!(r5["summary"]["builds_succeeded"], 2, "foo and dependent bar: {}", r5["summary"]);
     let db = h.repo_db();
     assert_eq!(db.iter().find(|p| p.name == "foo").unwrap().version, "1.1-1");
-    assert_eq!(db.len(), 2, "old foo replaced, not duplicated");
+    assert_eq!(db.iter().filter(|p| p.name == "foo").count(), 1, "old foo replaced, not duplicated");
     let kinds: Vec<String> = h
         .get("/api/candidates?state=published")
         .await

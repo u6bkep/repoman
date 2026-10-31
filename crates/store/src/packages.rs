@@ -14,6 +14,8 @@ pub struct PackageRow {
     pub provenance_class: Option<String>,
     pub policy: serde_json::Value,
     pub added_at: String,
+    /// Git URL of the PKGBUILD repository when not the AUR.
+    pub source_url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,20 +53,34 @@ pub struct SnapshotRow {
 impl Store {
     /// Insert a package if missing. Existing rows are left untouched.
     pub fn add_package(&self, pkgbase: &str, kind: &str, class: Option<&str>) -> Result<bool> {
+        self.add_package_from(pkgbase, kind, class, None)
+    }
+
+    /// Insert a package with an explicit git source. `None` means the AUR.
+    pub fn add_package_from(&self, pkgbase: &str, kind: &str, class: Option<&str>, source_url: Option<&str>) -> Result<bool> {
         self.with(|c| {
             let n = c.execute(
-                "INSERT OR IGNORE INTO package (pkgbase, kind, provenance_class, added_at)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![pkgbase, kind, class, clock::now()],
+                "INSERT OR IGNORE INTO package (pkgbase, kind, provenance_class, added_at, source_url)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![pkgbase, kind, class, clock::now(), source_url],
             )?;
             Ok(n == 1)
+        })
+    }
+
+    pub fn set_package_source(&self, pkgbase: &str, source_url: Option<&str>) -> Result<bool> {
+        self.with(|c| {
+            Ok(c.execute(
+                "UPDATE package SET source_url = ?2 WHERE pkgbase = ?1",
+                params![pkgbase, source_url],
+            )? == 1)
         })
     }
 
     pub fn get_package(&self, pkgbase: &str) -> Result<Option<PackageRow>> {
         self.with(|c| {
             Ok(c.query_row(
-                "SELECT pkgbase, kind, provenance_class, policy, added_at FROM package WHERE pkgbase = ?1",
+                "SELECT pkgbase, kind, provenance_class, policy, added_at, source_url FROM package WHERE pkgbase = ?1",
                 params![pkgbase],
                 |r| {
                     let policy: String = r.get(3)?;
@@ -74,6 +90,7 @@ impl Store {
                         provenance_class: r.get(2)?,
                         policy: serde_json::from_str(&policy).unwrap_or(serde_json::json!({})),
                         added_at: r.get(4)?,
+                        source_url: r.get(5)?,
                     })
                 },
             )
@@ -84,7 +101,7 @@ impl Store {
     pub fn list_packages(&self) -> Result<Vec<PackageRow>> {
         self.with(|c| {
             let mut st = c.prepare(
-                "SELECT pkgbase, kind, provenance_class, policy, added_at FROM package ORDER BY pkgbase",
+                "SELECT pkgbase, kind, provenance_class, policy, added_at, source_url FROM package ORDER BY pkgbase",
             )?;
             Ok(st
                 .query_map([], |r| {
@@ -95,6 +112,7 @@ impl Store {
                         provenance_class: r.get(2)?,
                         policy: serde_json::from_str(&policy).unwrap_or(serde_json::json!({})),
                         added_at: r.get(4)?,
+                        source_url: r.get(5)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?)

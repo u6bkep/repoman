@@ -185,6 +185,8 @@ pub const MIGRATIONS: &[&str] = &[
      );
      CREATE INDEX publication_repo_idx ON publication(repo, retired_at);
      CREATE INDEX publication_artifact_idx ON publication(artifact_sha);",
+    // 3: packages may come from a git repository other than the AUR
+    "ALTER TABLE package ADD COLUMN source_url TEXT;",
 ];
 
 pub fn migrate(conn: &Connection) -> Result<()> {

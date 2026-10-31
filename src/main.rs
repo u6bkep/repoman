@@ -68,6 +68,9 @@ enum Cmd {
         /// Provenance class: upstream-binary, upstream-source, vcs, repackaged, authored.
         #[arg(long)]
         class: Option<String>,
+        /// Git URL of a repository with the PKGBUILD at its root, instead of the AUR.
+        #[arg(long)]
+        source: Option<String>,
     },
     /// Remove a package base and its memberships, or with --stream only
     /// its membership on that stream.
@@ -181,9 +184,11 @@ async fn main() -> Result<()> {
                 .await?;
             api.emit(&v, || print_job(&v))
         }
-        Cmd::Add { pkgbase, streams, class } => {
+        Cmd::Add { pkgbase, streams, class, source } => {
             for pb in pkgbase {
-                let v = api.post("/api/packages", &json!({"pkgbase": pb, "streams": streams, "class": class})).await?;
+                let v = api
+                    .post("/api/packages", &json!({"pkgbase": pb, "streams": streams, "class": class, "source": source}))
+                    .await?;
                 api.emit(&v, || {
                     let st: Vec<String> = v["streams"].as_array().into_iter().flatten().map(|m| s(&m["stream"])).collect();
                     println!("{pb}: streams {}", st.join(", "));

@@ -158,12 +158,16 @@ pub async fn run_build(ctx: &JobCtx, p: BuildParams<'_>) -> Result<JobResult> {
             bail!("importing PGP keys failed: {}", tail.join(" | "));
         }
     }
-    let mut argv = vec!["makepkg".to_string(), "--verifysource".into(), "--noconfirm".into()];
+    // Download, verify, extract, and run prepare() with the network up.
+    // Arch's packaging guidelines put dependency fetching (cargo fetch, go
+    // mod download, npm ci) in prepare(), so it belongs to this phase; only
+    // build(), check(), and package() run offline.
+    let mut argv = vec!["makepkg".to_string(), "--nobuild".into(), "--noconfirm".into()];
     argv.extend(pgp_flag.iter().cloned());
     let cmd = sandbox(true).command(&argv, user, &cwd, &user_env)?;
     let (status, tail) = run_logged(ctx, cmd, Some(ctx.timeout())).await?;
     if !status.success() {
-        bail!("source download or verification failed ({status}): {}", tail.join(" | "));
+        bail!("source download, verification, or prepare() failed ({status}): {}", tail.join(" | "));
     }
     ctx.stage_done("sources");
 
@@ -173,8 +177,11 @@ pub async fn run_build(ctx: &JobCtx, p: BuildParams<'_>) -> Result<JobResult> {
         ctx.log(Fd::System, "policy allows network during build; this build is not isolated from the network");
     }
     let before = snapshot_upper(&upper)?;
+    // --noextract skips download, verification, extraction, and prepare(),
+    // all done above; --holdver keeps VCS sources as fetched.
     let mut argv = vec![
         "makepkg".to_string(),
+        "--noextract".into(),
         "--holdver".into(),
         "--noconfirm".into(),
         "--nosign".into(),
