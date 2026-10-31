@@ -100,6 +100,22 @@ async fn execute(app: &AppState, run_id: &str) -> Result<RunEnd> {
     for pass in 0..8 {
         step(app, run_id, "streams").await?;
         app.streams.refresh_all().await.context("refreshing streams")?;
+        // Repair: a stream with publications but no database file (first run
+        // after a rename, or manual deletion) gets its database rebuilt.
+        for s in app.config.streams_sorted() {
+            if !app.publisher.has_db(&s.name) {
+                let live: Vec<(String, String)> = app
+                    .store
+                    .live_artifacts(&s.name)?
+                    .into_iter()
+                    .map(|a| (a.sha256, a.filename))
+                    .collect();
+                if !live.is_empty() {
+                    tracing::warn!(stream = %s.name, "repo database missing; rebuilding from publications");
+                    app.publisher.rebuild(&app.blobs, &s.name, &live).await?;
+                }
+            }
+        }
 
         step(app, run_id, "images").await?;
         let mut images: HashMap<String, ImageRef> = HashMap::new();
@@ -821,7 +837,7 @@ async fn submit_build(app: &AppState, run_id: &str, item: &BuildItem, images: &H
         cache_servers: vec![],
         sig_level: Some("Never".into()),
     }];
-    if !app.store.live_artifacts(&item.stream)?.is_empty() {
+    if app.publisher.has_db(&item.stream) {
         extra.push(Repo {
             name: Publisher::published_repo_name(&item.stream),
             servers: vec![format!("{}/repos/{}/$arch", app.config.public_url, item.stream)],
