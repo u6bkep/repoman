@@ -113,6 +113,10 @@ pub enum JobKind {
         /// Skip signature verification of sources (per-package policy).
         #[serde(default)]
         skip_pgp: bool,
+        /// Leave the network up during build(): for packages whose prepare()
+        /// fetches at build time. Per-package policy, off by default.
+        #[serde(default)]
+        allow_network: bool,
         upload_url: String,
     },
     /// Regenerate SRCINFO from the PKGBUILD in a sandbox.

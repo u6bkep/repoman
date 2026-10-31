@@ -148,6 +148,7 @@ impl JobRunner for RealRunner {
                     install,
                     pgp_keys,
                     skip_pgp,
+                    allow_network,
                     upload_url,
                     ..
                 } => crate::build::run_build(
@@ -160,6 +161,7 @@ impl JobRunner for RealRunner {
                         install,
                         pgp_keys,
                         skip_pgp: *skip_pgp,
+                        allow_network: *allow_network,
                         upload_url,
                         makepkg_conf_extra: "",
                     },

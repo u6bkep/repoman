@@ -480,6 +480,7 @@ pub struct BuildItem {
     pub pkgnames: Vec<String>,
     pub validpgpkeys: Vec<String>,
     pub skip_pgp: bool,
+    pub allow_network: bool,
     /// Repos this build is published to: its own stream, or every member
     /// stream for an arch=any build-once package.
     pub publish_streams: Vec<String>,
@@ -742,6 +743,7 @@ async fn plan_all(app: &AppState, run_id: &str) -> Result<Planned> {
             let (commit, si) = &srcinfos[&b.pkgbase];
             let pkg = packages.iter().find(|p| p.pkgbase == b.pkgbase).unwrap();
             let skip_pgp = pkg.policy.get("pgp").and_then(|v| v.as_str()) == Some("skip");
+            let allow_network = pkg.policy.get("allow_network_build").and_then(|v| v.as_bool()) == Some(true);
             if !b.ambiguous_providers.is_empty() {
                 tracing::warn!(pkgbase = %b.pkgbase, providers = ?b.ambiguous_providers, "unpinned virtual providers");
             }
@@ -755,6 +757,7 @@ async fn plan_all(app: &AppState, run_id: &str) -> Result<Planned> {
                 pkgnames: si.pkgnames().iter().map(|s| s.to_string()).collect(),
                 validpgpkeys: si.base.values("validpgpkeys").into_iter().map(str::to_string).collect(),
                 skip_pgp,
+                allow_network,
                 publish_streams: once_targets
                     .get(&b.pkgbase)
                     .cloned()
@@ -931,6 +934,7 @@ async fn submit_build(app: &AppState, run_id: &str, item: &BuildItem, images: &H
             install: item.install.clone(),
             pgp_keys,
             skip_pgp: item.skip_pgp,
+            allow_network: item.allow_network,
             upload_url: format!("{}/api/blobs", app.config.public_url),
         },
         Some(&item.pkgbase),

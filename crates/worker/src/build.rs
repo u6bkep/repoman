@@ -20,6 +20,7 @@ pub struct BuildParams<'a> {
     pub install: &'a [String],
     pub pgp_keys: &'a [String],
     pub skip_pgp: bool,
+    pub allow_network: bool,
     pub upload_url: &'a str,
     pub makepkg_conf_extra: &'a str,
 }
@@ -166,8 +167,11 @@ pub async fn run_build(ctx: &JobCtx, p: BuildParams<'_>) -> Result<JobResult> {
     }
     ctx.stage_done("sources");
 
-    // ---- build (offline) ----------------------------------------------------
+    // ---- build (offline unless policy allows network) ----------------------
     ctx.stage("build");
+    if p.allow_network {
+        ctx.log(Fd::System, "policy allows network during build; this build is not isolated from the network");
+    }
     let before = snapshot_upper(&upper)?;
     let mut argv = vec![
         "makepkg".to_string(),
@@ -176,7 +180,7 @@ pub async fn run_build(ctx: &JobCtx, p: BuildParams<'_>) -> Result<JobResult> {
         "--nosign".into(),
     ];
     argv.extend(pgp_flag.iter().cloned());
-    let cmd = sandbox(false).command(&argv, user, &cwd, &user_env)?;
+    let cmd = sandbox(p.allow_network).command(&argv, user, &cwd, &user_env)?;
     let (status, tail) = run_logged(ctx, cmd, Some(ctx.timeout())).await?;
     let oom = ctx.oom_killed();
     if !status.success() {
