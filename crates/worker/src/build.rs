@@ -392,8 +392,10 @@ fn read_vcs_rev(builddir: &Path) -> Option<String> {
     for e in entries.flatten() {
         let p = e.path();
         if p.join(".git").exists() {
+            // The checkout belongs to the build uid; git refuses to read
+            // repositories owned by another user unless told otherwise.
             let out = std::process::Command::new("git")
-                .args(["rev-parse", "HEAD"])
+                .args(["-c", "safe.directory=*", "rev-parse", "HEAD"])
                 .current_dir(&p)
                 .output()
                 .ok()?;
