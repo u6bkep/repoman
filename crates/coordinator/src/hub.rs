@@ -77,6 +77,18 @@ impl Hub {
         self.wake.notify_one();
     }
 
+    /// Tell whichever worker holds each job to stop it, and free its slot.
+    pub fn cancel_jobs(&self, ids: &[JobId]) {
+        let mut map = self.connected.lock().unwrap();
+        for c in map.values_mut() {
+            for id in ids {
+                if c.running.remove(id) {
+                    let _ = c.tx.send(CoordMsg::Cancel { job_id: id.clone() });
+                }
+            }
+        }
+    }
+
     /// Receive the id of every job that reaches a terminal state.
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<JobId> {
         self.done.subscribe()

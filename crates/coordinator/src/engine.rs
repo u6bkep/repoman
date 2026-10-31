@@ -90,9 +90,15 @@ async fn step(app: &AppState, run_id: &str, name: &str) -> Result<()> {
 }
 
 async fn execute(app: &AppState, run_id: &str) -> Result<RunEnd> {
-    // A previous attempt at this run may have died mid-build.
+    // A previous attempt at this run may have died mid-build. Its jobs are
+    // stale: the plan below creates new ones.
     for c in app.store.candidates_in_states(&["building", "built"])? {
         app.store.set_candidate_state(&c.id, "approved")?;
+    }
+    let cancelled = app.store.cancel_open_jobs(&["build", "image", "inspect", "probe"])?;
+    if !cancelled.is_empty() {
+        tracing::warn!(count = cancelled.len(), "cancelled stale jobs from an interrupted run");
+        app.hub.cancel_jobs(&cancelled);
     }
 
     let mut summary = serde_json::json!({});

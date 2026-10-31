@@ -407,6 +407,28 @@ impl Store {
         })
     }
 
+    /// Cancel every non-terminal job of the given kinds. Used when a run
+    /// resumes after the coordinator restarted: the new plan creates fresh
+    /// jobs, and results from the old ones would be ignored anyway.
+    pub fn cancel_open_jobs(&self, kinds: &[&str]) -> Result<Vec<JobId>> {
+        self.with(|c| {
+            let placeholders = kinds.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let mut st = c.prepare(&format!(
+                "UPDATE job SET state = 'cancelled', finished_at = ?, error = 'cancelled: run resumed'
+                 WHERE kind IN ({placeholders}) AND state IN ('queued', 'assigned', 'running', 'orphaned')
+                 RETURNING id"
+            ))?;
+            let now = clock::now();
+            let mut p: Vec<&dyn rusqlite::ToSql> = vec![&now];
+            for k in kinds {
+                p.push(k);
+            }
+            Ok(st
+                .query_map(p.as_slice(), |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+    }
+
     /// Orphans older than `grace_secs` go back to the queue.
     pub fn requeue_stale_orphans(&self, grace_secs: u64) -> Result<Vec<JobId>> {
         self.with(|c| {
