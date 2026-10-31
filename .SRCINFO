@@ -18,6 +18,7 @@ pkgbase = repoman-git
 	optdepends = arch-install-scripts: not required; images are bootstrapped with pacman
 	provides = repoman
 	conflicts = repoman
+	options = !lto
 	backup = etc/repoman/worker.toml
 	source = repoman::git+https://github.com/u6bkep/repoman.git#branch=v2-main
 	sha256sums = SKIP

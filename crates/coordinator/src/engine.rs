@@ -796,6 +796,11 @@ async fn plan_all(app: &AppState, run_id: &str) -> Result<Planned> {
             // build failure). Installed into the build root alongside the
             // declared dependencies.
             let mut install = b.install;
+            for tool in si.vcs_tools(&app.config.arch) {
+                if !install.iter().any(|i| i == tool) {
+                    install.push(tool.to_string());
+                }
+            }
             for extra in pkg
                 .policy
                 .get("extra_depends")

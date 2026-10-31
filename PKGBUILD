@@ -14,6 +14,9 @@ optdepends=('arch-install-scripts: not required; images are bootstrapped with pa
 provides=('repoman')
 conflicts=('repoman')
 backup=('etc/repoman/worker.toml')
+# aws-lc-sys compiles C with makepkg's -flto=auto; rustc links with lld, which
+# cannot read GCC LTO objects out of a static archive.
+options=('!lto')
 source=("repoman::git+https://github.com/u6bkep/repoman.git#branch=v2-main")
 sha256sums=('SKIP')
 

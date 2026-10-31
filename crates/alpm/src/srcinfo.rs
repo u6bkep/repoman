@@ -162,6 +162,39 @@ impl Srcinfo {
                 .any(|s| s.starts_with("git+") || s.contains("::git+") || s.starts_with("git://"))
     }
 
+    /// VCS tools makepkg needs to fetch the sources, derived from the source
+    /// URL schemes on this arch. PKGBUILDs routinely omit `git` from
+    /// makedepends because makepkg on a host already has it.
+    pub fn vcs_tools(&self, arch: &str) -> Vec<&'static str> {
+        let mut tools = Vec::new();
+        let mut sources: Vec<String> = self.base.values("source").into_iter().map(str::to_string).collect();
+        sources.extend(self.base.values(&format!("source_{arch}")).into_iter().map(str::to_string));
+        for (_, sec) in &self.packages {
+            sources.extend(sec.values("source").into_iter().map(str::to_string));
+            sources.extend(sec.values(&format!("source_{arch}")).into_iter().map(str::to_string));
+        }
+        for s in &sources {
+            let url = s.split_once("::").map(|(_, u)| u).unwrap_or(s);
+            let tool = if url.starts_with("git+") || url.starts_with("git://") {
+                "git"
+            } else if url.starts_with("hg+") {
+                "mercurial"
+            } else if url.starts_with("svn+") || url.starts_with("svn://") {
+                "subversion"
+            } else if url.starts_with("bzr+") {
+                "breezy"
+            } else if url.starts_with("fossil+") {
+                "fossil"
+            } else {
+                continue;
+            };
+            if !tools.contains(&tool) {
+                tools.push(tool);
+            }
+        }
+        tools
+    }
+
     /// Effective values of an array key for one package on one arch:
     /// package override if present (an empty override clears), else base;
     /// plus the `_arch` variants from the same section.
@@ -368,6 +401,15 @@ pkgname = foo-docs
         assert!(!s.is_vcs());
         let g = Srcinfo::parse("pkgbase = x-git\n\tpkgver = r1\n\tpkgrel = 1\n\tsource = git+https://x\npkgname = x-git\n").unwrap();
         assert!(g.is_vcs());
+    }
+
+    #[test]
+    fn vcs_tools_from_sources() {
+        let g = Srcinfo::parse("pkgbase = x\n\tpkgver = 1\n\tpkgrel = 1\n\tsource = x::git+https://x#tag=v1\n\tsource = https://x/a.tar.gz\n\tsource_x86_64 = hg+https://y\npkgname = x\n").unwrap();
+        assert_eq!(g.vcs_tools("x86_64"), ["git", "mercurial"]);
+        assert_eq!(g.vcs_tools("aarch64"), ["git"]);
+        let plain = Srcinfo::parse("pkgbase = y\n\tpkgver = 1\n\tpkgrel = 1\n\tsource = https://x/a.tar.gz\npkgname = y\n").unwrap();
+        assert!(plain.vcs_tools("x86_64").is_empty());
     }
 
     #[test]
