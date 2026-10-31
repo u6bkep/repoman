@@ -569,6 +569,14 @@ and survives a worker reconnect.
 Review focus: protocol reconnection and idempotent job states.
 
 ### M1 — Build and publish, CLI only (3 sessions)
+
+Status 2026-10-31: implemented and running against the NAS coordinator with
+a user-namespace worker on the desktop. Verified on real packages: release
+(uhubctl), VCS with probe-driven rebuilds (joycond-git), arch=any build-once
+(pico-sdk, picotool), dependency discovery (picotool → pico-sdk), signed
+publishing to both stream repos, idle runs planning nothing. Remaining for
+the exit criterion: onboarding the real wanted list, the root system unit on
+the desktop, and switching clients.
 Streams with sync-DB parsing, base image builder and distribution, executor
 with all phases, cgroup limits, recorded peaks, network-off build, per-stream
 staging repos, planner with AUR dependency DAG and discovery loop, PGP key

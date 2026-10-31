@@ -60,7 +60,17 @@ unshare -Ur --map-auto -m -- repoman worker --config "$W/worker.toml"
 
 with `pacstrap_gpgdir = "$W/gnupg"` in the worker config, because the host's
 root-owned keyring is unreadable inside the namespace. cgroup limits and
-peak accounting are unavailable in this mode; everything else works.
+peak accounting are unavailable in this mode; everything else works. As a
+user systemd unit:
+
+```ini
+[Service]
+ExecStart=/usr/bin/unshare -Ur --map-auto -m -- %h/.local/bin/repoman worker --config %h/.config/repoman/worker.toml
+Restart=always
+```
+
+Files under the scratch directory end up owned by subordinate uids; remove
+them from inside a namespace (`unshare -Ur --map-auto rm -rf ...`).
 
 ## Clients
 
