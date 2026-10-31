@@ -1,0 +1,517 @@
+//! End-to-end run against a fake AUR (local bare git repos plus a stub RPC),
+//! a fake stream (a sync database served over HTTP), and a worker whose
+//! runner fabricates images and packages instead of calling pacstrap and
+//! makepkg. The coordinator's planner, gate, staging, repo-add publishing,
+//! baselines, and candidate lifecycle run for real.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use axum::Router;
+use axum::extract::{Path as AxPath, Query, State};
+use axum::routing::get;
+use repoman_alpm::srcinfo::Srcinfo;
+use repoman_alpm::syncdb::fixtures::{build_db, pkg};
+use repoman_alpm::syncdb::read_db;
+use repoman_common::config::{CoordinatorConfig, StreamConfig, WorkerConfig, WorkerCredential};
+use repoman_common::proto::{ArtifactInfo, JobKind, JobResult, JobSpec, Outcome};
+use repoman_store::Store;
+use repoman_worker::WorkerState;
+use repoman_worker::exec::{JobCtx, JobRunner, RunFuture};
+use serde_json::{Value, json};
+
+// ---------------------------------------------------------------------------
+// Fake AUR: bare repos under <dir>/aur, RPC metadata derived from them.
+
+struct FakeAur {
+    dir: PathBuf,
+    work: PathBuf,
+    /// pkgbase -> last_modified counter bumped on every push
+    stamps: Arc<Mutex<HashMap<String, i64>>>,
+}
+
+impl FakeAur {
+    fn new(root: &Path) -> Self {
+        let dir = root.join("aur");
+        let work = root.join("aur-work");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        FakeAur {
+            dir,
+            work,
+            stamps: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn git(&self, cwd: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_AUTHOR_NAME", "maint")
+            .env("GIT_AUTHOR_EMAIL", "m@x")
+            .env("GIT_COMMITTER_NAME", "maint")
+            .env("GIT_COMMITTER_EMAIL", "m@x")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// Create or update a package: writes PKGBUILD and .SRCINFO, commits,
+    /// pushes to the bare repo the coordinator clones from.
+    fn publish(&self, pkgbase: &str, pkgver: &str, depends: &[&str], makedepends: &[&str]) {
+        let bare = self.dir.join(format!("{pkgbase}.git"));
+        let wd = self.work.join(pkgbase);
+        if !bare.exists() {
+            self.git(&self.dir, &["init", "-q", "--bare", &format!("{pkgbase}.git")]);
+            std::fs::create_dir_all(&wd).unwrap();
+            self.git(&wd, &["init", "-q", "-b", "master"]);
+            self.git(&wd, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        }
+        let deps = depends.iter().map(|d| format!("\tdepends = {d}\n")).collect::<String>();
+        let mdeps = makedepends.iter().map(|d| format!("\tmakedepends = {d}\n")).collect::<String>();
+        std::fs::write(
+            wd.join(".SRCINFO"),
+            format!(
+                "pkgbase = {pkgbase}\n\tpkgdesc = fake {pkgbase}\n\tpkgver = {pkgver}\n\tpkgrel = 1\n\turl = https://example.org/{pkgbase}\n\tarch = x86_64\n\tlicense = MIT\n{mdeps}{deps}\tsource = https://example.org/{pkgbase}-{pkgver}.tar.gz\n\tsha256sums = SKIP\n\npkgname = {pkgbase}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            wd.join("PKGBUILD"),
+            format!("pkgname={pkgbase}\npkgver={pkgver}\npkgrel=1\narch=(x86_64)\nsource=()\npackage() {{ :; }}\n"),
+        )
+        .unwrap();
+        self.git(&wd, &["add", "-A"]);
+        self.git(&wd, &["commit", "-q", "-m", &format!("{pkgbase} {pkgver}")]);
+        self.git(&wd, &["push", "-q", "origin", "master"]);
+        let mut st = self.stamps.lock().unwrap();
+        let e = st.entry(pkgbase.to_string()).or_insert(1_700_000_000);
+        *e += 60;
+    }
+
+    fn git_url(&self) -> String {
+        format!("file://{}", self.dir.display())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stub HTTP: AUR RPC and a stream mirror.
+
+#[derive(Clone)]
+struct StubState {
+    stamps: Arc<Mutex<HashMap<String, i64>>>,
+    versions: Arc<Mutex<HashMap<String, String>>>,
+    core_db: Arc<Vec<u8>>,
+}
+
+async fn rpc_info(State(st): State<StubState>, Query(q): Query<Vec<(String, String)>>) -> axum::Json<Value> {
+    let stamps = st.stamps.lock().unwrap();
+    let versions = st.versions.lock().unwrap();
+    let results: Vec<Value> = q
+        .iter()
+        .filter(|(k, _)| k == "arg[]")
+        .filter_map(|(_, name)| {
+            let lm = stamps.get(name)?;
+            Some(json!({
+                "Name": name, "PackageBase": name, "Version": versions.get(name).cloned().unwrap_or_default(),
+                "LastModified": lm, "FirstSubmitted": 1_600_000_000, "Maintainer": "maint",
+                "NumVotes": 1, "Popularity": 0.5, "ID": 1, "PackageBaseID": 1,
+            }))
+        })
+        .collect();
+    axum::Json(json!({"type": "multiinfo", "resultcount": results.len(), "results": results, "version": 5}))
+}
+
+async fn rpc_search(AxPath(_name): AxPath<String>) -> axum::Json<Value> {
+    axum::Json(json!({"type": "search", "resultcount": 0, "results": [], "version": 5}))
+}
+
+async fn mirror_db(State(st): State<StubState>, AxPath((repo, _arch, file)): AxPath<(String, String, String)>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if repo == "core" && file == "core.db" {
+        ([(axum::http::header::LAST_MODIFIED, "Fri, 31 Oct 2026 00:00:00 GMT")], st.core_db.as_ref().clone()).into_response()
+    } else {
+        axum::http::StatusCode::NOT_FOUND.into_response()
+    }
+}
+
+async fn start_stub(st: StubState) -> String {
+    let app = Router::new()
+        .route("/rpc/v5/info", get(rpc_info))
+        .route("/rpc/v5/search/{name}", get(rpc_search))
+        .route("/mirror/{repo}/{arch}/{file}", get(mirror_db))
+        .with_state(st);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
+// ---------------------------------------------------------------------------
+// Fake worker runner.
+
+struct FakeRunner {
+    specs: Arc<Mutex<Vec<JobSpec>>>,
+}
+
+impl JobRunner for FakeRunner {
+    fn run<'a>(&'a self, ctx: &'a JobCtx, spec: &'a JobSpec) -> RunFuture<'a> {
+        self.specs.lock().unwrap().push(spec.clone());
+        Box::pin(async move {
+            match &spec.job {
+                JobKind::Image { stream, upload_url, .. } => {
+                    ctx.stage("pacstrap");
+                    let dir = ctx.job_dir();
+                    tokio::fs::create_dir_all(&dir).await?;
+                    let tarball = dir.join("image.tar.zst");
+                    let bytes = tarball_zst(&[("etc/os-release", b"fake")]);
+                    std::fs::write(&tarball, &bytes)?;
+                    let (sha, size) = repoman_worker::upload::sha256_file(&tarball)?;
+                    let filename = format!("{stream}-{}.tar.zst", &sha[..12]);
+                    repoman_worker::upload::put_blob(&ctx.http, upload_url, &ctx.config.token, &tarball, &sha, &filename).await?;
+                    ctx.stage_done("pacstrap");
+                    Ok(Outcome::success_with(JobResult::Image {
+                        sha256: sha,
+                        size,
+                        filename,
+                        packages: vec!["glibc 2.44-1".into()],
+                    }))
+                }
+                JobKind::Build {
+                    pkgbase,
+                    source_url,
+                    upload_url,
+                    aur_commit,
+                    ..
+                } => {
+                    ctx.stage("build");
+                    let dir = ctx.job_dir();
+                    tokio::fs::create_dir_all(&dir).await?;
+                    let src = ctx.http.get(source_url).send().await?.error_for_status()?.bytes().await?;
+                    let srcinfo = extract_srcinfo(&src, pkgbase)?;
+                    let si = Srcinfo::parse(&srcinfo)?;
+                    let mut artifacts = Vec::new();
+                    for name in si.pkgnames() {
+                        let ver = si.version();
+                        let depends = si.effective(name, "depends", "x86_64");
+                        let mut pkginfo = format!("pkgname = {name}\npkgbase = {pkgbase}\npkgver = {ver}\narch = x86_64\nsize = 10\n");
+                        for d in &depends {
+                            pkginfo.push_str(&format!("depend = {d}\n"));
+                        }
+                        let payload = format!("{pkgbase}@{aur_commit}");
+                        let bytes = tarball_zst(&[(".PKGINFO", pkginfo.as_bytes()), (&format!("usr/bin/{name}"), payload.as_bytes())]);
+                        let filename = format!("{name}-{ver}-x86_64.pkg.tar.zst");
+                        let path = dir.join(&filename);
+                        std::fs::write(&path, &bytes)?;
+                        let (sha, size) = repoman_worker::upload::sha256_file(&path)?;
+                        repoman_worker::upload::put_blob(&ctx.http, upload_url, &ctx.config.token, &path, &sha, &filename).await?;
+                        artifacts.push(ArtifactInfo {
+                            sha256: sha,
+                            filename,
+                            size,
+                            pkgname: name.to_string(),
+                            pkgbase: pkgbase.clone(),
+                            pkgver: ver,
+                            arch: "x86_64".into(),
+                            depends,
+                            provides: vec![],
+                            paths: vec![format!("usr/bin/{name}")],
+                            has_install_script: false,
+                            buildinfo: json!({}),
+                        });
+                    }
+                    ctx.stage_done("build");
+                    Ok(Outcome::success_with(JobResult::Build {
+                        artifacts,
+                        net_attempts: 0,
+                        outside_writes: vec![],
+                        upstream_rev: None,
+                    }))
+                }
+                other => anyhow::bail!("fake runner cannot run {}", other.name()),
+            }
+        })
+    }
+}
+
+fn tarball_zst(files: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut tar_bytes = Vec::new();
+    {
+        let mut ar = tar::Builder::new(&mut tar_bytes);
+        for (path, body) in files {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(body.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            ar.append_data(&mut h, path, *body).unwrap();
+        }
+        ar.finish().unwrap();
+    }
+    zstd::encode_all(&tar_bytes[..], 3).unwrap()
+}
+
+fn extract_srcinfo(tar_bytes: &[u8], pkgbase: &str) -> anyhow::Result<String> {
+    use std::io::Read;
+    let mut ar = tar::Archive::new(tar_bytes);
+    for e in ar.entries()? {
+        let mut e = e?;
+        let p = e.path()?.to_string_lossy().to_string();
+        if p == format!("{pkgbase}/.SRCINFO") {
+            let mut s = String::new();
+            e.read_to_string(&mut s)?;
+            return Ok(s);
+        }
+    }
+    anyhow::bail!("no .SRCINFO in source tarball")
+}
+
+// ---------------------------------------------------------------------------
+// Harness.
+
+struct Harness {
+    base: String,
+    specs: Arc<Mutex<Vec<JobSpec>>>,
+    aur: FakeAur,
+    versions: Arc<Mutex<HashMap<String, String>>>,
+    bulk: PathBuf,
+    _tmp: tempfile::TempDir,
+}
+
+async fn start() -> Harness {
+    let tmp = tempfile::tempdir().unwrap();
+    let aur = FakeAur::new(tmp.path());
+    let versions = Arc::new(Mutex::new(HashMap::new()));
+    let mut glibc = pkg("glibc", "2.44-1");
+    glibc.provides = vec!["libc.so=6-64".into()];
+    let core_db = build_db(&[glibc, pkg("cmake", "3.30-1"), pkg("python", "3.13-1")], false);
+    let stub = start_stub(StubState {
+        stamps: aur.stamps.clone(),
+        versions: versions.clone(),
+        core_db: Arc::new(core_db),
+    })
+    .await;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let bulk = tmp.path().join("bulk");
+    let config = CoordinatorConfig {
+        listen: addr.to_string(),
+        public_url: format!("http://{addr}"),
+        data_dir: tmp.path().join("data"),
+        bulk_dir: Some(bulk.clone()),
+        workers: vec![WorkerCredential {
+            name: "w1".into(),
+            token: "t1".into(),
+        }],
+        streams: vec![StreamConfig {
+            name: "s1".into(),
+            sort_order: 0,
+            server: format!("{stub}/mirror/$repo/$arch"),
+            repos: vec!["core".into()],
+            keyrings: vec![],
+        }],
+        aur_rpc_url: format!("{stub}/rpc/v5"),
+        aur_git_url: aur.git_url(),
+        ..Default::default()
+    };
+    std::fs::create_dir_all(&config.data_dir).unwrap();
+    let store = Arc::new(Store::open(&tmp.path().join("repoman.db")).unwrap());
+    tokio::spawn(repoman_coordinator::serve(config, store, listener));
+
+    let specs = Arc::new(Mutex::new(Vec::new()));
+    let state = WorkerState::with_runner(
+        2,
+        vec!["build".into(), "image".into(), "probe".into()],
+        Arc::new(FakeRunner { specs: specs.clone() }),
+    );
+    let wcfg = WorkerConfig {
+        coordinator: format!("ws://{addr}/ws/worker"),
+        name: "w1".into(),
+        token: "t1".into(),
+        slots: 2,
+        scratch_dir: tmp.path().join("scratch"),
+        arch: "x86_64".into(),
+        ..Default::default()
+    };
+    tokio::spawn(repoman_worker::run_with_state(wcfg, state));
+
+    let h = Harness {
+        base: format!("http://{addr}"),
+        specs,
+        aur,
+        versions,
+        bulk,
+        _tmp: tmp,
+    };
+    // Wait for the worker.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let v = h.get("/api/workers").await;
+        if v.as_array().unwrap().iter().any(|w| w["connected"] == true) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "worker never connected");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    h
+}
+
+impl Harness {
+    async fn get(&self, path: &str) -> Value {
+        reqwest::get(format!("{}{path}", self.base)).await.unwrap().json().await.unwrap()
+    }
+
+    async fn post(&self, path: &str, body: Value) -> Value {
+        let resp = reqwest::Client::new().post(format!("{}{path}", self.base)).json(&body).send().await.unwrap();
+        let status = resp.status();
+        let text = resp.text().await.unwrap();
+        assert!(status.is_success(), "POST {path}: {status} {text}");
+        serde_json::from_str(&text).unwrap_or(Value::Null)
+    }
+
+    fn publish_pkg(&self, pkgbase: &str, ver: &str, depends: &[&str], makedepends: &[&str]) {
+        self.aur.publish(pkgbase, ver, depends, makedepends);
+        self.versions.lock().unwrap().insert(pkgbase.to_string(), format!("{ver}-1"));
+    }
+
+    /// Start or resume a run and wait until it finishes or needs input.
+    async fn run(&self) -> Value {
+        let started = self.post("/api/runs", json!({})).await;
+        let id = started["id"].as_str().unwrap().to_string();
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            let v = self.get(&format!("/api/runs/{id}")).await;
+            if v["finished_at"].is_string() || v["state"] == "needs_input" {
+                return v;
+            }
+            assert!(Instant::now() < deadline, "run did not settle: {v}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    fn repo_db(&self) -> Vec<repoman_alpm::syncdb::SyncPackage> {
+        let p = self.bulk.join("repos/s1/x86_64/s1.db.tar.zst");
+        read_db(&std::fs::read(&p).unwrap_or_default()).unwrap_or_default()
+    }
+}
+
+#[tokio::test]
+async fn onboarding_build_publish_update_cycle() {
+    let h = start().await;
+    h.publish_pkg("foo", "1.0", &["glibc"], &["cmake"]);
+    h.publish_pkg("bar", "2.0", &["foo", "python"], &[]);
+    h.post("/api/packages", json!({"pkgbase": "foo", "streams": ["s1"]})).await;
+    h.post("/api/packages", json!({"pkgbase": "bar", "streams": ["s1"]})).await;
+
+    // Run 1: everything is new, so two onboarding candidates wait for us.
+    let r1 = h.run().await;
+    assert_eq!(r1["state"], "needs_input", "{r1}");
+    let pending = h.get("/api/candidates").await;
+    let pending = pending.as_array().unwrap();
+    assert_eq!(pending.len(), 2, "{pending:?}");
+    assert!(pending.iter().all(|c| c["kind"] == "onboarding"));
+    let images = h.get("/api/images").await;
+    assert_eq!(images.as_array().unwrap().len(), 1, "image built during run 1");
+
+    // Approving an onboarding candidate requires a class.
+    let bad = reqwest::Client::new()
+        .post(format!("{}/api/candidates/{}/decide", h.base, pending[0]["id"].as_str().unwrap()))
+        .json(&json!({"decision": "approve"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+    for c in pending {
+        h.post(
+            &format!("/api/candidates/{}/decide", c["id"].as_str().unwrap()),
+            json!({"decision": "approve", "class": "upstream-source"}),
+        )
+        .await;
+    }
+
+    // Run 2 (resume): builds foo then bar, publishes both.
+    let r2 = h.run().await;
+    assert_eq!(r2["state"], "done", "{r2}");
+    assert_eq!(r2["summary"]["builds_succeeded"], 2, "{}", r2["summary"]);
+    assert_eq!(r2["summary"]["published"], 2);
+    {
+        let specs = h.specs.lock().unwrap();
+        let builds: Vec<&JobSpec> = specs.iter().filter(|s| matches!(s.job, JobKind::Build { .. })).collect();
+        assert_eq!(builds.len(), 2);
+        assert_eq!(builds[0].pkgbase.as_deref(), Some("foo"), "dependency builds first");
+        assert_eq!(builds[1].pkgbase.as_deref(), Some("bar"));
+        if let JobKind::Build { install, pacman_conf, .. } = &builds[1].job {
+            assert_eq!(install, &["foo", "python"], "bar installs its AUR dep and the official one");
+            assert!(pacman_conf.contains("[repoman-staging]"), "staging repo precedes stream repos:\n{pacman_conf}");
+            assert!(pacman_conf.find("[repoman-staging]").unwrap() < pacman_conf.find("[core]").unwrap());
+        }
+        if let JobKind::Build { install, .. } = &builds[0].job {
+            assert_eq!(install, &["cmake", "glibc"]);
+        }
+    }
+    let db = h.repo_db();
+    let mut names: Vec<&str> = db.iter().map(|p| p.name.as_str()).collect();
+    names.sort();
+    assert_eq!(names, ["bar", "foo"]);
+    assert_eq!(db.iter().find(|p| p.name == "foo").unwrap().version, "1.0-1");
+    let foo = h.get("/api/packages/foo").await;
+    assert!(foo["baseline"]["aur_commit"].is_string(), "baseline advanced on publish");
+    let cands = h.get("/api/candidates?state=published").await;
+    assert_eq!(cands.as_array().unwrap().len(), 2);
+    // The repo files are served and resolvable.
+    let served = reqwest::get(format!("{}/repos/s1/x86_64/{}", h.base, db[0].filename)).await.unwrap();
+    assert_eq!(served.status(), 200);
+
+    // Run 3: nothing changed, nothing to do.
+    let r3 = h.run().await;
+    assert_eq!(r3["state"], "done");
+    assert_eq!(r3["summary"]["builds_planned"], 0, "{}", r3["summary"]);
+
+    // Upstream bumps foo. The candidate review shows the version change,
+    // bar is rebuilt as a dependent, and the repo carries the new versions.
+    h.publish_pkg("foo", "1.1", &["glibc"], &["cmake"]);
+    let r4 = h.run().await;
+    assert_eq!(r4["state"], "needs_input", "{r4}");
+    let pending = h.get("/api/candidates").await;
+    let pending = pending.as_array().unwrap();
+    assert_eq!(pending.len(), 1);
+    let c = &pending[0];
+    assert_eq!(c["kind"], "update");
+    assert_eq!(c["pkgbase"], "foo");
+    assert_eq!(c["review"]["version_from"], "1.0-1");
+    assert_eq!(c["review"]["version_to"], "1.1-1");
+    let changed: Vec<&str> = c["review"]["changes"].as_array().unwrap().iter().map(|x| x["key"].as_str().unwrap()).collect();
+    assert_eq!(changed, ["pkgver", "source"]);
+    assert_eq!(c["review"]["commits"].as_array().unwrap().len(), 1);
+    h.post(&format!("/api/candidates/{}/decide", c["id"].as_str().unwrap()), json!({"decision": "approve"})).await;
+
+    let r5 = h.run().await;
+    assert_eq!(r5["state"], "done", "{r5}");
+    assert_eq!(r5["summary"]["builds_succeeded"], 2, "foo and dependent bar: {}", r5["summary"]);
+    let db = h.repo_db();
+    assert_eq!(db.iter().find(|p| p.name == "foo").unwrap().version, "1.1-1");
+    assert_eq!(db.len(), 2, "old foo replaced, not duplicated");
+    let kinds: Vec<String> = h
+        .get("/api/candidates?state=published")
+        .await
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["kind"].as_str().unwrap().to_string())
+        .collect();
+    assert!(kinds.contains(&"dependency_rebuild".to_string()), "{kinds:?}");
+
+    // A rejected update stays rejected until the head moves.
+    h.publish_pkg("bar", "2.1", &["foo", "python"], &[]);
+    let r6 = h.run().await;
+    assert_eq!(r6["state"], "needs_input");
+    let pending = h.get("/api/candidates").await;
+    let c = &pending.as_array().unwrap()[0];
+    h.post(&format!("/api/candidates/{}/decide", c["id"].as_str().unwrap()), json!({"decision": "reject", "note": "nope"})).await;
+    let r7 = h.run().await;
+    assert_eq!(r7["state"], "done", "{r7}");
+    assert_eq!(r7["summary"]["builds_planned"], 0);
+    assert_eq!(h.repo_db().iter().find(|p| p.name == "bar").unwrap().version, "2.0-1");
+}

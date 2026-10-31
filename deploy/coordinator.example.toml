@@ -1,10 +1,34 @@
 # repoman coordinator configuration.
-# Runs on the NAS. Keep data_dir on fast storage; it holds the SQLite database.
+# Runs on the NAS. data_dir holds SQLite and GPG homes (SSD); bulk_dir holds
+# the artifact store, repos, images, staging, sync databases, and AUR clones.
 
 listen = "0.0.0.0:7800"
+# How workers and build roots reach this coordinator.
+public_url = "http://repoman.b.intern.gecko.network:7800"
 data_dir = "/var/lib/repoman"
+bulk_dir = "/var/lib/repoman/bulk"
 orphan_grace_secs = 120
+arch = "x86_64"
+image_packages = ["base", "base-devel"]
+image_max_age_secs = 86400
+# Set after `repoman keygen`; publishing is unsigned until then.
+# signing_key = "FINGERPRINT"
 
 [[workers]]
-name = "desktop"
+name = "b-dtop"
 token = "replace-with-a-long-random-string"
+
+# Streams, most conservative first. `server` is a pacman Server template.
+[[streams]]
+name = "manjaro-stable"
+sort_order = 0
+server = "https://cofractal-ewr.mm.fcix.net/manjaro/stable/$repo/$arch"
+repos = ["core", "extra", "multilib"]
+keyrings = ["archlinux", "manjaro"]
+
+[[streams]]
+name = "manjaro-unstable"
+sort_order = 1
+server = "https://cofractal-ewr.mm.fcix.net/manjaro/unstable/$repo/$arch"
+repos = ["core", "extra", "multilib"]
+keyrings = ["archlinux", "manjaro"]

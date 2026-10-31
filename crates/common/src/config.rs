@@ -84,6 +84,7 @@ impl Default for WorkerConfig {
             job_memory_limit: None,
             job_timeout_secs: default_job_timeout(),
             build_uid: default_build_uid(),
+            pacstrap_gpgdir: None,
         }
     }
 }
@@ -181,6 +182,10 @@ pub struct WorkerConfig {
     /// Unprivileged uid and gid used for makepkg inside build roots.
     #[serde(default = "default_build_uid")]
     pub build_uid: u32,
+    /// Host-side pacman keyring directory used by pacstrap to verify stream
+    /// packages while building images. Defaults to the host's own keyring.
+    #[serde(default)]
+    pub pacstrap_gpgdir: Option<PathBuf>,
 }
 
 impl WorkerConfig {

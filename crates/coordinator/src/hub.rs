@@ -32,6 +32,7 @@ pub struct Hub {
     connected: Mutex<HashMap<String, Connected>>,
     wake: Notify,
     next_conn_id: AtomicU64,
+    done: tokio::sync::broadcast::Sender<JobId>,
 }
 
 struct Connected {
@@ -67,12 +68,18 @@ impl Hub {
             connected: Mutex::new(HashMap::new()),
             wake: Notify::new(),
             next_conn_id: AtomicU64::new(1),
+            done: tokio::sync::broadcast::channel(1024).0,
         })
     }
 
     /// Wake the dispatcher, e.g. after a job was created.
     pub fn notify(&self) {
         self.wake.notify_one();
+    }
+
+    /// Receive the id of every job that reaches a terminal state.
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<JobId> {
+        self.done.subscribe()
     }
 
     pub fn connected_workers(&self) -> Vec<ConnectedWorker> {
@@ -334,6 +341,7 @@ impl Hub {
             WorkerMsg::Finished { job_id, outcome } => {
                 let applied = self.store.finish_job(&job_id, worker, &outcome)?;
                 self.release_slot(worker, &job_id);
+                let _ = self.done.send(job_id.clone());
                 if applied {
                     tracing::info!(%worker, job = %job_id, exit = outcome.exit_code, "job finished");
                     self.store.event(

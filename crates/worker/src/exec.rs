@@ -1,7 +1,13 @@
 //! Job execution: dispatch by kind, shared reporting context, process
 //! supervision with timeouts and log capture.
+//!
+//! The dispatch itself sits behind the `JobRunner` trait so integration
+//! tests can drive the coordinator with a worker that fakes images and
+//! packages instead of needing root and pacstrap.
 
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::process::ExitStatus;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -21,7 +27,7 @@ pub struct JobCtx {
     pub config: Arc<WorkerConfig>,
     pub http: reqwest::Client,
     state: Arc<WorkerState>,
-    job_id: JobId,
+    pub job_id: JobId,
     cgroup: Mutex<Option<JobCgroup>>,
     scratch_peak: Mutex<u64>,
 }
@@ -104,6 +110,71 @@ impl JobCtx {
     }
 }
 
+pub type RunFuture<'a> = Pin<Box<dyn Future<Output = Result<Outcome>> + Send + 'a>>;
+
+/// Executes one job kind. The real runner shells out to pacstrap, unshare,
+/// and makepkg; tests substitute their own.
+pub trait JobRunner: Send + Sync + 'static {
+    fn run<'a>(&'a self, ctx: &'a JobCtx, spec: &'a JobSpec) -> RunFuture<'a>;
+}
+
+pub struct RealRunner;
+
+impl JobRunner for RealRunner {
+    fn run<'a>(&'a self, ctx: &'a JobCtx, spec: &'a JobSpec) -> RunFuture<'a> {
+        Box::pin(async move {
+            match &spec.job {
+                JobKind::Noop { duration_ms, fail } => noop(ctx, *duration_ms, *fail).await,
+                JobKind::Image {
+                    stream,
+                    pacman_conf,
+                    packages,
+                    keyrings,
+                    makepkg_conf_extra,
+                    upload_url,
+                } => crate::image::build_image(ctx, stream, pacman_conf, packages, keyrings, makepkg_conf_extra, upload_url)
+                    .await
+                    .map(Outcome::success_with),
+                JobKind::Build {
+                    pkgbase,
+                    image,
+                    source_url,
+                    pacman_conf,
+                    install,
+                    pgp_keys,
+                    skip_pgp,
+                    upload_url,
+                    ..
+                } => crate::build::run_build(
+                    ctx,
+                    crate::build::BuildParams {
+                        pkgbase,
+                        image,
+                        source_url,
+                        pacman_conf,
+                        install,
+                        pgp_keys,
+                        skip_pgp: *skip_pgp,
+                        upload_url,
+                        makepkg_conf_extra: "",
+                    },
+                )
+                .await
+                .map(Outcome::success_with),
+                JobKind::Inspect {
+                    pkgbase,
+                    image,
+                    source_url,
+                    ..
+                } => crate::build::run_inspect(ctx, pkgbase, image, source_url)
+                    .await
+                    .map(Outcome::success_with),
+                JobKind::Probe { sources, .. } => crate::probe::run_probe(ctx, sources).await.map(Outcome::success_with),
+            }
+        })
+    }
+}
+
 /// Run a job to completion and report `Finished`.
 pub async fn run_job(spec: JobSpec, config: Arc<WorkerConfig>, state: Arc<WorkerState>) {
     let _permit = state
@@ -126,55 +197,7 @@ pub async fn run_job(spec: JobSpec, config: Arc<WorkerConfig>, state: Arc<Worker
         job_id: spec.id.clone(),
     });
 
-    let result: Result<Outcome> = match &spec.job {
-        JobKind::Noop { duration_ms, fail } => noop(&ctx, *duration_ms, *fail).await,
-        JobKind::Image {
-            stream,
-            pacman_conf,
-            packages,
-            keyrings,
-            makepkg_conf_extra,
-            upload_url,
-        } => crate::image::build_image(&ctx, stream, pacman_conf, packages, keyrings, makepkg_conf_extra, upload_url)
-            .await
-            .map(Outcome::success_with),
-        JobKind::Build {
-            pkgbase,
-            image,
-            source_url,
-            pacman_conf,
-            install,
-            pgp_keys,
-            skip_pgp,
-            upload_url,
-            ..
-        } => crate::build::run_build(
-            &ctx,
-            crate::build::BuildParams {
-                pkgbase,
-                image,
-                source_url,
-                pacman_conf,
-                install,
-                pgp_keys,
-                skip_pgp: *skip_pgp,
-                upload_url,
-                makepkg_conf_extra: "",
-            },
-        )
-        .await
-        .map(Outcome::success_with),
-        JobKind::Inspect {
-            pkgbase,
-            image,
-            source_url,
-            ..
-        } => crate::build::run_inspect(&ctx, pkgbase, image, source_url)
-            .await
-            .map(Outcome::success_with),
-        JobKind::Probe { sources, .. } => crate::probe::run_probe(&ctx, sources).await.map(Outcome::success_with),
-    };
-
+    let result = state.runner.run(&ctx, &spec).await;
     let mut outcome = match result {
         Ok(o) => o,
         Err(e) => {

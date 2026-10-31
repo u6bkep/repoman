@@ -57,7 +57,7 @@ else
   mount --bind "$REPOMAN_LOWER" "$ROOT"
 fi
 mount -t proc -o nosuid,noexec,nodev proc "$ROOT/proc"
-mount -t sysfs -o ro,nosuid,nodev,noexec sys "$ROOT/sys"
+mount -t sysfs -o ro,nosuid,nodev,noexec sys "$ROOT/sys" 2>/dev/null || { mount --rbind /sys "$ROOT/sys"; mount --make-rslave "$ROOT/sys"; }
 mount -t tmpfs -o mode=755,nosuid,nodev tmpfs "$ROOT/run"
 mount -t tmpfs -o nosuid,nodev tmpfs "$ROOT/tmp"
 mkdir -p "$ROOT/dev"
@@ -70,7 +70,7 @@ while [ $i -lt "${REPOMAN_BINDS:-0}" ]; do
   mount --bind "$src" "$ROOT$dst"
   i=$((i+1))
 done
-hostname "${REPOMAN_HOSTNAME:-repoman}"
+hostname "${REPOMAN_HOSTNAME:-repoman}" 2>/dev/null || true
 if [ "${REPOMAN_NET:-0}" = 1 ]; then
   cp -L /etc/resolv.conf "$ROOT/etc/resolv.conf" 2>/dev/null || true
 else

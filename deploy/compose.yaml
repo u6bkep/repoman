@@ -25,6 +25,7 @@ services:
     volumes:
       - ./coordinator.toml:/etc/repoman/coordinator.toml:ro
       - /srv/db/repoman/coordinator:/var/lib/repoman
+      - /media/data/repoman:/var/lib/repoman/bulk
     environment:
       RUST_LOG: info
 

@@ -10,7 +10,9 @@ use tokio::net::TcpListener;
 pub mod api;
 pub mod aur;
 pub mod blobs;
+pub mod engine;
 pub mod hub;
+pub mod keys;
 pub mod planner;
 pub mod publisher;
 pub mod streams;
@@ -20,6 +22,37 @@ pub struct AppState {
     pub config: Arc<CoordinatorConfig>,
     pub store: Arc<Store>,
     pub hub: Arc<hub::Hub>,
+    pub streams: Arc<streams::Streams>,
+    pub aur: Arc<aur::Aur>,
+    pub blobs: Arc<blobs::Blobs>,
+    pub publisher: Arc<publisher::Publisher>,
+    pub keys: Arc<keys::Keys>,
+    pub engine: Arc<engine::Engine>,
+}
+
+impl AppState {
+    pub fn new(config: CoordinatorConfig, store: Arc<Store>) -> Result<Self> {
+        let config = Arc::new(config);
+        std::fs::create_dir_all(config.bulk_dir())?;
+        let hub = hub::Hub::new(store.clone(), &config);
+        let streams = Arc::new(streams::Streams::new(config.clone())?);
+        streams.load_cached()?;
+        let aur = Arc::new(aur::Aur::new(&config.aur_rpc_url, &config.aur_git_url, &config.bulk_dir())?);
+        let blobs = Arc::new(blobs::Blobs::new(&config.bulk_dir())?);
+        let publisher = Arc::new(publisher::Publisher::new(&config)?);
+        let keys = Arc::new(keys::Keys::new(&config.data_dir)?);
+        Ok(AppState {
+            config,
+            store,
+            hub,
+            streams,
+            aur,
+            blobs,
+            publisher,
+            keys,
+            engine: engine::Engine::new(),
+        })
+    }
 }
 
 /// Open the store under `config.data_dir` and serve on `config.listen`.
@@ -36,10 +69,8 @@ pub async fn run(config: CoordinatorConfig) -> Result<()> {
 
 /// Serve on an already-bound listener. Tests use this with port 0.
 pub async fn serve(config: CoordinatorConfig, store: Arc<Store>, listener: TcpListener) -> Result<()> {
-    let config = Arc::new(config);
-    let hub = hub::Hub::new(store.clone(), &config);
-    tokio::spawn(hub.clone().dispatcher());
-    let state = AppState { config, store, hub };
+    let state = AppState::new(config, store)?;
+    tokio::spawn(state.hub.clone().dispatcher());
     axum::serve(listener, api::router(state)).await?;
     Ok(())
 }

@@ -40,12 +40,19 @@ pub struct WorkerState {
     pub slots: Arc<Semaphore>,
     pub cgroups: cgroup::CgroupManager,
     pub capabilities: Vec<String>,
+    pub runner: Arc<dyn exec::JobRunner>,
 }
 
 impl WorkerState {
     /// State for tests and unprivileged use: no cgroups, no sandbox.
     pub fn new(slots: u32) -> Arc<Self> {
-        Self::with_capabilities(slots, cgroup::CgroupManager::disabled(), Vec::new())
+        Self::with_capabilities(slots, cgroup::CgroupManager::disabled(), Vec::new(), Arc::new(exec::RealRunner))
+    }
+
+    /// State with a custom job runner, for integration tests that fake the
+    /// privileged executor.
+    pub fn with_runner(slots: u32, capabilities: Vec<String>, runner: Arc<dyn exec::JobRunner>) -> Arc<Self> {
+        Self::with_capabilities(slots, cgroup::CgroupManager::disabled(), capabilities, runner)
     }
 
     /// Detect what this process can do and set up cgroups accordingly.
@@ -66,10 +73,10 @@ impl WorkerState {
         } else {
             cgroup::CgroupManager::disabled()
         };
-        Self::with_capabilities(slots, cgroups, caps)
+        Self::with_capabilities(slots, cgroups, caps, Arc::new(exec::RealRunner))
     }
 
-    fn with_capabilities(slots: u32, cgroups: cgroup::CgroupManager, capabilities: Vec<String>) -> Arc<Self> {
+    fn with_capabilities(slots: u32, cgroups: cgroup::CgroupManager, capabilities: Vec<String>, runner: Arc<dyn exec::JobRunner>) -> Arc<Self> {
         let (tx, rx) = mpsc::unbounded_channel();
         Arc::new(WorkerState {
             tx,
@@ -79,6 +86,7 @@ impl WorkerState {
             slots: Arc::new(Semaphore::new(slots as usize)),
             cgroups,
             capabilities,
+            runner,
         })
     }
 

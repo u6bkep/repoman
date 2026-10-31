@@ -96,10 +96,13 @@ pub async fn build_image(
     // the shared worker cache so downloads are reused by build roots.
     let cache_dir = cfg.scratch_dir.join("pkgcache");
     tokio::fs::create_dir_all(&cache_dir).await?;
-    let conf_text = format!(
-        "{pacman_conf}\n# host-side cache for pacstrap\n[options]\nCacheDir = {}\n",
+    let mut conf_text = format!(
+        "{pacman_conf}\n# host-side settings for pacstrap\n[options]\nCacheDir = {}\n",
         cache_dir.display()
     );
+    if let Some(g) = &cfg.pacstrap_gpgdir {
+        conf_text.push_str(&format!("GPGDir = {}\n", g.display()));
+    }
     tokio::fs::write(&conf_path, conf_text).await?;
 
     ctx.stage("pacstrap");

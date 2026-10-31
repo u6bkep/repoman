@@ -257,9 +257,8 @@ impl SyncIndex {
     }
 }
 
-#[cfg(test)]
-pub mod testutil {
-    //! Build small sync databases in memory for tests.
+pub mod fixtures {
+    //! Build small sync databases in memory, for tests and local fixtures.
     use super::*;
     use std::io::Write;
 
@@ -358,7 +357,7 @@ pub mod testutil {
 
 #[cfg(test)]
 mod tests {
-    use super::testutil::*;
+    use super::fixtures::*;
     use super::*;
 
     #[test]

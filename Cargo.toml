@@ -32,5 +32,11 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
+axum = "0.8.9"
+repoman-alpm = { path = "crates/alpm" }
 repoman-store = { path = "crates/store" }
+tar = "0.4.46"
 tempfile = "3.27.0"
+tokio-util = "0.7.20"
+tower-http = { version = "0.7.1", features = ["fs"] }
+zstd = "0.14.3"

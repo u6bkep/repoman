@@ -1,8 +1,14 @@
 # repoman worker configuration.
-# Runs on a build host. The worker connects out to the coordinator.
+# Runs on a build host as root (M1+): the executor needs mount, namespace,
+# and cgroup privileges. The worker connects out to the coordinator.
 
-coordinator = "ws://b-srv0:7800/ws/worker"
-name = "desktop"
+coordinator = "ws://repoman.b.intern.gecko.network:7800/ws/worker"
+name = "b-dtop"
 token = "replace-with-a-long-random-string"
 slots = 4
+# Build roots, base images, package cache, and source cache live here.
 scratch_dir = "/var/lib/repoman-worker"
+# Per-job memory limit in bytes (cgroup v2); unset for none.
+# job_memory_limit = 17179869184
+job_timeout_secs = 14400
+build_uid = 1500
