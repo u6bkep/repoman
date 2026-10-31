@@ -146,8 +146,11 @@ stream         (name PK, distro, branch, mirror_url, keyring_pkg, repos JSON,
                 arch, sort_order)
 package        (pkgbase PK, provenance_class, policy JSON, kind, added_at)
                 -- kind: release | vcs
-                -- policy: pgp = fetch|skip, quarantine_days, auto_metadata,
-                --         versioned_interpreter_override, provider_choices
+                -- policy keys: pgp = "skip" (sources without a fetchable key),
+                --   allow_network_build = true (prepare() fetches at build time;
+                --   found on pico-sdk), build_once = true|false (override the
+                --   arch=any rule), provider_choices = {dep: pkgname},
+                --   quarantine_days, auto_metadata
 package_stream (pkgbase, stream, wanted BOOL, required BOOL)
 baseline       (pkgbase PK, aur_commit, srcinfo_hash, published_at, note)
 aur_snapshot   (pkgbase, fetched_at, last_modified, maintainer, submitter,
@@ -290,7 +293,8 @@ upper directory at teardown.
    `SRCDEST`, checks checksums and PGP signatures, exits. Network on. For
    `vcs` packages this updates the mirror clone in `SRCDEST`.
 4. **build** — enter a network namespace with loopback only (M2: plus an
-   nftables rule that counts and logs any non-loopback egress), then run
+   nftables rule that counts and logs any non-loopback egress), unless the
+   package's policy sets `allow_network_build`, which the log records; then run
    `makepkg --holdver --noconfirm` as the build uid. Sources are already in
    `SRCDEST`, so extraction, `prepare()`, `pkgver()`, `build()`, `check()`,
    and `package()` all run offline. `--holdver` prevents the VCS re-fetch
