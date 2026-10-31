@@ -81,7 +81,10 @@ else
   ip link set lo up 2>/dev/null || true
   : > "$ROOT/etc/resolv.conf"
 fi
-if [ "${REPOMAN_CHROOT:-1}" = 1 ]; then exec chroot "$ROOT" "$@"; fi
+if [ "${REPOMAN_CHROOT:-1}" = 1 ]; then
+  exec chroot "$ROOT" /bin/sh -c 'cd "$1" && shift && exec "$@"' sh "${REPOMAN_CWD:-/}" "$@"
+fi
+cd "${REPOMAN_CWD:-/}"
 exec "$@"
 "#;
 
@@ -130,9 +133,6 @@ impl Sandbox {
         for (k, v) in env {
             inner.push(format!("{k}={v}"));
         }
-        // `env -C dir` changes directory before exec (coreutils >= 8.28).
-        inner.push("-C".into());
-        inner.push(cwd.to_string());
         inner.extend(argv.iter().cloned());
         cmd.args(&inner);
 
@@ -147,6 +147,7 @@ impl Sandbox {
             }
         }
         cmd.env("REPOMAN_ROOT", &self.mountpoint)
+            .env("REPOMAN_CWD", cwd)
             .env("REPOMAN_CHROOT", if self.chroot { "1" } else { "0" })
             .env("REPOMAN_NET", if self.network { "1" } else { "0" })
             .env("REPOMAN_HOSTNAME", &self.hostname)
@@ -263,14 +264,13 @@ mod tests {
         let setpriv = args.iter().position(|a| a == "setpriv").unwrap();
         assert_eq!(args[setpriv + 1], "--reuid=1500");
         assert!(args.contains(&"HOME=/build".to_string()));
-        let c_flag = args.iter().rposition(|a| a == "-C").unwrap();
-        assert_eq!(args[c_flag + 1], "/build/foo");
         assert_eq!(&args[args.len() - 2..], ["makepkg", "--holdver"]);
         let envs: Vec<(String, String)> = std_cmd
             .get_envs()
             .filter_map(|(k, v)| Some((k.to_string_lossy().to_string(), v?.to_string_lossy().to_string())))
             .collect();
         assert!(envs.contains(&("REPOMAN_UPPER".into(), "/j/upper".into())));
+        assert!(envs.contains(&("REPOMAN_CWD".into(), "/build/foo".into())));
         assert!(envs.contains(&("REPOMAN_NET".into(), "0".into())));
         assert!(envs.contains(&("REPOMAN_BIND_DST_0".into(), "/build".into())));
         assert!(envs.contains(&("REPOMAN_CGROUP".into(), "/sys/fs/cgroup/x".into())));
