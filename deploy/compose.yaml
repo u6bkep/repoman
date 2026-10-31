@@ -1,0 +1,18 @@
+# docker compose for the coordinator on the NAS.
+#   docker compose -f deploy/compose.yaml up -d --build
+# Adjust the host paths: state on the SSD, bulk data on the HDD array (M1+).
+
+services:
+  coordinator:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: repoman:v2
+    restart: unless-stopped
+    ports:
+      - "7800:7800"
+    volumes:
+      - ./coordinator.toml:/etc/repoman/coordinator.toml:ro
+      - /srv/repoman/state:/var/lib/repoman
+    environment:
+      RUST_LOG: info

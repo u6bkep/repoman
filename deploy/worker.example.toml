@@ -1,0 +1,8 @@
+# repoman worker configuration.
+# Runs on a build host. The worker connects out to the coordinator.
+
+coordinator = "ws://b-srv0:7800/ws/worker"
+name = "desktop"
+token = "replace-with-a-long-random-string"
+slots = 4
+scratch_dir = "/var/lib/repoman-worker"

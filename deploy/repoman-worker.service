@@ -1,0 +1,17 @@
+# systemd unit for a build worker. Install to /etc/systemd/system/.
+# M1 adds mount, namespace, and cgroup needs: ProtectSystem=strict with
+# ReadWritePaths for scratch and images, CAP_SYS_ADMIN, Delegate=yes.
+
+[Unit]
+Description=repoman build worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/repoman worker --config /etc/repoman/worker.toml
+Restart=always
+RestartSec=5
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target

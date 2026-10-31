@@ -1,0 +1,10 @@
+# repoman coordinator configuration.
+# Runs on the NAS. Keep data_dir on fast storage; it holds the SQLite database.
+
+listen = "0.0.0.0:7800"
+data_dir = "/var/lib/repoman"
+orphan_grace_secs = 120
+
+[[workers]]
+name = "desktop"
+token = "replace-with-a-long-random-string"
