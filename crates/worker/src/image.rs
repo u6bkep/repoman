@@ -19,6 +19,7 @@ pub fn image_root(scratch: &Path, sha256: &str) -> PathBuf {
 pub async fn ensure_image(ctx: &JobCtx, image: &ImageRef) -> Result<PathBuf> {
     let root = image_root(&ctx.config.scratch_dir, &image.sha256);
     if root.join("usr").is_dir() && root.join(".repoman-complete").exists() {
+        touch_image(&root);
         return Ok(root);
     }
     ctx.log(Fd::System, format!("fetching base image {}", &image.sha256[..12]));
@@ -176,6 +177,8 @@ pub async fn build_image(
          mkdir -p /build /srcdest /etc/makepkg.conf.d\n\
          chown {uid}:{gid} /build /srcdest\n\
          cat > /etc/makepkg.conf.d/repoman.conf <<'EOF'\n{conf}EOF\n\
+         gpgconf --homedir /etc/pacman.d/gnupg --kill all >/dev/null 2>&1 || true\n\
+         rm -f /etc/pacman.d/gnupg/S.*\n\
          rm -f /etc/resolv.conf; : > /etc/resolv.conf\n\
          pacman -Q > /.repoman-packages\n",
         uid = cfg.build_uid,
@@ -241,4 +244,48 @@ pub async fn build_image(
         filename,
         packages: packages_installed,
     })
+}
+
+/// Remove unpacked images whose completion marker has not been touched for
+/// `max_age_days`, and failed job directories older than `keep_failed_days`.
+/// `ensure_image` touches the marker on every use.
+pub fn prune_scratch(scratch: &Path, image_max_age_days: u64, keep_failed_days: u64) {
+    let now = std::time::SystemTime::now();
+    let older_than = |p: &Path, days: u64| -> bool {
+        std::fs::metadata(p)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|age| age.as_secs() > days * 86_400)
+    };
+    if let Ok(entries) = std::fs::read_dir(scratch.join("images")) {
+        for e in entries.flatten() {
+            let marker = e.path().join("root").join(".repoman-complete");
+            let stale = if marker.exists() {
+                older_than(&marker, image_max_age_days)
+            } else {
+                // Incomplete unpack or leftover tarball: remove after a day.
+                older_than(&e.path(), 1)
+            };
+            if stale {
+                tracing::info!(path = %e.path().display(), "pruning unused image");
+                let _ = std::fs::remove_dir_all(e.path());
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(scratch.join("jobs")) {
+        for e in entries.flatten() {
+            if older_than(&e.path(), keep_failed_days) {
+                tracing::info!(path = %e.path().display(), "pruning old job directory");
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
+    }
+}
+
+/// Mark an image as recently used.
+pub fn touch_image(root: &Path) {
+    let marker = root.join(".repoman-complete");
+    let _ = std::fs::OpenOptions::new().write(true).open(&marker).and_then(|f| f.set_modified(std::time::SystemTime::now()));
 }

@@ -188,6 +188,7 @@ async fn ensure_image(app: &AppState, stream: &StreamConfig) -> Result<ImageRef>
                 .insert_image(&sha256, &stream.name, &filename, size, Some(&fingerprint), &packages)?;
             for old in app.store.retire_old_images(&stream.name, 2)? {
                 tracing::info!(image = %old, "retired old image");
+                let _ = app.blobs.delete(&old);
             }
             Ok(image_ref(app, &sha256, &filename))
         }

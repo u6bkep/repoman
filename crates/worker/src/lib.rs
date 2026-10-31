@@ -116,6 +116,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
 pub async fn run_with_state(config: WorkerConfig, state: Arc<WorkerState>) -> Result<()> {
     std::fs::create_dir_all(&config.scratch_dir)
         .with_context(|| format!("creating {}", config.scratch_dir.display()))?;
+    image::prune_scratch(&config.scratch_dir, 14, 3);
     let config = Arc::new(config);
     let mut backoff = Duration::from_secs(1);
     loop {
