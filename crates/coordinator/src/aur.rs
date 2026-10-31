@@ -178,9 +178,12 @@ impl Aur {
     }
 
     /// Mirror an arbitrary git repository holding a PKGBUILD at its root,
-    /// for packages that are not on the AUR (such as repoman itself).
+    /// for packages that are not on the AUR (such as repoman itself). The URL
+    /// may carry a makepkg-style `#branch=<name>` fragment; without one the
+    /// remote's default branch is followed.
     pub async fn sync_from(&self, pkgbase: &str, url: &str) -> Result<String> {
         validate_pkgbase(pkgbase)?;
+        let (url, branch) = split_source_fragment(url)?;
         let path = self.mirror_path(pkgbase);
         if path.join("HEAD").exists() {
             self.git(&["fetch", "--quiet", "--prune", "origin"], Some(&path))
@@ -196,6 +199,15 @@ impl Aur {
             .await
             .with_context(|| format!("cloning {pkgbase}"))?;
             std::fs::rename(&tmp, &path)?;
+        }
+        if let Some(branch) = branch {
+            // A mirror clone carries every branch; point HEAD at the wanted one
+            // so head()/show()/archive() all follow it.
+            let r = format!("refs/heads/{branch}");
+            self.git(&["rev-parse", "--verify", "--quiet", &format!("{r}^{{commit}}")], Some(&path))
+                .await
+                .with_context(|| format!("{pkgbase}: no branch {branch:?} in {url}"))?;
+            self.git(&["symbolic-ref", "HEAD", &r], Some(&path)).await?;
         }
         self.head(pkgbase).await
     }
@@ -292,6 +304,28 @@ impl Aur {
     }
 }
 
+/// Split a git source URL from its makepkg-style fragment. Only `branch=`
+/// is understood; a commit or tag would make the source static, which the
+/// commit-as-clock polling has no use for.
+pub fn split_source_fragment(url: &str) -> Result<(String, Option<String>)> {
+    let Some((base, frag)) = url.split_once('#') else {
+        return Ok((url.to_string(), None));
+    };
+    let Some(branch) = frag.strip_prefix("branch=") else {
+        bail!("unsupported source fragment {frag:?}; only #branch=<name> is understood");
+    };
+    let ok = !branch.is_empty()
+        && !branch.starts_with('-')
+        && !branch.contains("..")
+        && branch
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'+' | b'-'));
+    if !ok {
+        bail!("invalid branch name {branch:?}");
+    }
+    Ok((base.to_string(), Some(branch.to_string())))
+}
+
 fn validate_pkgbase(s: &str) -> Result<()> {
     let ok = !s.is_empty()
         && s.len() <= 255
@@ -319,6 +353,18 @@ fn urlencode(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn source_fragments() {
+        let (u, b) = super::split_source_fragment("https://x/r.git").unwrap();
+        assert_eq!((u.as_str(), b), ("https://x/r.git", None));
+        let (u, b) = super::split_source_fragment("https://x/r.git#branch=v2-main").unwrap();
+        assert_eq!((u.as_str(), b.as_deref()), ("https://x/r.git", Some("v2-main")));
+        assert!(super::split_source_fragment("https://x/r.git#commit=abc").is_err());
+        assert!(super::split_source_fragment("https://x/r.git#branch=").is_err());
+        assert!(super::split_source_fragment("https://x/r.git#branch=-x").is_err());
+        assert!(super::split_source_fragment("https://x/r.git#branch=a..b").is_err());
+    }
+
     use super::*;
 
     #[test]

@@ -69,6 +69,11 @@ impl FakeAur {
             self.git(&wd, &["init", "-q", "-b", "master"]);
             self.git(&wd, &["remote", "add", "origin", bare.to_str().unwrap()]);
         }
+        self.publish_inner(pkgbase, pkgver, depends, makedepends, "master");
+    }
+
+    fn publish_inner(&self, pkgbase: &str, pkgver: &str, depends: &[&str], makedepends: &[&str], branch: &str) {
+        let wd = self.work.join(pkgbase);
         let deps = depends.iter().map(|d| format!("\tdepends = {d}\n")).collect::<String>();
         let mdeps = makedepends.iter().map(|d| format!("\tmakedepends = {d}\n")).collect::<String>();
         std::fs::write(
@@ -85,10 +90,20 @@ impl FakeAur {
         .unwrap();
         self.git(&wd, &["add", "-A"]);
         self.git(&wd, &["commit", "-q", "-m", &format!("{pkgbase} {pkgver}")]);
-        self.git(&wd, &["push", "-q", "origin", "master"]);
+        self.git(&wd, &["push", "-q", "origin", branch]);
         let mut st = self.stamps.lock().unwrap();
         let e = st.entry(pkgbase.to_string()).or_insert(1_700_000_000);
         *e += 60;
+    }
+
+    /// Like publish, but commits on `branch` (created from master if new)
+    /// and pushes only that branch, leaving master where it was.
+    fn publish_on_branch(&self, pkgbase: &str, branch: &str, pkgver: &str, depends: &[&str], makedepends: &[&str]) {
+        let wd = self.work.join(pkgbase);
+        assert!(wd.exists(), "publish {pkgbase} on master first");
+        self.git(&wd, &["checkout", "-q", "-B", branch]);
+        self.publish_inner(pkgbase, pkgver, depends, makedepends, branch);
+        self.git(&wd, &["checkout", "-q", "master"]);
     }
 
     fn git_url(&self) -> String {
@@ -371,6 +386,10 @@ impl Harness {
         serde_json::from_str(&text).unwrap_or(Value::Null)
     }
 
+    async fn post_status(&self, path: &str, body: Value) -> u16 {
+        reqwest::Client::new().post(format!("{}{path}", self.base)).json(&body).send().await.unwrap().status().as_u16()
+    }
+
     fn publish_pkg(&self, pkgbase: &str, ver: &str, depends: &[&str], makedepends: &[&str]) {
         self.aur.publish(pkgbase, ver, depends, makedepends);
         self.versions.lock().unwrap().insert(pkgbase.to_string(), format!("{ver}-1"));
@@ -487,6 +506,25 @@ async fn onboarding_build_publish_update_cycle() {
     let pkg = h.get("/api/packages/selfhosted").await;
     assert_eq!(pkg["source_url"], src);
     assert!(pkg["snapshot"]["maintainer"].is_null());
+
+    // Following a branch other than the remote's default: 0.2 lives only on
+    // `next`, so re-pointing the source at it makes 0.2 the candidate while
+    // master still says 0.1.
+    h.aur.publish_on_branch("selfhosted", "next", "0.2", &["glibc"], &[]);
+    let branched = format!("{src}#branch=next");
+    h.post("/api/packages", json!({"pkgbase": "selfhosted", "streams": ["s1"], "source": branched})).await;
+    let rb = h.run().await;
+    assert_eq!(rb["state"], "needs_input", "{rb}");
+    let pending = h.get("/api/candidates").await;
+    let c = pending.as_array().unwrap().iter().find(|c| c["pkgbase"] == "selfhosted").expect("branch candidate");
+    assert_eq!(c["review"]["version_to"], "0.2-1", "{c}");
+    h.post(&format!("/api/candidates/{}/decide", c["id"].as_str().unwrap()), json!({"decision": "approve"})).await;
+    let rb2 = h.run().await;
+    assert_eq!(rb2["state"], "done", "{rb2}");
+    assert!(h.repo_db().iter().any(|p| p.name == "selfhosted" && p.version == "0.2-1"));
+    // Bad fragments are refused at add time.
+    let bad = h.post_status("/api/packages", json!({"pkgbase": "selfhosted", "streams": ["s1"], "source": format!("{src}#commit=abc")})).await;
+    assert_eq!(bad, 400);
 
     // Upstream bumps foo. The candidate review shows the version change,
     // bar is rebuilt as a dependent, and the repo carries the new versions.

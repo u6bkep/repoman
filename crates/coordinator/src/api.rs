@@ -285,6 +285,7 @@ async fn add_package(State(st): State<AppState>, axum::Json(req): axum::Json<Add
         if !(src.starts_with("https://") || src.starts_with("http://") || src.starts_with("file://") || src.starts_with("git://")) {
             return Err(bad_request("source must be an http(s), git, or file URL"));
         }
+        crate::aur::split_source_fragment(src).map_err(|e| bad_request(&e.to_string()))?;
     }
     let created = st
         .store

@@ -68,7 +68,9 @@ enum Cmd {
         /// Provenance class: upstream-binary, upstream-source, vcs, repackaged, authored.
         #[arg(long)]
         class: Option<String>,
-        /// Git URL of a repository with the PKGBUILD at its root, instead of the AUR.
+        /// Git URL of a repository with the PKGBUILD at its root, instead of
+        /// the AUR. Append #branch=<name> to follow a branch other than the
+        /// remote's default.
         #[arg(long)]
         source: Option<String>,
     },

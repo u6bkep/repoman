@@ -791,12 +791,29 @@ async fn plan_all(app: &AppState, run_id: &str) -> Result<Planned> {
             if !b.ambiguous_providers.is_empty() {
                 tracing::warn!(pkgbase = %b.pkgbase, providers = ?b.ambiguous_providers, "unpinned virtual providers");
             }
+            // policy.extra_depends: official packages a PKGBUILD needs but
+            // forgot to list (a missing makedepends is the most common AUR
+            // build failure). Installed into the build root alongside the
+            // declared dependencies.
+            let mut install = b.install;
+            for extra in pkg
+                .policy
+                .get("extra_depends")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str())
+            {
+                if !install.iter().any(|i| i == extra) {
+                    install.push(extra.to_string());
+                }
+            }
             items.push(BuildItem {
                 pkgbase: b.pkgbase.clone(),
                 stream: stream.name.clone(),
                 aur_commit: commit.clone(),
                 candidate_id: candidate_of.get(&b.pkgbase).cloned().flatten(),
-                install: b.install,
+                install,
                 member_deps: b.aur_deps.into_iter().filter(|d| member_names.contains(d)).collect(),
                 pkgnames: si.pkgnames().iter().map(|s| s.to_string()).collect(),
                 validpgpkeys: si.base.values("validpgpkeys").into_iter().map(str::to_string).collect(),

@@ -121,10 +121,22 @@ pub async fn run_build(ctx: &JobCtx, p: BuildParams<'_>) -> Result<JobResult> {
     argv.extend(p.install.iter().cloned());
     ctx.log(Fd::System, format!("installing {} dependencies", p.install.len()));
     let cmd = sandbox(true).command(&argv, RunAs::Root, "/", &[])?;
-    let (status, tail) = {
+    let (mut status, mut tail) = {
         let _cache_guard = ctx.lock_pacman().await;
         run_logged(ctx, cmd, Some(ctx.timeout())).await?
     };
+    if !status.success() && tail.iter().any(|l| l.contains("invalid or corrupted package")) {
+        // The shared cache held a file with this name from another stream or
+        // an earlier rebuild: same pkgver, different bytes. pacman has already
+        // deleted it (the delete prompt defaults to yes under --noconfirm),
+        // so a second attempt downloads the right one.
+        ctx.log(Fd::System, "a cached package failed its checksum; retrying after pacman dropped it".to_string());
+        let cmd = sandbox(true).command(&argv, RunAs::Root, "/", &[])?;
+        (status, tail) = {
+            let _cache_guard = ctx.lock_pacman().await;
+            run_logged(ctx, cmd, Some(ctx.timeout())).await?
+        };
+    }
     if !status.success() {
         bail!("dependency installation failed ({status}): {}", tail.join(" | "));
     }
