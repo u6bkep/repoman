@@ -30,6 +30,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/packages", get(list_packages).post(add_package))
         .route("/api/packages/{pkgbase}", get(get_package).delete(remove_package))
         .route("/api/packages/{pkgbase}/policy", post(set_policy))
+        .route("/api/packages/{pkgbase}/streams/{stream}", axum::routing::delete(remove_membership))
         .route("/api/runs", get(list_runs).post(start_run))
         .route("/api/runs/{id}", get(get_run))
         .route("/api/candidates", get(list_candidates))
@@ -305,6 +306,17 @@ async fn remove_package(State(st): State<AppState>, Path(pkgbase): Path<String>)
         return Err(not_found("no such package"));
     }
     st.store.event("package.removed", Some(&pkgbase), serde_json::json!({})).map_err(internal)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn remove_membership(State(st): State<AppState>, Path((pkgbase, stream)): Path<(String, String)>) -> Result<StatusCode, ApiError> {
+    if st.store.get_package(&pkgbase).map_err(internal)?.is_none() {
+        return Err(not_found("no such package"));
+    }
+    st.store.remove_membership(&pkgbase, &stream).map_err(internal)?;
+    st.store
+        .event("package.membership_removed", Some(&pkgbase), serde_json::json!({"stream": stream}))
+        .map_err(internal)?;
     Ok(StatusCode::NO_CONTENT)
 }
 

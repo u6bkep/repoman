@@ -69,8 +69,13 @@ enum Cmd {
         #[arg(long)]
         class: Option<String>,
     },
-    /// Remove a package base and its memberships.
-    Rm { pkgbase: String },
+    /// Remove a package base and its memberships, or with --stream only
+    /// its membership on that stream.
+    Rm {
+        pkgbase: String,
+        #[arg(long = "stream", short = 's')]
+        stream: Option<String>,
+    },
     /// List packages.
     Packages,
     /// Show one package.
@@ -186,9 +191,17 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Rm { pkgbase } => {
-            api.delete(&format!("/api/packages/{pkgbase}")).await?;
-            println!("removed {pkgbase}");
+        Cmd::Rm { pkgbase, stream } => {
+            match stream {
+                Some(s) => {
+                    api.delete(&format!("/api/packages/{pkgbase}/streams/{s}")).await?;
+                    println!("removed {pkgbase} from {s}");
+                }
+                None => {
+                    api.delete(&format!("/api/packages/{pkgbase}")).await?;
+                    println!("removed {pkgbase}");
+                }
+            }
             Ok(())
         }
         Cmd::Packages => {
