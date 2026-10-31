@@ -242,7 +242,9 @@ pub async fn run_build(ctx: &JobCtx, p: BuildParams<'_>) -> Result<JobResult> {
     // Scratch usage: the upper plus the job's build directory.
     let scratch = dir_size(&upper).unwrap_or(0) + dir_size(&build_dir).unwrap_or(0);
     ctx.set_scratch_peak(scratch);
-    let upstream_rev = read_vcs_rev(&pkgdir_host);
+    // makepkg extracts into BUILDDIR (/build/work/<pkgbase>/src), not next to
+    // the PKGBUILD.
+    let upstream_rev = read_vcs_rev(&build_dir.join("work").join(p.pkgbase));
     ctx.stage_done("collect");
 
     Ok(JobResult::Build {
@@ -382,9 +384,10 @@ fn dir_size(path: &Path) -> Result<u64> {
     Ok(total)
 }
 
-/// For VCS packages makepkg leaves the checkout in `src/`; record its HEAD.
-fn read_vcs_rev(pkgdir: &Path) -> Option<String> {
-    let src = pkgdir.join("src");
+/// For VCS packages makepkg leaves the checkout under `<builddir>/src/`;
+/// record the HEAD of the first git checkout found there.
+fn read_vcs_rev(builddir: &Path) -> Option<String> {
+    let src = builddir.join("src");
     let entries = std::fs::read_dir(src).ok()?;
     for e in entries.flatten() {
         let p = e.path();
