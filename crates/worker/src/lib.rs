@@ -61,7 +61,7 @@ impl WorkerState {
         match sandbox::available() {
             Ok(()) => {
                 caps.push("build".to_string());
-                if sandbox::which("pacstrap").is_some() {
+                if sandbox::which("pacman").is_some() {
                     caps.push("image".to_string());
                 }
             }

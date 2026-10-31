@@ -105,27 +105,53 @@ pub async fn build_image(
     }
     tokio::fs::write(&conf_path, conf_text).await?;
 
-    ctx.stage("pacstrap");
-    ctx.log(Fd::System, format!("pacstrap {} packages for {stream}", packages.len()));
-    // pacstrap mounts proc, sys, and dev into the target; give it a PID and
-    // mount namespace of its own so that works under a user namespace too and
-    // its mounts vanish when it exits.
-    let mut cmd = tokio::process::Command::new("unshare");
-    cmd.args(["--fork", "--pid", "--mount", "--propagation", "private", "--", "pacstrap", "-C"])
-        .arg(&conf_path)
-        .args(["-G", "-M", "-K"])
-        .arg(&target)
-        .args(packages)
-        .env("LANG", "C.UTF-8")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    let (status, tail) = run_logged(ctx, cmd, None).await?;
-    if !status.success() {
-        bail!("pacstrap failed ({status}): {}", tail.join(" | "));
+    ctx.stage("bootstrap");
+    ctx.log(Fd::System, format!("bootstrapping {} packages for {stream}", packages.len()));
+    // What pacstrap does, without pacstrap: create the skeleton, mount proc,
+    // sys, and dev into the target, and run the host pacman with `-r`.
+    for (d, mode) in [
+        ("var/cache/pacman/pkg", 0o755),
+        ("var/lib/pacman", 0o755),
+        ("var/log", 0o755),
+        ("dev", 0o755),
+        ("run", 0o755),
+        ("etc/pacman.d", 0o755),
+        ("tmp", 0o1777),
+        ("sys", 0o555),
+        ("proc", 0o555),
+    ] {
+        let p = target.join(d);
+        tokio::fs::create_dir_all(&p).await?;
+        std::fs::set_permissions(&p, std::os::unix::fs::PermissionsExt::from_mode(mode))?;
     }
-    ctx.stage_done("pacstrap");
+    let mnt = job_dir.join("mnt");
+    let boot = Sandbox {
+        root: RootSource::Dir(target.clone()),
+        mountpoint: mnt.clone(),
+        binds: vec![],
+        network: true,
+        cgroup: ctx.cgroup_path(),
+        hostname: "repoman-image".into(),
+        chroot: false,
+    };
+    boot.prepare_dirs()?;
+    let mut argv: Vec<String> = vec![
+        "pacman".into(),
+        "-r".into(),
+        mnt.to_string_lossy().to_string(),
+        "--config".into(),
+        conf_path.to_string_lossy().to_string(),
+        "-Sy".into(),
+        "--noconfirm".into(),
+        "--needed".into(),
+    ];
+    argv.extend(packages.iter().cloned());
+    let cmd = boot.command(&argv, RunAs::Root, "/", &[])?;
+    let (status, tail) = run_logged(ctx, cmd, Some(ctx.timeout())).await?;
+    if !status.success() {
+        bail!("bootstrap failed ({status}): {}", tail.join(" | "));
+    }
+    ctx.stage_done("bootstrap");
 
     ctx.stage("configure");
     // Keyrings and the build user, inside the new root.
@@ -136,6 +162,7 @@ pub async fn build_image(
         network: false,
         cgroup: ctx.cgroup_path(),
         hostname: "repoman-image".into(),
+        chroot: true,
     };
     sb.prepare_dirs()?;
     let mut script = String::from("set -e\n");

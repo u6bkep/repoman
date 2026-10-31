@@ -104,6 +104,7 @@ pub async fn run_build(ctx: &JobCtx, p: BuildParams<'_>) -> Result<JobResult> {
         network,
         cgroup: ctx.cgroup_path(),
         hostname: "repoman-build".into(),
+        chroot: true,
     };
     sandbox(true).prepare_dirs()?;
     ctx.stage_done("provision");
@@ -281,6 +282,7 @@ pub async fn run_inspect(ctx: &JobCtx, pkgbase: &str, image: &ImageRef, source_u
         network: false,
         cgroup: ctx.cgroup_path(),
         hostname: "repoman-inspect".into(),
+        chroot: true,
     };
     sb.prepare_dirs()?;
     ctx.stage_done("provision");

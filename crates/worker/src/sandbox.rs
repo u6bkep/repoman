@@ -38,6 +38,10 @@ pub struct Sandbox {
     /// cgroup directory to join before anything else, if any.
     pub cgroup: Option<PathBuf>,
     pub hostname: String,
+    /// `chroot` into the assembled root before exec (normal), or run the
+    /// command on the host side with the root mounted at `mountpoint`
+    /// (bootstrapping an image with the host pacman).
+    pub chroot: bool,
 }
 
 /// Who runs the command inside the root.
@@ -77,7 +81,8 @@ else
   ip link set lo up 2>/dev/null || true
   : > "$ROOT/etc/resolv.conf"
 fi
-exec chroot "$ROOT" "$@"
+if [ "${REPOMAN_CHROOT:-1}" = 1 ]; then exec chroot "$ROOT" "$@"; fi
+exec "$@"
 "#;
 
 impl Sandbox {
@@ -142,6 +147,7 @@ impl Sandbox {
             }
         }
         cmd.env("REPOMAN_ROOT", &self.mountpoint)
+            .env("REPOMAN_CHROOT", if self.chroot { "1" } else { "0" })
             .env("REPOMAN_NET", if self.network { "1" } else { "0" })
             .env("REPOMAN_HOSTNAME", &self.hostname)
             .env("REPOMAN_BINDS", self.binds.len().to_string());
@@ -237,6 +243,7 @@ mod tests {
             network: false,
             cgroup: Some("/sys/fs/cgroup/x".into()),
             hostname: "repoman-build".into(),
+            chroot: true,
         };
         let cmd = sb
             .command(
@@ -278,6 +285,7 @@ mod tests {
             network: true,
             cgroup: None,
             hostname: "h".into(),
+            chroot: true,
         };
         let cmd = sb.command(&["true".into()], RunAs::Root, "/", &[]).unwrap();
         let args: Vec<String> = cmd.as_std().get_args().map(|a| a.to_string_lossy().to_string()).collect();
