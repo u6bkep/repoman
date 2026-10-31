@@ -9,9 +9,17 @@ rust-version.workspace = true
 anyhow = "1.0.104"
 axum = { version = "0.8.9", features = ["ws"] }
 futures-util = "0.3.34"
+hex = "0.4.3"
+repoman-alpm = { version = "0.1.0", path = "../alpm" }
 repoman-common = { version = "0.1.0", path = "../common" }
 repoman-store = { version = "0.1.0", path = "../store" }
-serde = "1.0.229"
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls", "stream"] }
+serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+sha2 = "0.11.0"
 tokio = { version = "1.54.1", features = ["full"] }
+tokio-util = { version = "0.7.20", features = ["io"] }
 tracing = "0.1.44"
+
+[dev-dependencies]
+tempfile = "3.27.0"

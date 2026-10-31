@@ -22,12 +22,14 @@ async fn start_coordinator() -> Harness {
     let addr = listener.local_addr().unwrap();
     let config = CoordinatorConfig {
         listen: addr.to_string(),
+        public_url: format!("http://{addr}"),
         data_dir: tmp.path().join("coord"),
         workers: vec![WorkerCredential {
             name: "w1".into(),
             token: "t1".into(),
         }],
         orphan_grace_secs: 60,
+        ..Default::default()
     };
     let store = Arc::new(Store::open(&tmp.path().join("repoman.db")).unwrap());
     tokio::spawn(repoman_coordinator::serve(config, store, listener));
@@ -38,6 +40,7 @@ async fn start_coordinator() -> Harness {
         slots: 2,
         scratch_dir: tmp.path().join("scratch"),
         arch: "x86_64".into(),
+        ..Default::default()
     };
     Harness {
         base: format!("http://{addr}"),

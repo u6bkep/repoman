@@ -14,6 +14,15 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::Serialize;
 
 mod schema;
+pub mod artifacts;
+pub mod images;
+pub mod packages;
+pub mod runs;
+
+pub use artifacts::{ArtifactRow, PublicationRow};
+pub use images::ImageRow;
+pub use packages::{BaselineRow, MembershipRow, PackageRow, SnapshotRow};
+pub use runs::{CandidateRow, NewCandidate, RunRow};
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -47,6 +56,8 @@ pub struct JobRow {
     pub error: Option<String>,
     pub peaks: Peaks,
     pub attempts: u32,
+    pub candidate_id: Option<String>,
+    pub result: Option<repoman_common::proto::JobResult>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -68,9 +79,9 @@ pub struct Reconciled {
     pub conflicts: Vec<JobId>,
 }
 
-const JOB_COLS: &str = "id, spec, pkgbase, stream, state, worker, queued_at, assigned_at, \
+pub(crate) const JOB_COLS: &str = "id, spec, pkgbase, stream, state, worker, queued_at, assigned_at, \
                         started_at, finished_at, orphaned_at, exit_code, error, \
-                        peak_rss_bytes, peak_scratch_bytes, cpu_seconds, attempts";
+                        peak_rss_bytes, peak_scratch_bytes, cpu_seconds, attempts, candidate_id, result";
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
@@ -96,7 +107,7 @@ impl Store {
         })
     }
 
-    fn with<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+    pub(crate) fn with<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
         let conn = self.conn.lock().expect("store mutex poisoned");
         f(&conn)
     }
@@ -179,18 +190,29 @@ impl Store {
         pkgbase: Option<&str>,
         stream: Option<&str>,
     ) -> Result<JobRow> {
+        self.create_job_for(job, pkgbase, stream, None)
+    }
+
+    pub fn create_job_for(
+        &self,
+        job: &JobKind,
+        pkgbase: Option<&str>,
+        stream: Option<&str>,
+        candidate_id: Option<&str>,
+    ) -> Result<JobRow> {
         let id = repoman_common::new_id();
         self.with(|c| {
             c.execute(
-                "INSERT INTO job (id, kind, spec, pkgbase, stream, state, queued_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6)",
+                "INSERT INTO job (id, kind, spec, pkgbase, stream, state, queued_at, candidate_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7)",
                 params![
                     id,
                     job.name(),
                     serde_json::to_string(job)?,
                     pkgbase,
                     stream,
-                    clock::now()
+                    clock::now(),
+                    candidate_id
                 ],
             )?;
             Ok(())
@@ -281,7 +303,7 @@ impl Store {
             let n = c.execute(
                 "UPDATE job SET state = ?2, finished_at = ?3, exit_code = ?4, error = ?5,
                         peak_rss_bytes = ?6, peak_scratch_bytes = ?7, cpu_seconds = ?8,
-                        orphaned_at = NULL, started_at = COALESCE(started_at, ?3)
+                        orphaned_at = NULL, started_at = COALESCE(started_at, ?3), result = ?10
                  WHERE id = ?1 AND worker = ?9 AND state IN ('assigned', 'running', 'orphaned')",
                 params![
                     id,
@@ -293,6 +315,7 @@ impl Store {
                     outcome.peaks.peak_scratch_bytes.map(|v| v as i64),
                     outcome.peaks.cpu_seconds,
                     worker,
+                    outcome.result.as_ref().map(|r| serde_json::to_string(r).unwrap_or_default()),
                 ],
             )?;
             Ok(n == 1)
@@ -483,7 +506,7 @@ impl Store {
     }
 }
 
-fn row_to_job(r: &Row) -> rusqlite::Result<JobRow> {
+pub(crate) fn row_to_job(r: &Row) -> rusqlite::Result<JobRow> {
     let spec: String = r.get(1)?;
     let job: JobKind = serde_json::from_str(&spec).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e))
@@ -516,6 +539,10 @@ fn row_to_job(r: &Row) -> rusqlite::Result<JobRow> {
             cpu_seconds: r.get(15)?,
         },
         attempts: r.get(16)?,
+        candidate_id: r.get(17)?,
+        result: r
+            .get::<_, Option<String>>(18)?
+            .and_then(|s| serde_json::from_str(&s).ok()),
     })
 }
 

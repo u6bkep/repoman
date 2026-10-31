@@ -62,16 +62,71 @@ impl JobState {
     }
 }
 
-/// What a job does. M0 has only the no-op used to exercise the protocol;
-/// `build`, `inspect`, and `probe` arrive with M1.
+/// A base image the worker must have unpacked before a job can run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImageRef {
+    pub sha256: String,
+    /// Where to download the tarball if it is not present locally.
+    pub url: String,
+}
+
+/// What a job does.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum JobKind {
+    /// Exercises the protocol without touching the system.
     Noop {
         #[serde(default)]
         duration_ms: u64,
         #[serde(default)]
         fail: bool,
+    },
+    /// Build a base image for a stream with pacstrap and upload it.
+    Image {
+        stream: String,
+        /// Full pacman.conf text for the stream's repos.
+        pacman_conf: String,
+        packages: Vec<String>,
+        /// Keyrings to populate inside the image, e.g. `archlinux`, `manjaro`.
+        keyrings: Vec<String>,
+        /// Appended as `/etc/makepkg.conf.d/repoman.conf` inside the image.
+        makepkg_conf_extra: String,
+        /// `PUT {upload_url}/{sha256}?name=...` with the worker's bearer token.
+        upload_url: String,
+    },
+    /// Build one package base for one stream.
+    Build {
+        pkgbase: String,
+        stream: String,
+        aur_commit: String,
+        image: ImageRef,
+        /// Tarball of the AUR repo at `aur_commit`.
+        source_url: String,
+        /// pacman.conf for the build root: stream repos plus staging repo.
+        pacman_conf: String,
+        /// Package names to install before building: the resolved depends,
+        /// makedepends, and checkdepends.
+        install: Vec<String>,
+        /// Armored public keys for `validpgpkeys`.
+        #[serde(default)]
+        pgp_keys: Vec<String>,
+        /// Skip signature verification of sources (per-package policy).
+        #[serde(default)]
+        skip_pgp: bool,
+        upload_url: String,
+    },
+    /// Regenerate SRCINFO from the PKGBUILD in a sandbox.
+    Inspect {
+        pkgbase: String,
+        aur_commit: String,
+        image: ImageRef,
+        source_url: String,
+    },
+    /// Query upstream VCS heads for a package's sources.
+    Probe {
+        pkgbase: String,
+        /// makepkg `source=` entries that are VCS fetches.
+        sources: Vec<String>,
     },
 }
 
@@ -79,6 +134,17 @@ impl JobKind {
     pub fn name(&self) -> &'static str {
         match self {
             JobKind::Noop { .. } => "noop",
+            JobKind::Image { .. } => "image",
+            JobKind::Build { .. } => "build",
+            JobKind::Inspect { .. } => "inspect",
+            JobKind::Probe { .. } => "probe",
+        }
+    }
+
+    pub fn image(&self) -> Option<&ImageRef> {
+        match self {
+            JobKind::Build { image, .. } | JobKind::Inspect { image, .. } => Some(image),
+            _ => None,
         }
     }
 }
@@ -129,7 +195,6 @@ pub struct LogLine {
 }
 
 /// Resource peaks measured by the worker's cgroup and scratch accounting.
-/// All optional: the no-op job measures nothing.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Peaks {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -140,6 +205,60 @@ pub struct Peaks {
     pub cpu_seconds: Option<f64>,
 }
 
+/// One built package file, already uploaded to the coordinator's store.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArtifactInfo {
+    pub sha256: String,
+    pub filename: String,
+    pub size: u64,
+    pub pkgname: String,
+    pub pkgbase: String,
+    pub pkgver: String,
+    pub arch: String,
+    #[serde(default)]
+    pub depends: Vec<String>,
+    #[serde(default)]
+    pub provides: Vec<String>,
+    /// Payload paths, for the artifact diff.
+    #[serde(default)]
+    pub paths: Vec<String>,
+    #[serde(default)]
+    pub has_install_script: bool,
+    /// `.BUILDINFO` key/values as JSON.
+    #[serde(default)]
+    pub buildinfo: serde_json::Value,
+}
+
+/// Job-kind specific output.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum JobResult {
+    Image {
+        sha256: String,
+        size: u64,
+        filename: String,
+        /// Installed `name version` lines inside the image.
+        packages: Vec<String>,
+    },
+    Build {
+        artifacts: Vec<ArtifactInfo>,
+        #[serde(default)]
+        net_attempts: u64,
+        #[serde(default)]
+        outside_writes: Vec<String>,
+        /// Revision actually built for VCS packages, from pkgver().
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        upstream_rev: Option<String>,
+    },
+    Inspect {
+        srcinfo: String,
+    },
+    Probe {
+        /// (source entry, upstream revision)
+        revisions: Vec<(String, String)>,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Outcome {
     pub exit_code: i32,
@@ -147,6 +266,8 @@ pub struct Outcome {
     pub error: Option<String>,
     #[serde(default)]
     pub peaks: Peaks,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<JobResult>,
 }
 
 impl Outcome {
@@ -155,6 +276,14 @@ impl Outcome {
             exit_code: 0,
             error: None,
             peaks: Peaks::default(),
+            result: None,
+        }
+    }
+
+    pub fn success_with(result: JobResult) -> Self {
+        Outcome {
+            result: Some(result),
+            ..Outcome::success()
         }
     }
 
@@ -163,7 +292,12 @@ impl Outcome {
             exit_code,
             error: Some(error.into()),
             peaks: Peaks::default(),
+            result: None,
         }
+    }
+
+    pub fn is_success(&self) -> bool {
+        self.exit_code == 0 && self.error.is_none()
     }
 }
 
@@ -186,6 +320,10 @@ pub enum WorkerMsg {
         scratch_bytes: Option<u64>,
         #[serde(default)]
         in_flight: Vec<JobId>,
+        /// Capabilities: `image` means it can run pacstrap, `build` means it
+        /// can run the privileged executor.
+        #[serde(default)]
+        capabilities: Vec<String>,
     },
     Accepted {
         job_id: JobId,
@@ -257,6 +395,20 @@ mod tests {
             serde_json::to_string(&m).unwrap(),
             r#"{"type":"accepted","job_id":"x"}"#
         );
+    }
+
+    #[test]
+    fn outcome_with_result_round_trips() {
+        let o = Outcome::success_with(JobResult::Probe {
+            revisions: vec![("git+https://x".into(), "abc".into())],
+        });
+        let s = serde_json::to_string(&o).unwrap();
+        let back: Outcome = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, o);
+        assert!(back.is_success());
+        // Older messages without `result` still parse.
+        let legacy: Outcome = serde_json::from_str(r#"{"exit_code":0}"#).unwrap();
+        assert!(legacy.result.is_none());
     }
 
     #[test]

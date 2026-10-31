@@ -8,7 +8,12 @@ use repoman_store::Store;
 use tokio::net::TcpListener;
 
 pub mod api;
+pub mod aur;
+pub mod blobs;
 pub mod hub;
+pub mod planner;
+pub mod publisher;
+pub mod streams;
 
 #[derive(Clone)]
 pub struct AppState {

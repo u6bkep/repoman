@@ -17,7 +17,14 @@ use tokio::time::{interval, timeout};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
+pub mod build;
+pub mod cgroup;
 pub mod exec;
+pub mod image;
+pub mod logs;
+pub mod probe;
+pub mod sandbox;
+pub mod upload;
 
 const WELCOME_TIMEOUT: Duration = Duration::from_secs(10);
 const HEARTBEAT: Duration = Duration::from_secs(15);
@@ -30,11 +37,39 @@ pub struct WorkerState {
     /// so ordering is preserved.
     pending: Mutex<Option<WorkerMsg>>,
     in_flight: Mutex<HashSet<JobId>>,
-    slots: Arc<Semaphore>,
+    pub slots: Arc<Semaphore>,
+    pub cgroups: cgroup::CgroupManager,
+    pub capabilities: Vec<String>,
 }
 
 impl WorkerState {
+    /// State for tests and unprivileged use: no cgroups, no sandbox.
     pub fn new(slots: u32) -> Arc<Self> {
+        Self::with_capabilities(slots, cgroup::CgroupManager::disabled(), Vec::new())
+    }
+
+    /// Detect what this process can do and set up cgroups accordingly.
+    pub fn detect(slots: u32) -> Arc<Self> {
+        let mut caps = Vec::new();
+        match sandbox::available() {
+            Ok(()) => {
+                caps.push("build".to_string());
+                if sandbox::which("pacstrap").is_some() {
+                    caps.push("image".to_string());
+                }
+            }
+            Err(why) => tracing::warn!(%why, "sandbox unavailable; this worker will only run noop and probe jobs"),
+        }
+        caps.push("probe".to_string());
+        let cgroups = if caps.iter().any(|c| c == "build") {
+            cgroup::CgroupManager::init()
+        } else {
+            cgroup::CgroupManager::disabled()
+        };
+        Self::with_capabilities(slots, cgroups, caps)
+    }
+
+    fn with_capabilities(slots: u32, cgroups: cgroup::CgroupManager, capabilities: Vec<String>) -> Arc<Self> {
         let (tx, rx) = mpsc::unbounded_channel();
         Arc::new(WorkerState {
             tx,
@@ -42,6 +77,8 @@ impl WorkerState {
             pending: Mutex::new(None),
             in_flight: Mutex::new(HashSet::new()),
             slots: Arc::new(Semaphore::new(slots as usize)),
+            cgroups,
+            capabilities,
         })
     }
 
@@ -61,7 +98,8 @@ impl WorkerState {
 }
 
 pub async fn run(config: WorkerConfig) -> Result<()> {
-    let state = WorkerState::new(config.slots);
+    let state = WorkerState::detect(config.slots);
+    tracing::info!(capabilities = ?state.capabilities, "worker starting");
     run_with_state(config, state).await
 }
 
@@ -70,6 +108,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
 pub async fn run_with_state(config: WorkerConfig, state: Arc<WorkerState>) -> Result<()> {
     std::fs::create_dir_all(&config.scratch_dir)
         .with_context(|| format!("creating {}", config.scratch_dir.display()))?;
+    let config = Arc::new(config);
     let mut backoff = Duration::from_secs(1);
     loop {
         match session(&config, &state).await {
@@ -100,7 +139,7 @@ impl From<anyhow::Error> for SessionError {
     }
 }
 
-async fn session(config: &WorkerConfig, state: &Arc<WorkerState>) -> Result<(), SessionError> {
+async fn session(config: &Arc<WorkerConfig>, state: &Arc<WorkerState>) -> Result<(), SessionError> {
     let (ws, _) = connect_async(config.coordinator.as_str())
         .await
         .with_context(|| format!("connecting to {}", config.coordinator))?;
@@ -112,9 +151,10 @@ async fn session(config: &WorkerConfig, state: &Arc<WorkerState>) -> Result<(), 
         arch: config.arch.clone(),
         slots: config.slots,
         version: repoman_common::VERSION.to_string(),
-        mem_bytes: None,
+        mem_bytes: total_memory(),
         scratch_bytes: None,
         in_flight: state.in_flight(),
+        capabilities: state.capabilities.clone(),
     };
     send(&mut sink, &hello).await?;
 
@@ -170,7 +210,7 @@ async fn session(config: &WorkerConfig, state: &Arc<WorkerState>) -> Result<(), 
     }
 }
 
-fn handle(config: &WorkerConfig, state: &Arc<WorkerState>, msg: CoordMsg) {
+fn handle(config: &Arc<WorkerConfig>, state: &Arc<WorkerState>, msg: CoordMsg) {
     match msg {
         CoordMsg::Assign { spec } => {
             if !state.start_job(&spec.id) {
@@ -179,15 +219,14 @@ fn handle(config: &WorkerConfig, state: &Arc<WorkerState>, msg: CoordMsg) {
             }
             tracing::info!(job = %spec.id, kind = spec.job.name(), "assigned");
             let state = state.clone();
-            let scratch = config.scratch_dir.clone();
+            let config = config.clone();
             tokio::spawn(async move {
                 let id = spec.id.clone();
-                exec::run_job(spec, &scratch, &state).await;
+                exec::run_job(spec, config, state.clone()).await;
                 state.end_job(&id);
             });
         }
         CoordMsg::Cancel { job_id } => {
-            // M0 has nothing cancellable; M1's executor will own a kill handle.
             tracing::warn!(job = %job_id, "cancel requested; not supported yet");
         }
         CoordMsg::Pong => {}
@@ -204,4 +243,11 @@ where
 {
     let text = serde_json::to_string(msg)?;
     sink.send(Message::text(text)).await.context("sending frame")
+}
+
+fn total_memory() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let line = s.lines().find(|l| l.starts_with("MemTotal:"))?;
+    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kb * 1024)
 }

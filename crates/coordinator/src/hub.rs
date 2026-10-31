@@ -39,6 +39,7 @@ struct Connected {
     tx: mpsc::UnboundedSender<CoordMsg>,
     arch: String,
     slots: u32,
+    capabilities: Vec<String>,
     running: HashSet<JobId>,
     since: String,
 }
@@ -48,6 +49,7 @@ pub struct ConnectedWorker {
     pub name: String,
     pub arch: String,
     pub slots: u32,
+    pub capabilities: Vec<String>,
     pub running: Vec<JobId>,
     pub since: String,
 }
@@ -83,6 +85,7 @@ impl Hub {
                 name: name.clone(),
                 arch: c.arch.clone(),
                 slots: c.slots,
+                capabilities: c.capabilities.clone(),
                 running: c.running.iter().cloned().collect(),
                 since: c.since.clone(),
             })
@@ -111,8 +114,8 @@ impl Hub {
             self.store.event("job.requeued", Some(&id), serde_json::json!({"reason": "orphan_grace"}))?;
         }
         for job in self.store.queued_jobs()? {
-            let Some((worker, tx)) = self.reserve_slot(&job.id) else {
-                break; // every connected worker is full
+            let Some((worker, tx)) = self.reserve_slot(&job.id, required_capability(&job.job)) else {
+                continue; // no connected worker with a free slot can run this kind
             };
             if !self.store.set_assigned(&job.id, &worker)? {
                 self.release_slot(&worker, &job.id);
@@ -137,12 +140,14 @@ impl Hub {
         Ok(())
     }
 
-    /// Pick the connected worker with the most free slots and reserve one.
-    fn reserve_slot(&self, job: &JobId) -> Option<(String, mpsc::UnboundedSender<CoordMsg>)> {
+    /// Pick the capable connected worker with the most free slots and
+    /// reserve one.
+    fn reserve_slot(&self, job: &JobId, capability: Option<&str>) -> Option<(String, mpsc::UnboundedSender<CoordMsg>)> {
         let mut map = self.connected.lock().unwrap();
         let (name, c) = map
             .iter_mut()
             .filter(|(_, c)| (c.running.len() as u32) < c.slots)
+            .filter(|(_, c)| capability.is_none_or(|cap| c.capabilities.iter().any(|x| x == cap)))
             .max_by_key(|(_, c)| c.slots - c.running.len() as u32)?;
         c.running.insert(job.clone());
         Some((name.clone(), c.tx.clone()))
@@ -171,7 +176,7 @@ impl Hub {
                 return;
             }
         };
-        let (name, token, arch, slots, version, mem_bytes, scratch_bytes, in_flight) = match hello {
+        let (name, token, arch, slots, version, mem_bytes, scratch_bytes, in_flight, capabilities) = match hello {
             Ok(WorkerMsg::Hello {
                 name,
                 token,
@@ -181,7 +186,8 @@ impl Hub {
                 mem_bytes,
                 scratch_bytes,
                 in_flight,
-            }) => (name, token, arch, slots, version, mem_bytes, scratch_bytes, in_flight),
+                capabilities,
+            }) => (name, token, arch, slots, version, mem_bytes, scratch_bytes, in_flight, capabilities),
             Ok(other) => {
                 tracing::warn!(?other, "first worker message was not hello");
                 let _ = send(&mut sink, &CoordMsg::Rejected { reason: "expected hello".into() }).await;
@@ -232,6 +238,7 @@ impl Hub {
                     tx: tx.clone(),
                     arch: arch.clone(),
                     slots,
+                    capabilities: capabilities.clone(),
                     running: rec.resumed.iter().cloned().collect(),
                     since: repoman_common::clock::now(),
                 },
@@ -239,7 +246,7 @@ impl Hub {
                 tracing::warn!(worker = %name, old_conn = old.conn_id, "replaced existing connection");
             }
         }
-        tracing::info!(worker = %name, %arch, slots, %version, resumed = rec.resumed.len(), "worker connected");
+        tracing::info!(worker = %name, %arch, slots, %version, ?capabilities, resumed = rec.resumed.len(), "worker connected");
         let _ = self.store.event(
             "worker.connected",
             Some(&name),
@@ -354,4 +361,15 @@ where
 {
     let text = serde_json::to_string(msg).map_err(|_| ())?;
     sink.send(Message::Text(text.into())).await.map_err(|_| ())
+}
+
+/// Worker capability a job kind needs, if any.
+pub fn required_capability(job: &repoman_common::proto::JobKind) -> Option<&'static str> {
+    use repoman_common::proto::JobKind;
+    match job {
+        JobKind::Noop { .. } => None,
+        JobKind::Image { .. } => Some("image"),
+        JobKind::Build { .. } | JobKind::Inspect { .. } => Some("build"),
+        JobKind::Probe { .. } => Some("probe"),
+    }
 }
