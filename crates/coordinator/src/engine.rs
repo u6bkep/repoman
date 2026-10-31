@@ -144,14 +144,21 @@ async fn execute(app: &AppState, run_id: &str) -> Result<RunEnd> {
         step(app, run_id, "build").await?;
         let built = build_all(app, run_id, &planned, &images).await?;
 
+        // Candidates whose builds all succeeded were published as they
+        // completed; this pass handles partial failures and baseline-only
+        // rebuilds that carry no candidate.
         step(app, run_id, "publish").await?;
-        let published = publish_all(app, run_id, &planned, &built).await?;
+        let scope = PublishScope {
+            only: None,
+            exclude: built.published_candidates.clone(),
+        };
+        let published = built.published_count + publish_all(app, run_id, &planned, &built.results, &scope).await?;
 
         summary = serde_json::json!({
             "streams": planned.per_stream.keys().collect::<Vec<_>>(),
             "builds_planned": planned.per_stream.values().map(|v| v.len()).sum::<usize>(),
-            "builds_succeeded": built.values().filter(|r| r.is_ok()).count(),
-            "builds_failed": built.values().filter(|r| r.is_err()).count(),
+            "builds_succeeded": built.results.values().filter(|r| r.is_ok()).count(),
+            "builds_failed": built.results.values().filter(|r| r.is_err()).count(),
             "published": published,
             "skipped": planned.skipped,
         });
@@ -807,12 +814,41 @@ async fn plan_all(app: &AppState, run_id: &str) -> Result<Planned> {
 
 type BuildKey = (String, String); // (stream, pkgbase)
 
-async fn build_all(app: &AppState, run_id: &str, planned: &Planned, images: &HashMap<String, ImageRef>) -> Result<BTreeMap<BuildKey, Result<Vec<String>, String>>> {
+pub struct BuildOutcome {
+    pub results: BTreeMap<BuildKey, Result<Vec<String>, String>>,
+    /// Candidates already published incrementally during the build phase.
+    pub published_candidates: HashSet<String>,
+    pub published_count: usize,
+}
+
+/// Which candidates a publish pass covers.
+pub struct PublishScope {
+    pub only: Option<HashSet<String>>,
+    pub exclude: HashSet<String>,
+}
+
+impl PublishScope {
+    fn covers(&self, item: &BuildItem) -> bool {
+        match &item.candidate_id {
+            Some(c) => self.only.as_ref().is_none_or(|o| o.contains(c)) && !self.exclude.contains(c),
+            // Baseline-only rebuilds have no candidate; the final pass takes them.
+            None => self.only.is_none(),
+        }
+    }
+}
+
+async fn build_all(app: &AppState, run_id: &str, planned: &Planned, images: &HashMap<String, ImageRef>) -> Result<BuildOutcome> {
     let mut results: BTreeMap<BuildKey, Result<Vec<String>, String>> = BTreeMap::new();
+    let mut published_candidates: HashSet<String> = HashSet::new();
+    let mut published_count = 0usize;
     let mut in_flight: HashMap<String, (BuildKey, u32)> = HashMap::new(); // job id -> (key, attempt)
     let mut remaining: Vec<BuildItem> = planned.per_stream.values().flatten().cloned().collect();
     if remaining.is_empty() {
-        return Ok(results);
+        return Ok(BuildOutcome {
+            results,
+            published_candidates,
+            published_count,
+        });
     }
     for stream in planned.per_stream.keys() {
         app.publisher.ensure_staging(run_id, stream).await?;
@@ -904,6 +940,29 @@ async fn build_all(app: &AppState, run_id: &str, planned: &Planned, images: &Has
                     }
                     tracing::info!(pkgbase = %item.pkgbase, stream = %item.stream, artifacts = shas.len(), "built");
                     results.insert(key, Ok(shas));
+                    // Publish as soon as every build of this candidate succeeded,
+                    // so progress survives an interrupted run.
+                    if let Some(cid) = &item.candidate_id {
+                        let complete = planned
+                            .per_stream
+                            .values()
+                            .flatten()
+                            .filter(|b| b.candidate_id.as_deref() == Some(cid))
+                            .all(|b| matches!(results.get(&(b.stream.clone(), b.pkgbase.clone())), Some(Ok(_))));
+                        if complete {
+                            let scope = PublishScope {
+                                only: Some(HashSet::from([cid.clone()])),
+                                exclude: HashSet::new(),
+                            };
+                            match publish_all(app, run_id, planned, &results, &scope).await {
+                                Ok(n) => {
+                                    published_count += n;
+                                    published_candidates.insert(cid.clone());
+                                }
+                                Err(e) => tracing::error!(candidate = %cid, error = %format!("{e:#}"), "incremental publish failed; retried at run end"),
+                            }
+                        }
+                    }
                 }
                 (state, _) => {
                     let err = row.error.unwrap_or_else(|| format!("job ended in state {}", state.as_str()));
@@ -925,7 +984,11 @@ async fn build_all(app: &AppState, run_id: &str, planned: &Planned, images: &Has
             }
         }
     }
-    Ok(results)
+    Ok(BuildOutcome {
+        results,
+        published_candidates,
+        published_count,
+    })
 }
 
 async fn submit_build(app: &AppState, run_id: &str, item: &BuildItem, images: &HashMap<String, ImageRef>) -> Result<String> {
@@ -978,7 +1041,7 @@ async fn submit_build(app: &AppState, run_id: &str, item: &BuildItem, images: &H
 
 // ---- publish ----------------------------------------------------------------------
 
-async fn publish_all(app: &AppState, _run_id: &str, planned: &Planned, built: &BTreeMap<BuildKey, Result<Vec<String>, String>>) -> Result<usize> {
+async fn publish_all(app: &AppState, _run_id: &str, planned: &Planned, built: &BTreeMap<BuildKey, Result<Vec<String>, String>>, scope: &PublishScope) -> Result<usize> {
     let mut published = 0usize;
     let signing = app.publisher.signing_enabled();
     if !signing {
@@ -990,6 +1053,9 @@ async fn publish_all(app: &AppState, _run_id: &str, planned: &Planned, built: &B
     let mut per_target: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
     for (stream, items) in &planned.per_stream {
         for item in items {
+            if !scope.covers(item) {
+                continue;
+            }
             let Some(Ok(shas)) = built.get(&(stream.clone(), item.pkgbase.clone())) else {
                 continue;
             };
@@ -1050,6 +1116,9 @@ async fn publish_all(app: &AppState, _run_id: &str, planned: &Planned, built: &B
     let mut by_candidate: HashMap<String, Vec<(&BuildItem, bool)>> = HashMap::new();
     for items in planned.per_stream.values() {
         for item in items {
+            if !scope.covers(item) {
+                continue;
+            }
             let ok = matches!(built.get(&(item.stream.clone(), item.pkgbase.clone())), Some(Ok(_)));
             if let Some(c) = &item.candidate_id {
                 by_candidate.entry(c.clone()).or_default().push((item, ok));
