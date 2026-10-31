@@ -1,6 +1,6 @@
-# systemd unit for a build worker. Install to /etc/systemd/system/.
-# M1 adds mount, namespace, and cgroup needs: ProtectSystem=strict with
-# ReadWritePaths for scratch and images, CAP_SYS_ADMIN, Delegate=yes.
+# systemd unit for a build worker running as root. Install to
+# /etc/systemd/system/. The executor needs mounts, namespaces, and a
+# delegated cgroup subtree; everything else is locked down.
 
 [Unit]
 Description=repoman build worker
@@ -12,6 +12,21 @@ ExecStart=/usr/local/bin/repoman worker --config /etc/repoman/worker.toml
 Restart=always
 RestartSec=5
 Environment=RUST_LOG=info
+
+# cgroup v2 delegation for per-job limits and peak accounting.
+Delegate=yes
+DelegateSubgroup=supervisor
+
+# Filesystem: read-only system, writable scratch and config only.
+ProtectSystem=strict
+ReadWritePaths=/var/lib/repoman-worker
+ReadOnlyPaths=/etc/repoman
+PrivateTmp=yes
+ProtectHome=read-only
+# Needed for mount(2), unshare(2), chroot(2), setuid into build roots,
+# pacman -r, and cgroup management.
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_MKNOD CAP_NET_ADMIN CAP_SYS_PTRACE CAP_KILL CAP_SETPCAP CAP_SETFCAP
+NoNewPrivileges=no
 
 [Install]
 WantedBy=multi-user.target
