@@ -616,12 +616,17 @@ prediction on first-seen packages.
 
 ## 17. Operational notes
 
-- Coordinator deployment: `docker compose` on the NAS; volumes for SQLite and
-  GPG home on the SSD, store, repos, images, and cache on the HDD array; UI
-  and repos exposed through the existing reverse proxy, which forwards to the
-  coordinator rather than serving static files.
-- Worker deployment: a systemd service on the desktop with
-  `ProtectSystem=strict` and explicit read-write paths for scratch, images,
+- Coordinator deployment: stack at `/containers/repoman` on the NAS per that
+  host's conventions, see `deploy/compose.yaml`. Container `repoman` on the
+  `docker1` macvlan, reachable as `repoman.b.intern.gecko.network:7800`.
+  SQLite at `/srv/db/repoman/coordinator` on the SSD; GPG home joins it in
+  M1. Store, repos, images, and cache go under `/media/data/repoman` on the
+  HDD array from M1. UI and repos exposed through the existing reverse proxy,
+  which forwards to the coordinator rather than serving static files. Source
+  is rsync'd to the stack's `src/` and the image is built on the host.
+- Worker deployment: M0 runs a user-level systemd unit on the desktop with the
+  binary in `~/.local/bin`, since the no-op executor needs no privileges. M1
+  moves it to a system service with `ProtectSystem=strict` and explicit read-write paths for scratch, images,
   and `SRCDEST`; `CAP_SYS_ADMIN` retained for mounts and namespaces;
   delegated cgroup subtree.
 - Configuration: one TOML per role. Secrets (worker tokens, API key) via

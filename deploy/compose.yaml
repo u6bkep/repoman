@@ -1,18 +1,34 @@
-# docker compose for the coordinator on the NAS.
-#   docker compose -f deploy/compose.yaml up -d --build
-# Adjust the host paths: state on the SSD, bulk data on the HDD array (M1+).
+# Coordinator stack for the NAS (b-srv0). Lives at /containers/repoman per
+# that host's conventions: the stack dir holds this file, the config, and a
+# rsync'd copy of the source under ./src for the image build. The SQLite
+# database is bind-mounted from the SSD at /srv/db/repoman/coordinator.
+#
+#   rsync -a --delete --exclude target --exclude .git <repo>/ /containers/repoman/src/
+#   docker compose up -d --build
+#
+# The container joins the docker1 macvlan and is reachable on the LAN as
+# repoman.b.intern.gecko.network:7800 with no port publishing.
 
 services:
   coordinator:
     build:
-      context: ..
+      context: ./src
       dockerfile: deploy/Dockerfile
     image: repoman:v2
+    container_name: repoman
+    hostname: repoman
+    labels:
+      coredns.dockerdiscovery.network: "docker1"
+    networks:
+      lan:
     restart: unless-stopped
-    ports:
-      - "7800:7800"
     volumes:
       - ./coordinator.toml:/etc/repoman/coordinator.toml:ro
-      - /srv/repoman/state:/var/lib/repoman
+      - /srv/db/repoman/coordinator:/var/lib/repoman
     environment:
       RUST_LOG: info
+
+networks:
+  lan:
+    name: docker1
+    external: true
