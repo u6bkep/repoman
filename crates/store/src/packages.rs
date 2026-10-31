@@ -146,8 +146,25 @@ impl Store {
         })
     }
 
+    /// Remove a package and close any candidate still open for it, so the
+    /// queue does not keep showing work for something nobody wants.
     pub fn remove_package(&self, pkgbase: &str) -> Result<bool> {
-        self.with(|c| Ok(c.execute("DELETE FROM package WHERE pkgbase = ?1", params![pkgbase])? == 1))
+        self.with(|c| {
+            let placeholders = crate::runs::OPEN_STATES.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let now = clock::now();
+            let mut p: Vec<&dyn rusqlite::ToSql> = vec![&now, &pkgbase];
+            for s in crate::runs::OPEN_STATES {
+                p.push(s);
+            }
+            c.execute(
+                &format!(
+                    "UPDATE candidate SET state = 'superseded', decided_at = ?, decided_by = 'removal', note = 'package removed'
+                     WHERE pkgbase = ? AND state IN ({placeholders})"
+                ),
+                p.as_slice(),
+            )?;
+            Ok(c.execute("DELETE FROM package WHERE pkgbase = ?1", params![pkgbase])? == 1)
+        })
     }
 
     // ---- membership -------------------------------------------------------
@@ -373,8 +390,28 @@ mod tests {
 
         s.set_package_policy("yay", &serde_json::json!({"pgp": "skip"})).unwrap();
         assert_eq!(s.get_package("yay").unwrap().unwrap().policy["pgp"], "skip");
+        let run = s.create_run().unwrap();
+        let c = s
+            .create_candidate(
+                &run.id,
+                &crate::runs::NewCandidate {
+                    pkgbase: "yay",
+                    kind: "update",
+                    aur_commit: Some("def"),
+                    upstream_rev: None,
+                    first_seen_last_modified: None,
+                    class: None,
+                    floor_risk: None,
+                    state: "pending",
+                    review: serde_json::json!({}),
+                },
+            )
+            .unwrap();
         assert!(s.remove_package("yay").unwrap());
         assert!(s.memberships("yay").unwrap().is_empty(), "cascade");
+        let closed = s.get_candidate(&c.id).unwrap().unwrap();
+        assert_eq!(closed.state, "superseded", "open candidates close with the package");
+        assert_eq!(closed.decided_by.as_deref(), Some("removal"));
     }
 
     #[test]
