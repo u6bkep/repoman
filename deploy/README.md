@@ -34,16 +34,16 @@ must use `SigLevel = Optional` for the repoman repos.
 ## Worker (build host)
 
 The executor needs mounts, namespaces, and cgroup delegation, so the worker
-runs as root under systemd. One-time setup, as root:
+runs as root under systemd. One-time setup:
 
 ```sh
-install -m 755 target/release/repoman /usr/local/bin/repoman
-install -d -m 700 /etc/repoman /var/lib/repoman-worker
-install -m 600 deploy/worker.example.toml /etc/repoman/worker.toml   # then edit
-install -m 644 deploy/repoman-worker.service /etc/systemd/system/
-systemctl daemon-reload
-systemctl enable --now repoman-worker.service
+cargo build --release
+sudo deploy/install-worker.sh          # uses ~/.config/repoman/worker.toml
 ```
+
+The script installs the binary, derives `/etc/repoman/worker.toml` from the
+user config, installs the hardened unit, and stops the user-level unit so
+only one process connects under the worker's name.
 
 Iteration afterwards is a release build, `install` of the binary, and
 `systemctl restart repoman-worker`.
