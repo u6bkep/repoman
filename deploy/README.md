@@ -36,7 +36,15 @@ must use `SigLevel = Optional` for the repoman repos.
 The executor needs mounts, namespaces, and cgroup delegation, so the worker
 runs as root under systemd. repoman ships as the `repoman-git` package built
 by repoman itself from this branch (root `PKGBUILD`), so a build host installs
-it like any other package once the client stanza below is in place:
+it like any other package once the client stanza below is in place. The
+coordinator learns about it as a git-sourced package; the fragment matters
+because GitHub's default branch is still v1:
+
+```sh
+repoman add repoman-git --source 'https://github.com/u6bkep/repoman.git#branch=v2-main'
+```
+
+Then on each build host:
 
 ```sh
 sudo pacman -Syu repoman-git
