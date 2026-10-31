@@ -475,7 +475,9 @@ pub struct Planned {
 
 fn target_commit(cands: &[CandidateRow], baseline: Option<&str>) -> Option<(String, Option<String>)> {
     for c in cands {
-        if c.state == "approved" {
+        // Failed candidates stay approved in spirit: they are re-planned until
+        // they succeed or a newer head supersedes them.
+        if c.state == "approved" || c.state == "failed" {
             if let Some(commit) = &c.aur_commit {
                 return Some((commit.clone(), Some(c.id.clone())));
             }
@@ -890,7 +892,18 @@ async fn publish_all(app: &AppState, _run_id: &str, planned: &Planned, built: &B
         for (sha, _) in &to_add {
             retired_all.extend(app.store.publish(sha, stream)?);
         }
-        app.publisher.publish(&app.blobs, stream, &to_add).await?;
+        if app.publisher.has_db(stream) {
+            app.publisher.publish(&app.blobs, stream, &to_add).await?;
+        } else {
+            // Missing or renamed database: rebuild it from every live artifact.
+            let live: Vec<(String, String)> = app
+                .store
+                .live_artifacts(stream)?
+                .into_iter()
+                .map(|a| (a.sha256, a.filename))
+                .collect();
+            app.publisher.rebuild(&app.blobs, stream, &live).await?;
+        }
         published += to_add.len();
         app.store.event("repo.published", Some(stream), serde_json::json!({"count": to_add.len(), "retired": retired_all.len()}))?;
 

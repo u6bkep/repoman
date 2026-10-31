@@ -56,8 +56,15 @@ impl Publisher {
         "repoman-staging"
     }
 
-    pub fn published_repo_name(stream: &str) -> String {
-        format!("repoman-{stream}")
+    /// Every stream's repo is named `repoman` and its database file
+    /// `repoman.db`, so clients and build roots use one stanza name and
+    /// differ only in the Server URL.
+    pub fn published_repo_name(_stream: &str) -> String {
+        "repoman".to_string()
+    }
+
+    pub fn db_path(&self, stream: &str) -> PathBuf {
+        self.repo_dir(stream).join("repoman.db.tar.zst")
     }
 
     // ---- repo-add ---------------------------------------------------------------
@@ -184,7 +191,7 @@ impl Publisher {
             args.push("-k".into());
             args.push(self.signing_key.clone().unwrap());
         }
-        let db = dir.join(format!("{stream}.db.tar.zst"));
+        let db = self.db_path(stream);
         args.push(db.to_string_lossy().to_string());
         for (sha, name) in artifacts {
             let p = Self::link_blob(blobs, sha, name, &dir)?;
@@ -200,7 +207,7 @@ impl Publisher {
             return Ok(());
         }
         let dir = self.repo_dir(stream);
-        let db = dir.join(format!("{stream}.db.tar.zst"));
+        let db = self.db_path(stream);
         if db.exists() {
             let mut args: Vec<String> = vec!["-q".into()];
             if self.signing_enabled() {
@@ -273,10 +280,36 @@ mod tests {
             ..Default::default()
         };
         let p = Publisher::new(&cfg).unwrap();
-        assert_eq!(Publisher::published_repo_name("manjaro-stable"), "repoman-manjaro-stable");
+        assert_eq!(Publisher::published_repo_name("manjaro-stable"), "repoman");
+        assert!(p.db_path("manjaro-stable").ends_with("repos/manjaro-stable/x86_64/repoman.db.tar.zst"));
         assert!(p.repo_dir("manjaro-stable").ends_with("repos/manjaro-stable/x86_64"));
         assert!(p.staging_dir("r1", "s").ends_with("staging/r1/s/x86_64"));
         assert!(!p.signing_enabled());
         let _ = std::fs::remove_dir_all(&cfg.data_dir);
+    }
+}
+
+impl Publisher {
+    /// Does the stream's database exist on disk?
+    pub fn has_db(&self, stream: &str) -> bool {
+        self.db_path(stream).exists()
+    }
+
+    /// Rebuild a stream's database from scratch out of the given live
+    /// artifacts, for repair or after a naming change. Removes stale
+    /// database files first.
+    pub async fn rebuild(&self, blobs: &Blobs, stream: &str, artifacts: &[(String, String)]) -> Result<()> {
+        let dir = self.repo_dir(stream);
+        std::fs::create_dir_all(&dir)?;
+        for e in std::fs::read_dir(&dir)?.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.contains(".db") || name.contains(".files") {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+        if artifacts.is_empty() {
+            return Ok(());
+        }
+        self.publish(blobs, stream, artifacts).await
     }
 }

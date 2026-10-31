@@ -392,7 +392,7 @@ impl Harness {
     }
 
     fn repo_db(&self) -> Vec<repoman_alpm::syncdb::SyncPackage> {
-        let p = self.bulk.join("repos/s1/x86_64/s1.db.tar.zst");
+        let p = self.bulk.join("repos/s1/x86_64/repoman.db.tar.zst");
         read_db(&std::fs::read(&p).unwrap_or_default()).unwrap_or_default()
     }
 }
