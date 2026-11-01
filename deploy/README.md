@@ -103,3 +103,20 @@ sudo pacman-key --lsign-key <fingerprint>
 
 Until a signing key is configured, use `SigLevel = Optional TrustAll` for
 this repo only.
+
+## Package cache for clients
+
+The coordinator serves upstream packages through `/cache` as a pacman
+`CacheServer`: the first machine to need a file pulls it across the internet,
+every later one gets it from the NAS. Build roots use it automatically. To
+let a client use it too, add one line to each distribution stanza in
+`/etc/pacman.conf`, above its `Include`:
+
+```
+[core]
+CacheServer = http://repoman.b.intern.gecko.network:7800/cache
+Include = /etc/pacman.d/mirrorlist
+```
+
+pacman tries the cache first and falls back to the mirrors on any failure,
+so a coordinator outage costs nothing but speed.

@@ -20,6 +20,12 @@ quarantine_days = 3
 auto_approve = true
 auto_approve_metadata = true
 
+# Pull-through cache for upstream packages at /cache (pacman CacheServer).
+# Build roots use it automatically; clients add a CacheServer line.
+cache_enabled = true
+cache_grace_days = 30
+# cache_max_bytes = 107374182400
+
 # Routine updates are checked against GitHub/GitLab/Codeberg: the tag must
 # exist under the baseline's owner. GITHUB_TOKEN in the environment raises
 # the rate limit.

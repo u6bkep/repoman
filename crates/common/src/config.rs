@@ -72,6 +72,21 @@ pub struct CoordinatorConfig {
     /// Environment variable with a GitHub token (raises the API rate limit).
     #[serde(default = "default_github_token_env")]
     pub github_token_env: String,
+    /// Serve upstream package files through /cache (pacman CacheServer) and
+    /// point build roots at it.
+    #[serde(default = "default_true")]
+    pub cache_enabled: bool,
+    /// Days a cached file stays after leaving every stream database.
+    #[serde(default = "default_cache_grace_days")]
+    pub cache_grace_days: u64,
+    /// Total cache size above which unreferenced files are evicted early,
+    /// least recently served first. Unset means no cap.
+    #[serde(default)]
+    pub cache_max_bytes: Option<u64>,
+}
+
+fn default_cache_grace_days() -> u64 {
+    30
 }
 
 fn default_github_token_env() -> String {
@@ -175,6 +190,9 @@ impl Default for CoordinatorConfig {
             reviewer: ReviewerConfig::default(),
             forge_checks: true,
             github_token_env: default_github_token_env(),
+            cache_enabled: true,
+            cache_grace_days: default_cache_grace_days(),
+            cache_max_bytes: None,
         }
     }
 }

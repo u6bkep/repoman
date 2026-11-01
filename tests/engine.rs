@@ -21,6 +21,7 @@ use repoman_store::Store;
 use repoman_worker::WorkerState;
 use repoman_worker::exec::{JobCtx, JobRunner, RunFuture};
 use serde_json::{Value, json};
+use sha2::Digest;
 
 // ---------------------------------------------------------------------------
 // Fake AUR: bare repos under <dir>/aur, RPC metadata derived from them.
@@ -135,6 +136,9 @@ struct StubState {
     stamps: Arc<Mutex<HashMap<String, i64>>>,
     versions: Arc<Mutex<HashMap<String, String>>>,
     core_db: Arc<Vec<u8>>,
+    /// Package files the fake mirror serves, by filename.
+    files: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    mirror_requests: Arc<Mutex<Vec<String>>>,
 }
 
 async fn rpc_info(State(st): State<StubState>, Query(q): Query<Vec<(String, String)>>) -> axum::Json<Value> {
@@ -161,8 +165,11 @@ async fn rpc_search(AxPath(_name): AxPath<String>) -> axum::Json<Value> {
 
 async fn mirror_db(State(st): State<StubState>, AxPath((repo, _arch, file)): AxPath<(String, String, String)>) -> axum::response::Response {
     use axum::response::IntoResponse;
+    st.mirror_requests.lock().unwrap().push(format!("{repo}/{file}"));
     if repo == "core" && file == "core.db" {
         ([(axum::http::header::LAST_MODIFIED, "Fri, 31 Oct 2026 00:00:00 GMT")], st.core_db.as_ref().clone()).into_response()
+    } else if let Some(bytes) = st.files.lock().unwrap().get(&file) {
+        bytes.clone().into_response()
     } else {
         axum::http::StatusCode::NOT_FOUND.into_response()
     }
@@ -309,6 +316,7 @@ fn extract_srcinfo(tar_bytes: &[u8], pkgbase: &str) -> anyhow::Result<String> {
 
 struct Harness {
     base: String,
+    mirror_requests: Arc<Mutex<Vec<String>>>,
     specs: Arc<Mutex<Vec<JobSpec>>>,
     aur: FakeAur,
     versions: Arc<Mutex<HashMap<String, String>>>,
@@ -328,11 +336,25 @@ async fn start_with(tweak: impl FnOnce(&mut CoordinatorConfig)) -> Harness {
     let versions = Arc::new(Mutex::new(HashMap::new()));
     let mut glibc = pkg("glibc", "2.44-1");
     glibc.provides = vec!["libc.so=6-64".into()];
-    let core_db = build_db(&[glibc, pkg("cmake", "3.30-1"), pkg("python", "3.13-1")], false);
+    // cmake carries a real size and checksum so the cache can verify it;
+    // the fake mirror serves the matching bytes (and a corrupt python).
+    let cmake_bytes = b"cmake package bytes".to_vec();
+    let mut cmake = pkg("cmake", "3.30-1");
+    cmake.csize = Some(cmake_bytes.len() as u64);
+    cmake.sha256sum = Some(hex::encode(sha2::Sha256::digest(&cmake_bytes)));
+    let mut python = pkg("python", "3.13-1");
+    python.sha256sum = Some("00".repeat(32));
+    let mut files = HashMap::new();
+    files.insert(cmake.filename.clone(), cmake_bytes);
+    files.insert(python.filename.clone(), b"not what the database says".to_vec());
+    let core_db = build_db(&[glibc, cmake, python], false);
+    let mirror_requests = Arc::new(Mutex::new(Vec::new()));
     let stub = start_stub(StubState {
         stamps: aur.stamps.clone(),
         versions: versions.clone(),
         core_db: Arc::new(core_db),
+        files: Arc::new(Mutex::new(files)),
+        mirror_requests: mirror_requests.clone(),
     })
     .await;
 
@@ -386,6 +408,7 @@ async fn start_with(tweak: impl FnOnce(&mut CoordinatorConfig)) -> Harness {
 
     let h = Harness {
         base: format!("http://{addr}"),
+        mirror_requests,
         specs,
         aur,
         versions,
@@ -789,4 +812,46 @@ async fn artifacts_with_new_install_script_wait_in_publish_review() {
     assert_eq!(h.repo_db().iter().find(|p| p.name == "foo").unwrap().version, "1.1-1");
     let published = h.get("/api/candidates?state=published").await;
     assert!(published.as_array().unwrap().iter().any(|c| c["id"] == held[0]["id"]));
+}
+
+#[tokio::test]
+async fn cache_serves_verified_upstream_files() {
+    let h = start().await;
+    // Streams load on the first run; trigger one so the index knows cmake.
+    h.post("/api/packages", json!({"pkgbase": "foo", "streams": ["s1"]})).await;
+    h.publish_pkg("foo", "1.0", &["glibc"], &[]);
+    assert_eq!(h.run().await["state"], "needs_input");
+    let before = h.mirror_requests.lock().unwrap().len();
+
+    // Miss: fetched from the mirror, verified, served.
+    let r = reqwest::get(format!("{}/cache/cmake-3.30-1-x86_64.pkg.tar.zst", h.base)).await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.bytes().await.unwrap().as_ref(), b"cmake package bytes");
+    // Hit: nothing goes to the mirror; ranges work.
+    let r = reqwest::Client::new()
+        .get(format!("{}/cache/cmake-3.30-1-x86_64.pkg.tar.zst", h.base))
+        .header("range", "bytes=0-4")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 206);
+    assert_eq!(r.bytes().await.unwrap().as_ref(), b"cmake");
+    let mirror_fetches = h.mirror_requests.lock().unwrap()[before..].iter().filter(|r| r.ends_with(".pkg.tar.zst")).count();
+    assert_eq!(mirror_fetches, 1, "one upstream fetch for two requests");
+
+    // A corrupt mirror file never reaches a client.
+    let r = reqwest::get(format!("{}/cache/python-3.13-1-x86_64.pkg.tar.zst", h.base)).await.unwrap();
+    assert_eq!(r.status(), 502, "{}", r.text().await.unwrap());
+    // Not a package file, or unknown everywhere.
+    assert_eq!(reqwest::get(format!("{}/cache/core.db", h.base)).await.unwrap().status(), 404);
+    assert_eq!(reqwest::get(format!("{}/cache/nope-1-1-x86_64.pkg.tar.zst", h.base)).await.unwrap().status(), 502);
+
+    let view = h.get("/api/cache").await;
+    assert_eq!(view["files"], 1, "{view}");
+    assert_eq!(view["hits"], 1);
+    assert_eq!(view["misses"], 3);
+    // Build roots and image bootstraps are pointed at the cache.
+    let specs = h.specs.lock().unwrap();
+    let conf = specs.iter().find_map(|s| match &s.job { JobKind::Image { pacman_conf, .. } => Some(pacman_conf.clone()), _ => None }).expect("image job");
+    assert!(conf.contains(&format!("CacheServer = {}/cache", h.base)), "{conf}");
 }

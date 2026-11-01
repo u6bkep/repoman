@@ -428,7 +428,7 @@ async function viewPackage(pkgbase) {
 // ---- system ----------------------------------------------------------------------
 
 async function viewSystem() {
-  const [workers, images, events, health] = await Promise.all([api("/api/workers"), api("/api/images"), api("/api/events?limit=60"), api("/api/health")]);
+  const [workers, images, events, health, cache] = await Promise.all([api("/api/workers"), api("/api/images"), api("/api/events?limit=60"), api("/api/health"), api("/api/cache")]);
   $main.innerHTML = `
     <h1>System <span class="muted">repoman ${esc(health.version)}</span></h1>
     <h2>Workers</h2>
@@ -441,6 +441,13 @@ async function viewSystem() {
       cells: (i) => [esc(i.stream), `<span class="mono">${short(i.sha256, 12)}</span>`, bytes(i.size), dash(i.packages?.length), pill(i.state), `<span class="muted">${ago(i.created_at)}</span>`],
       empty: "no images yet",
     })}
+    <h2>Package cache</h2>
+    <div class="cards">
+      <div class="card"><div class="label">state</div><div class="big">${cache.enabled ? "on" : "off"}</div><div class="muted mono">${esc(cache.url)}</div></div>
+      <div class="card"><div class="label">files</div><div class="big">${cache.files}</div><div class="muted">${bytes(cache.bytes)} total</div></div>
+      <div class="card"><div class="label">hits / misses</div><div class="big">${cache.hits} / ${cache.misses}</div><div class="muted">${cache.errors} fetch errors since start</div></div>
+      <div class="card"><div class="label">evictable</div><div class="big">${cache.unreferenced_files}</div><div class="muted">${bytes(cache.unreferenced_bytes)} past the databases, ${cache.grace_days}d grace${cache.max_bytes ? `, cap ${bytes(cache.max_bytes)}` : ", no size cap"}</div></div>
+    </div>
     <h2>Recent events</h2>
     ${table(["when", "kind", "subject", "payload"], events, {
       cells: (e) => [`<span class="muted">${ago(e.ts)}</span>`, esc(e.kind), dash(e.subject), `<code class="ellipsis">${esc(JSON.stringify(e.payload))}</code>`],
@@ -451,6 +458,8 @@ async function viewSystem() {
     <pre>[repoman]
 SigLevel = Required DatabaseRequired
 Server = ${esc(location.origin)}/repos/manjaro-stable/$arch</pre>
+    <p>Optionally let the distribution repos fetch through this host's cache by adding one line to each of <code>[core]</code>, <code>[extra]</code>, and <code>[multilib]</code>, above their <code>Include</code>:</p>
+    <pre>CacheServer = ${esc(location.origin)}/cache</pre>
     <p>Import the signing key once: <code>curl -s ${esc(location.origin)}/repos/repoman.asc | sudo pacman-key --add - &amp;&amp; sudo pacman-key --lsign-key &lt;fingerprint&gt;</code></p></div>`;
 }
 viewSystem.refresh = 10000;

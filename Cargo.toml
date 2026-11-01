@@ -33,6 +33,8 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
 axum = "0.8.9"
+hex = "0.4.3"
+sha2 = "0.11.0"
 repoman-alpm = { path = "crates/alpm" }
 repoman-store = { path = "crates/store" }
 tar = "0.4.46"

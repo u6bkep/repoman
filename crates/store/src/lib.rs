@@ -15,6 +15,7 @@ use serde::Serialize;
 
 mod schema;
 pub mod artifacts;
+pub mod cache;
 pub mod images;
 pub mod packages;
 pub mod runs;

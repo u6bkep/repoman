@@ -10,6 +10,7 @@ use tokio::net::TcpListener;
 pub mod api;
 pub mod aur;
 pub mod blobs;
+pub mod cache;
 pub mod engine;
 pub mod forge;
 pub mod gate;
@@ -32,6 +33,7 @@ pub struct AppState {
     pub keys: Arc<keys::Keys>,
     pub reviewer: Arc<reviewer::Reviewer>,
     pub forge: Arc<forge::ForgeClient>,
+    pub cache: Arc<cache::Cache>,
     pub engine: Arc<engine::Engine>,
 }
 
@@ -48,6 +50,7 @@ impl AppState {
         let keys = Arc::new(keys::Keys::new(&config.data_dir)?);
         let reviewer = Arc::new(reviewer::Reviewer::new(config.reviewer.clone()));
         let forge = Arc::new(forge::ForgeClient::new(std::env::var(&config.github_token_env).ok().filter(|t| !t.is_empty())));
+        let cache = Arc::new(cache::Cache::new(config.clone(), streams.clone(), store.clone())?);
         if reviewer.enabled() && !reviewer.is_configured() {
             tracing::warn!(env = %config.reviewer.api_key_env, "reviewer enabled but no API key in the environment; candidates will record no verdict");
         }
@@ -62,6 +65,7 @@ impl AppState {
             keys,
             reviewer,
             forge,
+            cache,
             engine: engine::Engine::new(),
         })
     }
@@ -83,6 +87,17 @@ pub async fn run(config: CoordinatorConfig) -> Result<()> {
 pub async fn serve(config: CoordinatorConfig, store: Arc<Store>, listener: TcpListener) -> Result<()> {
     let state = AppState::new(config, store)?;
     tokio::spawn(state.hub.clone().dispatcher());
+    // Cache eviction on a schedule, independent of runs.
+    let cache = state.cache.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+        loop {
+            tick.tick().await;
+            if let Err(e) = cache.maintain() {
+                tracing::warn!(error = %format!("{e:#}"), "cache maintenance failed");
+            }
+        }
+    });
     axum::serve(listener, api::router(state)).await?;
     Ok(())
 }

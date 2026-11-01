@@ -619,7 +619,10 @@ edge cases around failed and superseded candidates.
 ### M3 — Cache role (1–2 sessions)
 Pull-through cache with verification, locking, ranges, referenced-set
 eviction, size cap, UI page. Workers and clients switch to `CacheServer` for
-upstream repos.
+upstream repos. Implemented 2026-11-01 as `coordinator::cache` (`/cache/{file}`,
+`/api/cache`, store table `cache_file`, maintenance after each stream refresh
+and every six hours); build roots and image bootstraps get `CacheServer`
+automatically when `cache_enabled`.
 Exit: a fresh base image build pulls every package from the cache after the
 first run; eviction removes stale files on schedule.
 Review focus: concurrency and partial-download handling.

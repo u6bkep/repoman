@@ -40,6 +40,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/candidates/{id}/decide", post(decide_candidate))
         .route("/api/candidates/{id}/diff", get(candidate_diff))
         .route("/api/events", get(list_events))
+        .route("/api/cache", get(cache_view))
+        .route("/cache/{filename}", get(cache_file))
         .route("/api/images", get(list_images))
         .route("/api/signing-key", post(generate_signing_key))
         .route("/repos/repoman.asc", get(public_key))
@@ -147,6 +149,15 @@ struct EventsQuery {
 
 async fn list_events(State(st): State<AppState>, Query(q): Query<EventsQuery>) -> Result<axum::Json<Vec<repoman_store::EventRow>>, ApiError> {
     Ok(axum::Json(st.store.recent_events(q.limit.min(1000)).map_err(internal)?))
+}
+
+async fn cache_view(State(st): State<AppState>) -> Result<axum::Json<crate::cache::CacheView>, ApiError> {
+    Ok(axum::Json(st.cache.view().map_err(internal)?))
+}
+
+/// `GET /cache/{filename}`: pacman CacheServer endpoint for upstream packages.
+async fn cache_file(State(st): State<AppState>, Path(filename): Path<String>, req: axum::http::Request<Body>) -> Response {
+    st.cache.serve(&filename, req).await
 }
 
 #[derive(Deserialize)]

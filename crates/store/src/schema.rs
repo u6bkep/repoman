@@ -191,6 +191,19 @@ pub const MIGRATIONS: &[&str] = &[
     "ALTER TABLE baseline ADD COLUMN maintainers TEXT NOT NULL DEFAULT '[]';",
     // 5: setuid/setgid payload files, for the artifact diff
     "ALTER TABLE artifact ADD COLUMN setuid_paths TEXT NOT NULL DEFAULT '[]';",
+    // 6: pull-through package cache bookkeeping
+    "CREATE TABLE cache_file (
+         filename           TEXT PRIMARY KEY,
+         size               INTEGER NOT NULL,
+         sha256             TEXT,
+         stream             TEXT,
+         repo               TEXT,
+         fetched_at         TEXT NOT NULL,
+         last_served_at     TEXT NOT NULL,
+         serves             INTEGER NOT NULL DEFAULT 0,
+         unreferenced_since TEXT
+     );
+     CREATE INDEX cache_file_lru_idx ON cache_file(unreferenced_since, last_served_at);",
 ];
 
 pub fn migrate(conn: &Connection) -> Result<()> {

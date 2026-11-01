@@ -111,6 +111,9 @@ async fn execute(app: &AppState, run_id: &str) -> Result<RunEnd> {
     for pass in 0..8 {
         step(app, run_id, "streams").await?;
         app.streams.refresh_all().await.context("refreshing streams")?;
+        if let Err(e) = app.cache.maintain() {
+            tracing::warn!(error = %format!("{e:#}"), "cache maintenance failed");
+        }
         // Repair: a stream with publications but no database file (first run
         // after a rename, or manual deletion) gets its database rebuilt.
         for s in app.config.streams_sorted() {
@@ -213,7 +216,7 @@ async fn ensure_image(app: &AppState, stream: &StreamConfig) -> Result<ImageRef>
     let job = app.store.create_job(
         &JobKind::Image {
             stream: stream.name.clone(),
-            pacman_conf: app.streams.image_pacman_conf(stream),
+            pacman_conf: app.streams.pacman_conf(stream, &[], &app.cache.servers()).render(),
             packages: app.config.image_packages.clone(),
             keyrings: stream.keyrings.clone(),
             makepkg_conf_extra: app.config.makepkg_conf_extra.clone(),
@@ -1310,7 +1313,7 @@ async fn submit_build(app: &AppState, run_id: &str, item: &BuildItem, images: &H
             sig_level: Some("Never".into()),
         });
     }
-    let pacman_conf = app.streams.pacman_conf(stream, &extra, &[]).render();
+    let pacman_conf = app.streams.pacman_conf(stream, &extra, &app.cache.servers()).render();
     let pgp_keys = if item.skip_pgp || item.validpgpkeys.is_empty() {
         Vec::new()
     } else {
