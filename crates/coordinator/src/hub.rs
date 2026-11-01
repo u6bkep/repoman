@@ -180,8 +180,8 @@ impl Hub {
     }
 
     /// Pick the capable connected worker with a free slot and room for
-    /// `needed` bytes beside what its running jobs were promised; prefer the
-    /// one with the most memory left, then the most free slots.
+    /// `needed` bytes beside what its running jobs were promised; spread
+    /// work first (most free slots), then prefer the most memory left.
     fn reserve_slot(&self, job: &JobId, capability: Option<&str>, needed: u64) -> Option<(String, mpsc::UnboundedSender<CoordMsg>)> {
         let mut map = self.connected.lock().unwrap();
         let (name, c) = map
@@ -191,7 +191,7 @@ impl Hub {
             .filter(|(_, c)| fits(c.mem_bytes, c.running.values().sum(), c.running.len(), needed))
             .max_by_key(|(_, c)| {
                 let left = c.mem_bytes.map(|m| m.saturating_sub(c.running.values().sum::<u64>())).unwrap_or(u64::MAX);
-                (left, c.slots - c.running.len() as u32)
+                (c.slots - c.running.len() as u32, left)
             })?;
         c.running.insert(job.clone(), needed);
         Some((name.clone(), c.tx.clone()))

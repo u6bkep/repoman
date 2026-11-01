@@ -61,12 +61,16 @@ pub async fn run_probe(ctx: &JobCtx, sources: &[String]) -> Result<JobResult> {
 }
 
 async fn ls_remote(url: &str, refname: &str) -> Result<String> {
-    let out = tokio::process::Command::new("git")
-        .args(["ls-remote", "--", url, refname])
+    // An unreachable upstream must not stall the whole run; git's own
+    // connect timeout can run to minutes.
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.args(["ls-remote", "--", url, refname])
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(std::process::Stdio::null())
-        .output()
+        .kill_on_drop(true);
+    let out = tokio::time::timeout(std::time::Duration::from_secs(45), cmd.output())
         .await
+        .map_err(|_| anyhow::anyhow!("git ls-remote {url}: no answer within 45 s"))?
         .context("spawning git ls-remote")?;
     if !out.status.success() {
         bail!("git ls-remote {url} {refname}: {}", String::from_utf8_lossy(&out.stderr).trim());
