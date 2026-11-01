@@ -135,7 +135,8 @@ impl FakeAur {
 struct StubState {
     stamps: Arc<Mutex<HashMap<String, i64>>>,
     versions: Arc<Mutex<HashMap<String, String>>>,
-    core_db: Arc<Vec<u8>>,
+    /// (bytes, Last-Modified) of the fake core database; tests swap it.
+    core_db: Arc<Mutex<(Vec<u8>, String)>>,
     /// Package files the fake mirror serves, by filename.
     files: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     mirror_requests: Arc<Mutex<Vec<String>>>,
@@ -196,7 +197,8 @@ async fn mirror_db(State(st): State<StubState>, AxPath((repo, _arch, file)): AxP
     use axum::response::IntoResponse;
     st.mirror_requests.lock().unwrap().push(format!("{repo}/{file}"));
     if repo == "core" && file == "core.db" {
-        ([(axum::http::header::LAST_MODIFIED, "Fri, 31 Oct 2026 00:00:00 GMT")], st.core_db.as_ref().clone()).into_response()
+        let (bytes, lastmod) = st.core_db.lock().unwrap().clone();
+        ([(axum::http::header::LAST_MODIFIED, lastmod)], bytes).into_response()
     } else if let Some(bytes) = st.files.lock().unwrap().get(&file) {
         bytes.clone().into_response()
     } else {
@@ -264,6 +266,8 @@ impl JobRunner for FakeRunner {
                     for name in si.pkgnames() {
                         let ver = si.version();
                         let depends = si.effective(name, "depends", "x86_64");
+                        // A package depending on libfoo links libfoo.so.1.
+                        let needed: Vec<String> = if depends.iter().any(|d| d == "libfoo") { vec!["libfoo.so.1".into()] } else { vec![] };
                         let mut pkginfo = format!("pkgname = {name}\npkgbase = {pkgbase}\npkgver = {ver}\narch = x86_64\nsize = 10\n");
                         for d in &depends {
                             pkginfo.push_str(&format!("depend = {d}\n"));
@@ -288,6 +292,7 @@ impl JobRunner for FakeRunner {
                             paths: vec![format!("usr/bin/{name}")],
                             has_install_script: si.base.first("install").is_some(),
                             setuid_paths: vec![],
+                            needed,
                             buildinfo: json!({}),
                         });
                     }
@@ -348,6 +353,7 @@ struct Harness {
     base: String,
     mirror_requests: Arc<Mutex<Vec<String>>>,
     dangerous: Arc<Mutex<Vec<String>>>,
+    core_db: Arc<Mutex<(Vec<u8>, String)>>,
     specs: Arc<Mutex<Vec<JobSpec>>>,
     aur: FakeAur,
     versions: Arc<Mutex<HashMap<String, String>>>,
@@ -378,13 +384,16 @@ async fn start_with(tweak: impl FnOnce(&mut CoordinatorConfig)) -> Harness {
     let mut files = HashMap::new();
     files.insert(cmake.filename.clone(), cmake_bytes);
     files.insert(python.filename.clone(), b"not what the database says".to_vec());
-    let core_db = build_db(&[glibc, cmake, python], false);
+    let mut libfoo = pkg("libfoo", "1.0-1");
+    libfoo.provides = vec!["libfoo.so=1-64".into()];
+    let core_db = build_db(&[glibc, cmake, python, libfoo], false);
+    let core_db = Arc::new(Mutex::new((core_db, "Fri, 31 Oct 2026 00:00:00 GMT".to_string())));
     let mirror_requests = Arc::new(Mutex::new(Vec::new()));
     let dangerous: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let stub = start_stub(StubState {
         stamps: aur.stamps.clone(),
         versions: versions.clone(),
-        core_db: Arc::new(core_db),
+        core_db: core_db.clone(),
         files: Arc::new(Mutex::new(files)),
         mirror_requests: mirror_requests.clone(),
         dangerous: dangerous.clone(),
@@ -444,6 +453,7 @@ async fn start_with(tweak: impl FnOnce(&mut CoordinatorConfig)) -> Harness {
         base: format!("http://{addr}"),
         mirror_requests,
         dangerous,
+        core_db,
         specs,
         aur,
         versions,
@@ -916,4 +926,48 @@ async fn aur_security_signal_blocks_auto_approval() {
     assert_eq!(signals[0]["source"], "aur-security");
     assert_eq!(signals[0]["severity"], "high");
     assert_eq!(signals[0]["payload"]["verdict"], "dangerous");
+}
+
+#[tokio::test]
+async fn soname_bump_in_stream_rebuilds_dependents() {
+    let h = start().await;
+    h.post("/api/packages", json!({"pkgbase": "foo", "streams": ["s1"], "class": "upstream-source"})).await;
+    h.publish_pkg("foo", "1.0", &["glibc", "libfoo"], &[]);
+    assert_eq!(h.run().await["state"], "needs_input");
+    let c = h.get("/api/candidates").await.as_array().unwrap()[0].clone();
+    h.post(&format!("/api/candidates/{}/decide", c["id"].as_str().unwrap()), json!({"decision": "approve"})).await;
+    assert_eq!(h.run().await["state"], "done");
+    let hist = h.get("/api/packages/foo/history").await;
+    assert_eq!(hist["publications"][0]["artifact"]["needed"], json!(["libfoo.so.1"]), "{hist}");
+    // Nothing to do while the stream still provides libfoo.so.1.
+    let idle = h.run().await;
+    assert_eq!(idle["summary"]["builds_planned"], 0, "{idle}");
+
+    // The stream bumps libfoo to a new soname.
+    {
+        let mut glibc = pkg("glibc", "2.44-1");
+        glibc.provides = vec!["libc.so=6-64".into()];
+        let mut libfoo = pkg("libfoo", "2.0-1");
+        libfoo.provides = vec!["libfoo.so=2-64".into()];
+        let db = build_db(&[glibc, pkg("cmake", "3.30-1"), pkg("python", "3.13-1"), libfoo], false);
+        *h.core_db.lock().unwrap() = (db, "Sat, 01 Nov 2026 00:00:00 GMT".to_string());
+    }
+    let r = h.run().await;
+    assert_eq!(r["state"], "done", "{r}");
+    assert_eq!(r["summary"]["builds_succeeded"], 1, "foo rebuilt without operator input: {}", r["summary"]);
+    let published = h.get("/api/candidates?state=published").await;
+    let rebuild = published.as_array().unwrap().iter().find(|c| c["kind"] == "soname_rebuild").expect("soname_rebuild candidate");
+    assert_eq!(rebuild["pkgbase"], "foo");
+    assert_eq!(rebuild["review"]["sonames"], json!(["libfoo.so.1"]));
+    // And it does not loop: the rebuilt artifact still says libfoo.so.1 (fake
+    // runner), but a second run must not create another candidate while one
+    // was just published... it will, since the stream still lacks .so.1; that
+    // is the real-world answer too (the package truly needs rebuilding against
+    // the new soname and the fake build cannot do it). Check instead that a
+    // run with no further change plans the rebuild once more rather than
+    // crashing or duplicating candidates.
+    let again = h.run().await;
+    assert_eq!(again["state"], "done", "{again}");
+    let open: Vec<Value> = h.get("/api/candidates?state=approved").await.as_array().unwrap().clone();
+    assert!(open.is_empty(), "no dangling approved candidates: {open:?}");
 }

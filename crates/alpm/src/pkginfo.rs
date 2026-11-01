@@ -124,6 +124,9 @@ pub struct PackageMeta {
     pub paths: Vec<String>,
     /// Payload files carrying the setuid or setgid bit.
     pub setuid_paths: Vec<String>,
+    /// Shared libraries the payload's ELF files link against (sonames),
+    /// sorted and deduplicated.
+    pub needed: Vec<String>,
 }
 
 pub fn read_package_meta(bytes: &[u8]) -> Result<PackageMeta> {
@@ -159,8 +162,26 @@ pub fn read_package_meta(bytes: &[u8]) -> Result<PackageMeta> {
             }
             ".MTREE" | ".CHANGELOG" => {}
             p if !p.starts_with('.') => {
-                if entry.header().entry_type().is_file() && entry.header().mode().unwrap_or(0) & 0o6000 != 0 {
+                let is_file = entry.header().entry_type().is_file();
+                if is_file && entry.header().mode().unwrap_or(0) & 0o6000 != 0 {
                     meta.setuid_paths.push(p.to_string());
+                }
+                // ELF payloads: read and record their NEEDED sonames. Only
+                // files that start with the magic are read in full.
+                if is_file && entry.size() >= 64 && entry.size() <= 512 << 20 {
+                    let mut head = [0u8; 4];
+                    if entry.read_exact(&mut head).is_ok() {
+                        if &head == crate::elf::MAGIC {
+                            let mut rest = Vec::with_capacity(entry.size() as usize);
+                            rest.extend_from_slice(&head);
+                            entry.read_to_end(&mut rest)?;
+                            for n in crate::elf::needed(&rest) {
+                                if !meta.needed.contains(&n) {
+                                    meta.needed.push(n);
+                                }
+                            }
+                        }
+                    }
                 }
                 meta.paths.push(p.to_string());
             }
@@ -170,6 +191,7 @@ pub fn read_package_meta(bytes: &[u8]) -> Result<PackageMeta> {
     meta.pkginfo
         .as_ref()
         .context("package has no .PKGINFO")?;
+    meta.needed.sort();
     Ok(meta)
 }
 

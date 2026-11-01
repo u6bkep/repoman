@@ -142,6 +142,10 @@ async fn execute(app: &AppState, run_id: &str) -> Result<RunEnd> {
 
         step(app, run_id, "candidates").await?;
         create_candidates(app, run_id, &images).await?;
+        let rebuilds = soname_rebuilds(app, run_id)?;
+        if rebuilds > 0 {
+            tracing::info!(count = rebuilds, "soname rebuild candidates created");
+        }
 
         step(app, run_id, "gate").await?;
         let auto = auto_approve(app)?;
@@ -508,9 +512,21 @@ async fn create_candidates(app: &AppState, run_id: &str, images: &HashMap<String
                 }
             }
             Some(_) => {
-                // Baseline is current. VCS packages still need an upstream check.
+                // Baseline is current. VCS packages still need an upstream check,
+                // at most once per policy.probe_interval_hours.
                 if p.kind == "vcs" && !open.iter().any(|c| c.kind == "vcs") {
-                    probes.push((p.clone(), head));
+                    let interval = p.policy.get("probe_interval_hours").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let due = interval <= 0.0
+                        || app
+                            .store
+                            .last_job_finished(&p.pkgbase, "probe")?
+                            .and_then(|t| clock::seconds_between(&t, &clock::now()))
+                            .is_none_or(|age| age >= interval * 3600.0);
+                    if due {
+                        probes.push((p.clone(), head));
+                    } else {
+                        tracing::debug!(pkgbase = %p.pkgbase, "VCS probe not due yet");
+                    }
                 }
             }
         }
@@ -582,6 +598,71 @@ async fn create_candidates(app: &AppState, run_id: &str, images: &HashMap<String
         }
     }
     Ok(())
+}
+
+// ---- soname rebuilds -------------------------------------------------------------
+
+/// Arch spells a soname provide as `libfoo.so=3-64`; this turns a NEEDED
+/// entry `libfoo.so.3` into (`libfoo.so`, `3`).
+fn soname_parts(needed: &str) -> Option<(&str, &str)> {
+    let i = needed.find(".so.")?;
+    Some((&needed[..i + 3], &needed[i + 4..]))
+}
+
+/// A published artifact whose linked libraries a stream no longer provides
+/// at the same soname version has to be rebuilt: a `soname_rebuild`
+/// candidate at the baseline commit, approved, unless the package already
+/// has an open candidate. Libraries no stream package provides at all are
+/// skipped (bundled, or from the AUR, where the dependency graph handles it).
+fn soname_rebuilds(app: &AppState, run_id: &str) -> Result<usize> {
+    use repoman_alpm::depspec::DepSpec;
+    let suffix = match app.config.arch.as_str() {
+        "x86_64" | "aarch64" => "-64",
+        _ => "-32",
+    };
+    let mut created = 0;
+    let mut seen: HashSet<String> = HashSet::new();
+    for stream in app.config.streams_sorted() {
+        let Some(idx) = app.streams.get(&stream.name) else { continue };
+        for a in app.store.live_artifacts(&stream.name)? {
+            if seen.contains(&a.pkgbase) {
+                continue;
+            }
+            let Some(needed) = a.needed.as_ref().and_then(|n| n.as_array()) else { continue };
+            let mut missing = Vec::new();
+            for n in needed.iter().filter_map(|v| v.as_str()) {
+                let Some((lib, ver)) = soname_parts(n) else { continue };
+                if idx.index.satisfiers(&DepSpec::unversioned(lib)).is_empty() {
+                    continue; // nothing in the stream provides this library at all
+                }
+                if !idx.index.satisfies(&DepSpec::parse(&format!("{lib}={ver}{suffix}"))) {
+                    missing.push(n.to_string());
+                }
+            }
+            if missing.is_empty() {
+                continue;
+            }
+            seen.insert(a.pkgbase.clone());
+            if !app.store.open_candidates(&a.pkgbase)?.is_empty() {
+                continue;
+            }
+            let Some(baseline) = app.store.get_baseline(&a.pkgbase)? else { continue };
+            app.store.create_candidate(
+                run_id,
+                &NewCandidate {
+                    pkgbase: &a.pkgbase,
+                    kind: "soname_rebuild",
+                    aur_commit: Some(&baseline.aur_commit),
+                    state: "approved",
+                    review: serde_json::json!({"stream": stream.name, "sonames": missing, "note": "stream no longer provides these sonames"}),
+                    ..Default::default()
+                },
+            )?;
+            app.store.event("candidate.soname_rebuild", Some(&a.pkgbase), serde_json::json!({"stream": stream.name, "sonames": missing}))?;
+            created += 1;
+        }
+    }
+    Ok(created)
 }
 
 // ---- gate -----------------------------------------------------------------------
@@ -1249,6 +1330,7 @@ async fn build_all(app: &AppState, run_id: &str, planned: &Planned, images: &Has
                     for a in &artifacts {
                         app.store
                             .insert_artifact(a, Some(&job_id), &item.stream, Some(&item.aur_commit), upstream_rev.as_deref())?;
+                        app.store.set_artifact_needed(&a.sha256, &serde_json::json!(a.needed))?;
                         app.publisher
                             .stage(&app.blobs, run_id, &item.stream, &a.sha256, &a.filename)
                             .await
@@ -1529,8 +1611,17 @@ mod tests {
             paths: paths.iter().map(|p| p.to_string()).collect(),
             has_install_script: install,
             setuid_paths: vec![],
+            needed: vec![],
             buildinfo: serde_json::json!({}),
         }
+    }
+
+    #[test]
+    fn soname_parsing() {
+        assert_eq!(soname_parts("libfoo.so.3"), Some(("libfoo.so", "3")));
+        assert_eq!(soname_parts("libc.so.6"), Some(("libc.so", "6")));
+        assert_eq!(soname_parts("libbar.so.1.2"), Some(("libbar.so", "1.2")));
+        assert_eq!(soname_parts("libnover.so"), None);
     }
 
     fn prev(paths: &[&str], install: bool) -> ArtifactRow {

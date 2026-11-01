@@ -267,6 +267,7 @@ pub async fn run_build(ctx: &JobCtx, p: BuildParams<'_>) -> Result<JobResult> {
             paths: meta.paths,
             has_install_script: meta.install_script.is_some(),
             setuid_paths: meta.setuid_paths,
+            needed: meta.needed,
             buildinfo,
         });
     }

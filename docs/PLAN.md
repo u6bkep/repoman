@@ -636,6 +636,10 @@ Done 2026-11-01: admission (`hub::fits`, per-job `memory_limit` predicted in
 `engine::predict_memory` from the last five peaks, doubled per retry) and the
 aur-security signal (`coordinator::aursec`, `POST /api/v1/checks/lookup`,
 verdict → severity, blocks auto-approval across the candidate's commit range).
+Also done: `soname_rebuild` candidates (worker records NEEDED sonames of ELF
+payloads via `alpm::elf`; after each refresh `engine::soname_rebuilds` compares
+them with the stream's `libX.so=N-64` provides) and `policy.probe_interval_hours`
+for VCS probes (default: every run). Laptop registered as worker `b-lap`.
 Exit: a soname bump in a stream produces rebuild candidates on the next run
 without operator input; two workers share a run without duplicate jobs.
 Review focus: scheduler fairness, duplicate-job suppression, footprint

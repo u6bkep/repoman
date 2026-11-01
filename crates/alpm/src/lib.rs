@@ -3,6 +3,7 @@
 //! runs in a container and the parsers must be testable anywhere.
 
 pub mod depspec;
+pub mod elf;
 pub mod pacman_conf;
 pub mod pkginfo;
 pub mod srcinfo;

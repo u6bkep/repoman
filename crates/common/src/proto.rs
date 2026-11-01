@@ -243,6 +243,9 @@ pub struct ArtifactInfo {
     /// Payload files with the setuid or setgid bit.
     #[serde(default)]
     pub setuid_paths: Vec<String>,
+    /// Sonames the payload's ELF files link against.
+    #[serde(default)]
+    pub needed: Vec<String>,
     /// `.BUILDINFO` key/values as JSON.
     #[serde(default)]
     pub buildinfo: serde_json::Value,

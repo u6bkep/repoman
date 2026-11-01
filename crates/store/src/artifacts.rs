@@ -390,6 +390,7 @@ mod tests {
             paths: vec!["usr/bin/x".into()],
             has_install_script: false,
             setuid_paths: vec![],
+            needed: vec![],
             buildinfo: serde_json::json!({}),
         }
     }

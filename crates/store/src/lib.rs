@@ -272,6 +272,17 @@ impl Store {
         })
     }
 
+    /// When a job of `kind` for `pkgbase` last finished, if ever.
+    pub fn last_job_finished(&self, pkgbase: &str, kind: &str) -> Result<Option<String>> {
+        self.with(|c| {
+            Ok(c.query_row(
+                "SELECT MAX(finished_at) FROM job WHERE pkgbase = ?1 AND kind = ?2 AND finished_at IS NOT NULL",
+                params![pkgbase, kind],
+                |r| r.get::<_, Option<String>>(0),
+            )?)
+        })
+    }
+
     /// (peak RSS, peak scratch) of the newest successful builds of a package
     /// base, newest first, for footprint prediction.
     pub fn recent_build_peaks(&self, pkgbase: &str, limit: u32) -> Result<Vec<(Option<u64>, Option<u64>)>> {
