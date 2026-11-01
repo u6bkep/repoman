@@ -473,6 +473,20 @@ System page. They raise risk; they never approve. A signal above `info`
 blocks auto-approval until it expires (`expires_at`) or the operator clears
 it (`POST /api/signals/{id}/clear`, recorded as a `signal.cleared` event).
 
+### 10.5a Operator UI (notes, 2026-11-01)
+
+Plain JS over the JSON API, compiled into the binary at `/ui/`. Refreshes
+swap the page but keep window and element scroll offsets and open
+`<details>`; the job view patches in place and fetches only new log lines
+(`GET /api/jobs/{id}/log?after=seq`), following the tail only when the
+reader is already at the bottom. The queue splits "needs you" from
+"waiting on the clock" by mirroring `auto_approve` (class, floor, LLM
+risk, blocking signals, quarantine from `/api/config` and package policy)
+and says when the gate will approve each routine candidate. Jobs carry the
+run that queued them (migration 9) so run pages list probes and image
+builds; run pages show a step timeline from `run.step` events. Times show
+the absolute value on hover.
+
 ### 10.6 LLM reviewer
 
 Implemented in M2 as `coordinator::reviewer` (raw HTTP; no official Rust

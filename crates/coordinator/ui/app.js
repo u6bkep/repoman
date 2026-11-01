@@ -705,10 +705,10 @@ async function viewPackages() {
       cls: "compact",
       cells: (p) => [
         `${esc(p.pkgbase)} <span class="muted small">${esc(p.kind)}${p.streams.some((s) => s.required && !s.wanted) ? " · dep" : ""}</span>`,
-        dash(p.provenance_class),
+        `<span class="nowrap">${dash(p.provenance_class)}</span>`,
         liveCell(p),
         `${dash(p.snapshot?.version)}${p.snapshot?.last_modified ? ` <span class="muted small">${relative(new Date(p.snapshot.last_modified * 1000).toISOString())}</span>` : ""}`,
-        `${p.snapshot ? (p.snapshot.maintainer ? esc(p.snapshot.maintainer) : '<span class="muted">nobody</span>') : "-"}${p.snapshot?.votes != null ? ` <span class="muted small">${p.snapshot.votes}</span>` : ""}`,
+        p.source_url ? '<span class="muted">git source</span>' : `${p.snapshot ? (p.snapshot.maintainer ? esc(p.snapshot.maintainer) : '<span class="muted">nobody</span>') : "-"}${p.snapshot?.votes != null ? ` <span class="muted small">${p.snapshot.votes}</span>` : ""}`,
         aurStatePills(p),
         p.open_candidates.length ? `<a href="#/candidates/${p.open_candidates[0].id}">${pill(p.open_candidates[0].state)}</a>` : "",
         policySummary(p),
@@ -796,9 +796,11 @@ async function viewPackage(pkgbase) {
     <div class="panel">${kv([
       ["serving", serving],
       ["streams", p.streams.map((m) => `<span class="pill">${esc(m.stream)}${m.required && !m.wanted ? " (dependency)" : ""}</span>`).join(" ") || "-"],
-      ["AUR version", `${dash(s.version)} <span class="muted">modified ${agoEpoch(s.last_modified)}, fetched ${ago(s.fetched_at)}${s.first_submitted ? `, on the AUR since ${agoEpoch(s.first_submitted)}` : ""}</span>`],
-      ["maintainer", `${s.maintainer ? esc(s.maintainer) : '<span class="muted">nobody</span>'}${(s.comaintainers || []).length ? ` <span class="muted">+ ${esc(s.comaintainers.join(", "))}</span>` : ""}${s.submitter && s.submitter !== s.maintainer ? ` <span class="muted">submitted by ${esc(s.submitter)}</span>` : ""}`],
-      ["votes", `${dash(s.votes)} <span class="muted">popularity ${s.popularity != null ? s.popularity.toFixed(2) : "-"}</span>`],
+      p.source_url
+        ? ["upstream", `${dash(s.version)} <span class="muted">head ${short(s.head_commit)}, committed ${agoEpoch(s.last_modified)}, fetched ${ago(s.fetched_at)}</span>`]
+        : ["AUR version", `${dash(s.version)} <span class="muted">modified ${agoEpoch(s.last_modified)}, fetched ${ago(s.fetched_at)}${s.first_submitted ? `, on the AUR since ${agoEpoch(s.first_submitted)}` : ""}</span>`],
+      p.source_url ? null : ["maintainer", `${s.maintainer ? esc(s.maintainer) : '<span class="muted">nobody</span>'}${(s.comaintainers || []).length ? ` <span class="muted">+ ${esc(s.comaintainers.join(", "))}</span>` : ""}${s.submitter && s.submitter !== s.maintainer ? ` <span class="muted">submitted by ${esc(s.submitter)}</span>` : ""}`],
+      p.source_url ? null : ["votes", `${dash(s.votes)} <span class="muted">popularity ${s.popularity != null ? s.popularity.toFixed(2) : "-"}</span>`],
       ["baseline", p.baseline ? `<span class="mono">${short(p.baseline.aur_commit)}</span> published ${ago(p.baseline.published_at)}${p.baseline.maintainers?.length ? ` by ${esc(p.baseline.maintainers.join(", "))}` : ""}` : '<span class="muted">none yet</span>'],
       p.source_url ? ["source", `<span class="mono">${esc(p.source_url)}</span>`] : null,
       ["added", ago(p.added_at)],
