@@ -115,7 +115,7 @@ if [ "${REPOMAN_CHROOT:-1}" = 1 ]; then
       tcpdump -i repoman0 -nn -U -w "$REPOMAN_NETLOG.pcap" >/dev/null 2>&1 &
       CAP=$!
     else
-      nft add rule inet repoman out oifname "repoman0" meta nftrace set 1 2>/dev/null \
+      nft insert rule inet repoman out oifname "repoman0" meta nftrace set 1 2>/dev/null \
         && { nft monitor trace > "$REPOMAN_NETLOG.trace" 2>/dev/null & CAP=$!; }
     fi
     chroot "$ROOT" /bin/sh -c 'cd "$1" && shift && exec "$@"' sh "${REPOMAN_CWD:-/}" "$@"
