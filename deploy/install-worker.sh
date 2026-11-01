@@ -48,6 +48,9 @@ sed -e 's#^scratch_dir = .*#scratch_dir = "/var/lib/repoman-worker"#' \
     "$src_config" > /etc/repoman/worker.toml
 chmod 600 /etc/repoman/worker.toml
 systemctl daemon-reload
-systemctl enable --now repoman-worker.service
+# enable --now leaves an already running unit on its old binary; restart
+# so the installed one actually serves.
+systemctl enable repoman-worker.service
+systemctl restart repoman-worker.service
 sleep 2
 systemctl --no-pager --lines=5 status repoman-worker.service || true
