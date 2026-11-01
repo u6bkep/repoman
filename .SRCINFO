@@ -16,6 +16,7 @@ pkgbase = repoman-git
 	depends = coreutils
 	depends = iproute2
 	depends = nftables
+	depends = tcpdump
 	optdepends = arch-install-scripts: not required; images are bootstrapped with pacman
 	provides = repoman
 	conflicts = repoman

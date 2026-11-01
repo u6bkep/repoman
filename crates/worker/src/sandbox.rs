@@ -108,9 +108,28 @@ fi
 if [ "${REPOMAN_CHROOT:-1}" = 1 ]; then
   if [ "$NETCOUNT" = 1 ]; then
     set +e
+    # Record what tries to leave: a pcap with tcpdump when the host has it
+    # (shows DNS names), otherwise nftables' own trace (addresses and ports).
+    CAP=""
+    if command -v tcpdump >/dev/null 2>&1; then
+      tcpdump -i repoman0 -nn -U -w "$REPOMAN_NETLOG.pcap" >/dev/null 2>&1 &
+      CAP=$!
+    else
+      nft add rule inet repoman out oifname "repoman0" meta nftrace set 1 2>/dev/null \
+        && { nft monitor trace > "$REPOMAN_NETLOG.trace" 2>/dev/null & CAP=$!; }
+    fi
     chroot "$ROOT" /bin/sh -c 'cd "$1" && shift && exec "$@"' sh "${REPOMAN_CWD:-/}" "$@"
     st=$?
     nft -j list counter inet repoman attempts > "$REPOMAN_NETLOG" 2>/dev/null || true
+    if [ -n "$CAP" ]; then
+      sleep 0.3
+      kill "$CAP" 2>/dev/null; wait "$CAP" 2>/dev/null
+      if [ -s "$REPOMAN_NETLOG.pcap" ]; then
+        tcpdump -nn -r "$REPOMAN_NETLOG.pcap" > "$REPOMAN_NETLOG.txt" 2>/dev/null || true
+      elif [ -s "$REPOMAN_NETLOG.trace" ]; then
+        grep "packet:" "$REPOMAN_NETLOG.trace" | sed 's/^.*packet: //' > "$REPOMAN_NETLOG.txt" 2>/dev/null || true
+      fi
+    fi
     exit $st
   fi
   exec chroot "$ROOT" /bin/sh -c 'cd "$1" && shift && exec "$@"' sh "${REPOMAN_CWD:-/}" "$@"

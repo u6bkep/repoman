@@ -221,6 +221,12 @@ pub async fn run_build(ctx: &JobCtx, p: BuildParams<'_>) -> Result<JobResult> {
         let n = read_netlog(&job_dir.join("netlog.json"));
         if n > 0 {
             ctx.log(Fd::System, format!("{n} packets tried to leave the offline build (counted and rejected)"));
+            // What they were: tcpdump text (with DNS question names) or the
+            // nftables trace, one line per packet, capped for the job log. The
+            // raw capture stays in the job directory with the other scratch.
+            for line in read_capture(&job_dir.join("netlog.json.txt"), 40) {
+                ctx.log(Fd::System, format!("net: {line}"));
+            }
         }
         n
     };
@@ -290,6 +296,20 @@ pub async fn run_build(ctx: &JobCtx, p: BuildParams<'_>) -> Result<JobResult> {
         outside_writes,
         upstream_rev,
     })
+}
+
+/// Lines of the packet capture summary the setup script wrote next to the
+/// counter dump, at most `max`, with a trailer when truncated.
+pub fn read_capture(path: &Path, max: usize) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let mut out: Vec<String> = lines.iter().take(max).map(|l| l.trim().to_string()).collect();
+    if lines.len() > max {
+        out.push(format!("... {} more packets in the job directory's capture", lines.len() - max));
+    }
+    out
 }
 
 /// Packets the sandbox's nftables counter saw on the sink interface, from
@@ -504,6 +524,19 @@ mod tests {
         assert_eq!(vcs_checkout_dir("jimtcl::git+https://github.com/msteveb/jimtcl#tag=0.83").as_deref(), Some("jimtcl"));
         assert_eq!(vcs_checkout_dir("git://host/x/repo/").as_deref(), Some("repo"));
         assert_eq!(vcs_checkout_dir("https://example.org/x-1.0.tar.gz"), None);
+    }
+
+    #[test]
+    fn capture_summary_is_capped() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("netlog.json.txt");
+        assert!(read_capture(&f, 5).is_empty());
+        std::fs::write(&f, (0..8).map(|i| format!("12:00:0{i} IP 10.255.255.1.4000{i} > 10.255.255.254.53: A? host{i}.example.
+")).collect::<String>()).unwrap();
+        let lines = read_capture(&f, 5);
+        assert_eq!(lines.len(), 6);
+        assert!(lines[0].contains("host0.example"));
+        assert_eq!(lines[5], "... 3 more packets in the job directory's capture");
     }
 
     #[test]

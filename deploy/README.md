@@ -120,3 +120,16 @@ Include = /etc/pacman.d/mirrorlist
 
 pacman tries the cache first and falls back to the mirrors on any failure,
 so a coordinator outage costs nothing but speed.
+
+## Diagnosing network attempts in offline builds
+
+build(), check(), and package() run with no route to the internet: a sink
+interface takes the default route and nftables counts and rejects whatever
+reaches it. When the count is non-zero the job log says so and lists the
+packets (`net: ...` lines): with `tcpdump` on the worker the lines include
+DNS question names, which usually point straight at the build step that
+tried to fetch; without it the nftables trace shows addresses and ports. The
+raw capture (`netlog.json.pcap` or `.trace`) stays in the job's scratch
+directory, kept for failed jobs. Any attempt during an offline build holds
+the candidate in publish_review; a package that legitimately needs the
+network at build time gets `allow_network_build` in its policy instead.
