@@ -123,6 +123,11 @@ pub enum JobKind {
         #[serde(default)]
         memory_limit: Option<u64>,
     },
+    /// A job kind this version no longer has (probe and inspect jobs from
+    /// before information gathering moved into the coordinator). Rows stay
+    /// readable as history; nothing runs them.
+    #[serde(other)]
+    Legacy,
 }
 
 impl JobKind {
@@ -139,6 +144,7 @@ impl JobKind {
             JobKind::Noop { .. } => "noop",
             JobKind::Image { .. } => "image",
             JobKind::Build { .. } => "build",
+            JobKind::Legacy => "legacy",
         }
     }
 

@@ -416,6 +416,7 @@ pub fn required_capability(job: &repoman_common::proto::JobKind) -> Option<&'sta
         JobKind::Noop { .. } => None,
         JobKind::Image { .. } => Some("image"),
         JobKind::Build { .. } => Some("build"),
+        JobKind::Legacy => Some("legacy-never-offered"),
     }
 }
 

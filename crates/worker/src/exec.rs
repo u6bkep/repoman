@@ -174,6 +174,7 @@ impl JobRunner for RealRunner {
                 )
                 .await
                 .map(Outcome::success_with),
+                JobKind::Legacy => anyhow::bail!("job kind no longer supported"),
             }
         })
     }
