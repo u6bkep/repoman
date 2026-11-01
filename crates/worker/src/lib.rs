@@ -44,6 +44,8 @@ pub struct WorkerState {
     /// Serialises pacman runs that write the shared package cache: two
     /// instances downloading the same file into one cache corrupt it.
     pub pacman_lock: tokio::sync::Mutex<()>,
+    /// Serialises image download and unpack across concurrent jobs.
+    pub image_lock: tokio::sync::Mutex<()>,
 }
 
 impl WorkerState {
@@ -91,6 +93,7 @@ impl WorkerState {
             capabilities,
             runner,
             pacman_lock: tokio::sync::Mutex::new(()),
+            image_lock: tokio::sync::Mutex::new(()),
         })
     }
 

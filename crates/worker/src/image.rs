@@ -15,10 +15,18 @@ pub fn image_root(scratch: &Path, sha256: &str) -> PathBuf {
     scratch.join("images").join(sha256).join("root")
 }
 
-/// Ensure an image is unpacked locally, downloading if needed.
+/// Ensure an image is unpacked locally, downloading if needed. Serialised
+/// across jobs: two builds for the same stream arriving together must not
+/// both unpack (one would delete the other's partial tree).
 pub async fn ensure_image(ctx: &JobCtx, image: &ImageRef) -> Result<PathBuf> {
     let root = image_root(&ctx.config.scratch_dir, &image.sha256);
-    if root.join("usr").is_dir() && root.join(".repoman-complete").exists() {
+    let complete = |root: &Path| root.join("usr").is_dir() && root.join(".repoman-complete").exists();
+    if complete(&root) {
+        touch_image(&root);
+        return Ok(root);
+    }
+    let _guard = ctx.lock_image().await;
+    if complete(&root) {
         touch_image(&root);
         return Ok(root);
     }
@@ -39,11 +47,13 @@ async fn unpack_image(ctx: &JobCtx, tarball: &Path, root: &Path) -> Result<()> {
     let _ = tokio::fs::remove_dir_all(&tmp).await;
     tokio::fs::create_dir_all(&tmp).await?;
     let mut cmd = tokio::process::Command::new("bsdtar");
-    // -p keeps modes, owners, and xattrs (file capabilities); file flags
-    // are skipped because a real-root unpack onto a filesystem without
-    // chattr support (var/log/journal carries +C) fails otherwise.
-    cmd.args(["--numeric-owner", "--no-fflags", "-xpf"])
+    // -p keeps modes, owners, and xattrs (file capabilities) and also turns
+    // file flags on, so --no-fflags must come after it: a real-root unpack
+    // onto a filesystem without chattr support fails on var/log/journal's
+    // +C otherwise.
+    cmd.args(["--numeric-owner", "-xpf"])
         .arg(tarball)
+        .arg("--no-fflags")
         .arg("-C")
         .arg(&tmp)
         .stdin(std::process::Stdio::null())

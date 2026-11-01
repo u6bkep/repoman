@@ -58,6 +58,11 @@ impl JobCtx {
         self.state.pacman_lock.lock().await
     }
 
+    /// Hold while downloading or unpacking a base image.
+    pub async fn lock_image(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.state.image_lock.lock().await
+    }
+
     pub fn set_scratch_peak(&self, bytes: u64) {
         let mut p = self.scratch_peak.lock().unwrap();
         *p = (*p).max(bytes);
