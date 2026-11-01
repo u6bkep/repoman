@@ -110,6 +110,7 @@ async fn execute(app: &AppState, run_id: &str) -> Result<RunEnd> {
     // Discovery can add packages; loop until a pass adds nothing.
     for pass in 0..8 {
         step(app, run_id, "streams").await?;
+        progress(app, run_id, serde_json::json!({"phase": "streams", "detail": "refreshing stream databases"}));
         app.streams.refresh_all().await.context("refreshing streams")?;
         if let Err(e) = app.cache.maintain() {
             tracing::warn!(error = %format!("{e:#}"), "cache maintenance failed");
@@ -134,24 +135,33 @@ async fn execute(app: &AppState, run_id: &str) -> Result<RunEnd> {
         step(app, run_id, "images").await?;
         let mut images: HashMap<String, ImageRef> = HashMap::new();
         for s in app.config.streams_sorted() {
+            progress(app, run_id, serde_json::json!({"phase": "images", "detail": format!("checking base image for {}", s.name)}));
             images.insert(s.name.clone(), ensure_image(app, s).await?);
         }
 
         step(app, run_id, "poll").await?;
+        progress(app, run_id, serde_json::json!({"phase": "poll", "detail": "asking the AUR and git sources for new commits"}));
         poll_aur(app).await?;
 
         step(app, run_id, "candidates").await?;
-        create_candidates(app, run_id, &images).await?;
+        progress(app, run_id, serde_json::json!({"phase": "candidates"}));
+        let probes = create_candidates(app, run_id, &images).await?;
         let rebuilds = soname_rebuilds(app, run_id)?;
         if rebuilds > 0 {
             tracing::info!(count = rebuilds, "soname rebuild candidates created");
         }
 
+        // The gate runs before the upstream probes so that nothing the gate
+        // would approve sits in the queue looking like it waits on a human.
         step(app, run_id, "gate").await?;
+        progress(app, run_id, serde_json::json!({"phase": "gate"}));
         let auto = auto_approve(app)?;
         if auto > 0 {
             tracing::info!(count = auto, "gate approved routine candidates after quarantine");
         }
+
+        step(app, run_id, "probes").await?;
+        run_probes(app, run_id, probes).await?;
 
         let pending = app.store.candidates_in_states(&["pending"])?;
         if !pending.is_empty() {
@@ -159,6 +169,7 @@ async fn execute(app: &AppState, run_id: &str) -> Result<RunEnd> {
         }
 
         step(app, run_id, "plan").await?;
+        progress(app, run_id, serde_json::json!({"phase": "plan"}));
         let planned = plan_all(app, run_id).await?;
         if planned.discovered > 0 {
             tracing::info!(discovered = planned.discovered, pass, "new AUR dependencies discovered; looping");
@@ -172,6 +183,7 @@ async fn execute(app: &AppState, run_id: &str) -> Result<RunEnd> {
         // completed; this pass handles partial failures and baseline-only
         // rebuilds that carry no candidate.
         step(app, run_id, "publish").await?;
+        progress(app, run_id, serde_json::json!({"phase": "publish"}));
         let scope = PublishScope {
             only: None,
             exclude: built.published_candidates.union(&built.held_candidates).cloned().collect(),
@@ -191,6 +203,7 @@ async fn execute(app: &AppState, run_id: &str) -> Result<RunEnd> {
     }
 
     step(app, run_id, "cleanup").await?;
+    progress(app, run_id, serde_json::json!({"phase": "done"}));
     let _ = app.publisher.remove_staging(run_id);
     let held = app.store.candidates_in_states(&["publish_review"])?;
     if !held.is_empty() {
@@ -379,7 +392,7 @@ fn srcinfo_hash(text: &str) -> String {
     hex::encode(Sha256::digest(text.as_bytes()))
 }
 
-async fn create_candidates(app: &AppState, run_id: &str, images: &HashMap<String, ImageRef>) -> Result<()> {
+async fn create_candidates(app: &AppState, run_id: &str, images: &HashMap<String, ImageRef>) -> Result<Vec<(PackageRow, String)>> {
     let packages = app.store.list_packages()?;
     let mut probes: Vec<(PackageRow, String)> = Vec::new();
     for p in &packages {
@@ -403,7 +416,7 @@ async fn create_candidates(app: &AppState, run_id: &str, images: &HashMap<String
                     app.store.supersede_candidates(&p.pkgbase, &head)?;
                     let mut review = serde_json::json!({"note": "no baseline; first review"});
                     let (floor_risk, llm_risk) = match srcinfo_at(app, &p.pkgbase, &head).await {
-                        Ok(si) => review_change(app, p, None, &head, &si, images, &[], &mut review).await?,
+                        Ok(si) => review_change(app, run_id, p, None, &head, &si, images, &[], &mut review).await?,
                         Err(e) => {
                             review["gate_error"] = serde_json::Value::String(e.to_string());
                             (None, None)
@@ -486,7 +499,7 @@ async fn create_candidates(app: &AppState, run_id: &str, images: &HashMap<String
                         }
                     }
                     let (floor_risk, llm_risk) = match srcinfo_at(app, &p.pkgbase, &head).await {
-                        Ok(si) => review_change(app, p, Some(b), &head, &si, images, &commits, &mut review).await?,
+                        Ok(si) => review_change(app, run_id, p, Some(b), &head, &si, images, &commits, &mut review).await?,
                         Err(e) => {
                             review["gate_error"] = serde_json::Value::String(e.to_string());
                             (None, None)
@@ -532,7 +545,21 @@ async fn create_candidates(app: &AppState, run_id: &str, images: &HashMap<String
         }
     }
 
-    // Probe VCS upstreams in parallel through workers.
+    Ok(probes)
+}
+
+/// What the run is doing, for the UI: replaces the whole progress record.
+fn progress(app: &AppState, run_id: &str, p: serde_json::Value) {
+    let mut p = p;
+    p["at"] = serde_json::Value::String(clock::now());
+    if let Err(e) = app.store.set_run_progress(run_id, &p) {
+        tracing::warn!(error = %e, "recording run progress");
+    }
+}
+
+/// Probe VCS upstreams in parallel through workers and create `vcs`
+/// candidates for packages whose published build is behind.
+async fn run_probes(app: &AppState, run_id: &str, probes: Vec<(PackageRow, String)>) -> Result<()> {
     let mut probe_jobs = Vec::new();
     for (p, head) in &probes {
         let si = match srcinfo_at(app, &p.pkgbase, head).await {
@@ -556,8 +583,25 @@ async fn create_candidates(app: &AppState, run_id: &str, images: &HashMap<String
     if !probe_jobs.is_empty() {
         app.hub.notify();
     }
+    let total = probe_jobs.len();
+    let waiting: Vec<String> = probe_jobs.iter().map(|(p, _, _)| p.pkgbase.clone()).collect();
+    let mut done = 0usize;
+    progress(app, run_id, serde_json::json!({"phase": "probes", "total": total, "done": done, "waiting": waiting}));
     for (p, head, job_id) in probe_jobs {
         let row = wait_job(app, &job_id).await?;
+        done += 1;
+        {
+            let waiting: Vec<String> = probes
+                .iter()
+                .map(|(q, _)| q.pkgbase.clone())
+                .filter(|pb| app.store.open_candidates(pb).ok().is_some_and(|_| true))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .filter(|_| false)
+                .collect();
+            let _ = waiting;
+        }
+        progress(app, run_id, serde_json::json!({"phase": "probes", "total": total, "done": done, "last": p.pkgbase, "worker": row.worker}));
         let Some(JobResult::Probe { revisions }) = row.result else {
             tracing::warn!(pkgbase = %p.pkgbase, "probe failed: {:?}", row.error);
             continue;
@@ -673,6 +717,7 @@ fn soname_rebuilds(app: &AppState, run_id: &str) -> Result<usize> {
 #[allow(clippy::too_many_arguments)]
 async fn review_change(
     app: &AppState,
+    run_id: &str,
     p: &PackageRow,
     baseline: Option<&repoman_store::BaselineRow>,
     head: &str,
@@ -681,6 +726,7 @@ async fn review_change(
     commits: &[crate::aur::CommitInfo],
     review: &mut serde_json::Value,
 ) -> Result<(Option<String>, Option<String>)> {
+    progress(app, run_id, serde_json::json!({"phase": "candidates", "detail": format!("assessing {}", p.pkgbase)}));
     let a = match crate::gate::assess(app, &p.pkgbase, baseline, head, si, images, p.source_url.is_some()).await {
         Ok(a) => a,
         Err(e) => {
@@ -697,6 +743,7 @@ async fn review_change(
         return Ok((Some(floor), None));
     };
     let version_from = review["version_from"].as_str().map(str::to_string);
+    progress(app, run_id, serde_json::json!({"phase": "candidates", "detail": format!("LLM review of {} ({model})", p.pkgbase)}));
     let outcome = app
         .reviewer
         .review(
@@ -1299,6 +1346,25 @@ async fn build_all(app: &AppState, run_id: &str, planned: &Planned, images: &Has
                 }
             }
             if done.is_empty() {
+                let running: Vec<serde_json::Value> = in_flight
+                    .iter()
+                    .filter_map(|(id, (key, _))| {
+                        let row = app.store.get_job(id).ok().flatten()?;
+                        Some(serde_json::json!({"job": id, "pkgbase": key.1, "stream": key.0, "worker": row.worker, "state": row.state.as_str(), "since": row.started_at.or(Some(row.queued_at))}))
+                    })
+                    .collect();
+                progress(
+                    app,
+                    run_id,
+                    serde_json::json!({
+                        "phase": "build",
+                        "total": planned.per_stream.values().map(|v| v.len()).sum::<usize>(),
+                        "done": results.values().filter(|r| r.is_ok()).count(),
+                        "failed": results.values().filter(|r| r.is_err()).count(),
+                        "running": running,
+                        "queued": remaining.len(),
+                    }),
+                );
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(15), rx.recv()).await;
                 continue;
             }

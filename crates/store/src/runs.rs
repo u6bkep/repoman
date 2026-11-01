@@ -15,6 +15,8 @@ pub struct RunRow {
     pub state: String,
     pub step: Option<String>,
     pub summary: serde_json::Value,
+    /// What the run is doing right now: phase, counts, what it waits on.
+    pub progress: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +82,7 @@ fn row_to_candidate(r: &rusqlite::Row) -> rusqlite::Result<CandidateRow> {
 
 fn row_to_run(r: &rusqlite::Row) -> rusqlite::Result<RunRow> {
     let summary: String = r.get(5)?;
+    let progress: String = r.get(6)?;
     Ok(RunRow {
         id: r.get(0)?,
         started_at: r.get(1)?,
@@ -87,6 +90,7 @@ fn row_to_run(r: &rusqlite::Row) -> rusqlite::Result<RunRow> {
         state: r.get(3)?,
         step: r.get(4)?,
         summary: serde_json::from_str(&summary).unwrap_or(serde_json::json!({})),
+        progress: serde_json::from_str(&progress).unwrap_or(serde_json::json!({})),
     })
 }
 
@@ -108,7 +112,7 @@ impl Store {
     pub fn get_run(&self, id: &str) -> Result<Option<RunRow>> {
         self.with(|c| {
             Ok(c.query_row(
-                "SELECT id, started_at, finished_at, state, step, summary FROM run WHERE id = ?1",
+                "SELECT id, started_at, finished_at, state, step, summary, progress FROM run WHERE id = ?1",
                 params![id],
                 row_to_run,
             )
@@ -120,7 +124,7 @@ impl Store {
     pub fn active_run(&self) -> Result<Option<RunRow>> {
         self.with(|c| {
             Ok(c.query_row(
-                "SELECT id, started_at, finished_at, state, step, summary FROM run
+                "SELECT id, started_at, finished_at, state, step, summary, progress FROM run
                  WHERE finished_at IS NULL ORDER BY started_at DESC LIMIT 1",
                 [],
                 row_to_run,
@@ -132,7 +136,7 @@ impl Store {
     pub fn list_runs(&self, limit: u32) -> Result<Vec<RunRow>> {
         self.with(|c| {
             let mut st = c.prepare(
-                "SELECT id, started_at, finished_at, state, step, summary FROM run
+                "SELECT id, started_at, finished_at, state, step, summary, progress FROM run
                  ORDER BY started_at DESC LIMIT ?1",
             )?;
             Ok(st
@@ -147,6 +151,13 @@ impl Store {
                 "UPDATE run SET state = ?2, step = ?3 WHERE id = ?1",
                 params![id, state, step],
             )?;
+            Ok(())
+        })
+    }
+
+    pub fn set_run_progress(&self, id: &str, progress: &serde_json::Value) -> Result<()> {
+        self.with(|c| {
+            c.execute("UPDATE run SET progress = ?2 WHERE id = ?1", params![id, progress.to_string()])?;
             Ok(())
         })
     }

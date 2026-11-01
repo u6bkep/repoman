@@ -204,6 +204,8 @@ pub const MIGRATIONS: &[&str] = &[
          unreferenced_since TEXT
      );
      CREATE INDEX cache_file_lru_idx ON cache_file(unreferenced_since, last_served_at);",
+    // 7: live progress of the active run, for the UI
+    "ALTER TABLE run ADD COLUMN progress TEXT NOT NULL DEFAULT '{}';",
 ];
 
 pub fn migrate(conn: &Connection) -> Result<()> {

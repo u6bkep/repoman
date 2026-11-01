@@ -72,6 +72,29 @@ function renderDiff(text) {
     return `${esc(l)}\n`;
   }).join("").replace(/<\/span>(?!\n)/g, "</span>");
 }
+// One line describing what an active run is doing right now.
+function progressLine(run) {
+  const p = run?.progress || {};
+  const since = p.at ? ` <span class="muted">(${ago(p.at)})</span>` : "";
+  switch (p.phase) {
+    case "streams": case "poll": case "images": return `${esc(p.detail || p.phase)}${since}`;
+    case "candidates": return `${esc(p.detail || "creating candidates")}${since}`;
+    case "gate": return `gate: deciding routine candidates${since}`;
+    case "probes": {
+      const left = (p.total ?? 0) - (p.done ?? 0);
+      return `probing VCS upstreams: ${p.done ?? 0}/${p.total ?? 0}${left ? `, ${left} still answering` : ""}${p.last ? ` (last: ${esc(p.last)} on ${esc(p.worker || "?")})` : ""}${since}`;
+    }
+    case "plan": return `planning builds${since}`;
+    case "build": {
+      const running = (p.running || []).map((j) => `<a href="#/jobs/${esc(j.job)}">${esc(j.pkgbase)}</a> on ${esc(j.worker || "?")} for ${dur(j.since)}`).join(", ");
+      return `building: ${p.done ?? 0} done, ${p.failed ?? 0} failed, ${p.queued ?? 0} queued of ${p.total ?? 0}${running ? ` · running ${running}` : ""}${since}`;
+    }
+    case "publish": return `publishing${since}`;
+    case "done": return `finishing${since}`;
+    default: return run?.step ? `${esc(run.step)}${since}` : "";
+  }
+}
+
 function candidateSummary(c) {
   const r = c.review || {};
   const parts = [];
@@ -126,10 +149,18 @@ document.addEventListener("click", (e) => {
 
 async function header() {
   try {
-    const [h, pending, workers] = await Promise.all([api("/api/health"), api("/api/candidates"), api("/api/workers")]);
+    const [h, pending, workers, runs] = await Promise.all([api("/api/health"), api("/api/candidates"), api("/api/workers"), api("/api/runs")]);
     document.getElementById("queue-count").textContent = pending.length || "";
     const online = workers.filter((w) => w.connected).length;
-    $status.textContent = `${h.run_active ? "run active" : "idle"} · ${online}/${workers.length} workers`;
+    const active = runs.find((r) => r.state === "running");
+    let phase = "idle";
+    if (active) {
+      const p = active.progress || {};
+      phase = p.phase === "build" ? `building ${p.done ?? 0}/${p.total ?? 0}` : p.phase === "probes" ? `probing ${p.done ?? 0}/${p.total ?? 0}` : p.detail || p.phase || active.step || "running";
+    } else if (runs.some((r) => r.state === "needs_input")) {
+      phase = "waiting for decisions";
+    }
+    $status.textContent = `${phase} · ${online}/${workers.length} workers`;
   } catch (e) { $status.textContent = "coordinator unreachable"; }
 }
 setInterval(header, 5000);
@@ -141,11 +172,13 @@ async function viewQueue() {
     api("/api/candidates"), api("/api/candidates?state=deferred"), api("/api/runs"),
   ]);
   const active = runs.find((r) => r.state === "running" || r.state === "needs_input");
+  const activeRun = active ? await api(`/api/runs/${active.id}`) : null;
+  const willAuto = (c) => activeRun?.state === "running" && c.kind === "update" && c.review?.gate?.diff_class !== "structural" && c.floor_risk === "low" && !c.llm_risk;
   const cells = (c) => [
     `<a href="#/packages/${esc(c.pkgbase)}">${esc(c.pkgbase)}</a>`, esc(c.kind), dash(c.class),
     pill(c.review?.gate?.diff_class), pill(c.floor_risk), pill(c.llm_risk),
     `<span class="muted">${agoEpoch(c.first_seen_last_modified)}</span>`,
-    `<span class="ellipsis">${esc(candidateSummary(c))}</span>`,
+    `<span class="ellipsis">${willAuto(c) ? '<span class="pill low">gate will decide</span> ' : ""}${esc(candidateSummary(c))}</span>`,
   ];
   const headers = ["package", "kind", "class", "diff", "floor", "llm", "on AUR", "summary"];
   $main.innerHTML = `
@@ -156,6 +189,7 @@ async function viewQueue() {
         <button class="primary" id="start-run">${active?.state === "needs_input" ? "Resume run" : "Start run"}</button>
       </div>
     </div>
+    ${activeRun && activeRun.state === "running" ? `<div class="panel">run <a href="#/runs/${activeRun.id}" class="mono">${short(activeRun.id)}</a> · ${progressLine(activeRun)}</div>` : ""}
     <h2>Pending decisions (${pending.length})</h2>
     ${table(headers, pending, { cells, href: (c) => `#/candidates/${c.id}`, empty: "no candidates waiting" })}
     ${deferred.length ? `<h2>Deferred (${deferred.length})</h2>${table(headers, deferred, { cells, href: (c) => `#/candidates/${c.id}` })}` : ""}
@@ -297,6 +331,7 @@ async function viewRun(id) {
       ${r.state === "needs_input" ? `<a class="btn" href="#/queue">Decide pending candidates</a>` : ""}
     </div>
     <div class="muted">started ${ago(r.started_at)} · ${open ? "running for" : "took"} ${dur(r.started_at, r.finished_at)}</div>
+    ${r.state === "running" ? `<div class="panel">${progressLine(r)}</div>` : ""}
     ${summary}
     <h2>Candidates (${r.candidates.length})</h2>${cands}
     <h2>Jobs (${jobs.length})</h2>${jobsTable(jobs)}`;
