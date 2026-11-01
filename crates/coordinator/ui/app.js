@@ -598,10 +598,12 @@ viewRuns.refresh = 5000;
 function stepTimeline(r) {
   const steps = (r.events || []).filter((e) => e.kind === "run.step").sort((a, b) => a.seq - b.seq);
   if (!steps.length) return "";
-  const end = r.finished_at || new Date().toISOString();
+  // A parked run stopped working at its last progress update; only a
+  // running one is still accruing time on its last step.
+  const end = r.finished_at || (r.state === "running" ? new Date().toISOString() : r.progress?.at || new Date().toISOString());
   return `<div class="timeline">${steps.map((s, i) => {
     const next = steps[i + 1]?.ts || end;
-    const live = !steps[i + 1] && !r.finished_at;
+    const live = !steps[i + 1] && r.state === "running";
     return `<span class="step ${live ? "live" : ""}" title="${esc(absolute(s.ts))}">${esc(s.payload.step)} <span class="muted">${dur(s.ts, next)}</span></span>`;
   }).join('<span class="muted"> › </span>')}</div>`;
 }
@@ -627,7 +629,7 @@ async function viewRun(id) {
       <h1>Run <span class="mono">${short(id)}</span> ${pill(r.state)} ${r.step ? `<span class="muted">step ${esc(r.step)}</span>` : ""}</h1>
       ${r.state === "needs_input" ? `<a class="btn" href="#/queue">Decide pending candidates</a>` : ""}
     </div>
-    <div class="muted">started ${ago(r.started_at)} · ${open ? "running for" : "took"} ${dur(r.started_at, r.finished_at)}${r.finished_at ? ` · finished ${ago(r.finished_at)}` : ""}</div>
+    <div class="muted">started ${ago(r.started_at)}${r.state === "running" ? ` · running for ${dur(r.started_at)}` : r.state === "needs_input" ? ` · worked ${dur(r.started_at, r.progress?.at)}, parked ${ago(r.progress?.at)} waiting for decisions; resume from the queue when you have made them` : ` · took ${dur(r.started_at, r.finished_at)}${r.finished_at ? ` · finished ${ago(r.finished_at)}` : ""}`}</div>
     ${r.state === "running" ? `<div class="panel">${progressLine(r)}</div>` : ""}
     ${stepTimeline(r)}
     ${hasSummary ? `<div class="cards">
