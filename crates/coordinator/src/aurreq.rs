@@ -1,4 +1,6 @@
-//! The aur-requests mailing list, read through the archive's RSS feed. Every
+//! The AUR mailing lists, read through the archive's RSS feeds.
+//!
+//! aur-requests is the valuable one and it is structured. Every
 //! deletion, merge, orphan and adoption request on the AUR is posted there
 //! by aurweb with a fixed subject, so the list is the only machine-readable
 //! view of requests (the RPC has none, and the archive's mbox export is
@@ -13,16 +15,58 @@
 //! The body of a filing is `<user> [1] filed a <type> request for <base>
 //! [2]:` followed by the rationale; an outcome's body is `Request #n has
 //! been Accepted by <user> [1].`
+//!
+//! aur-general is free-form discussion. The only cheap, honest use of it is
+//! a whole-word match of tracked package names against subject and body,
+//! recorded as an `info` mention the reviewer gets to read.
 
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-pub struct AurRequests {
+/// One RSS feed of a HyperKitty archive.
+pub struct Feed {
     http: reqwest::Client,
     url: String,
 }
+
+/// An item as the feed carries it, entities decoded.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Entry {
+    pub title: String,
+    pub link: String,
+    pub guid: String,
+    pub description: String,
+    /// `Name` from `addr (Name)`, or the whole author field.
+    pub author: Option<String>,
+    /// RFC 3339 UTC, from the feed's pubDate.
+    pub published: Option<String>,
+}
+
+impl Feed {
+    pub fn new(url: &str) -> Self {
+        Feed {
+            http: reqwest::Client::builder()
+                .user_agent(format!("repoman/{}", repoman_common::VERSION))
+                .timeout(Duration::from_secs(30))
+                .build()
+                .expect("http client"),
+            url: url.to_string(),
+        }
+    }
+
+    pub async fn fetch_entries(&self) -> Result<Vec<Entry>> {
+        let resp = self.http.get(&self.url).send().await.with_context(|| format!("feed {}", self.url))?;
+        if !resp.status().is_success() {
+            bail!("feed {}: HTTP {}", self.url, resp.status());
+        }
+        let text = resp.text().await?;
+        Ok(parse_entries(&text))
+    }
+}
+
+pub struct AurRequests(Feed);
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RequestItem {
@@ -59,25 +103,82 @@ pub fn severity(item: &RequestItem) -> &'static str {
 
 impl AurRequests {
     pub fn new(url: &str) -> Self {
-        AurRequests {
-            http: reqwest::Client::builder()
-                .user_agent(format!("repoman/{}", repoman_common::VERSION))
-                .timeout(Duration::from_secs(30))
-                .build()
-                .expect("http client"),
-            url: url.to_string(),
-        }
+        AurRequests(Feed::new(url))
     }
 
     /// The feed's current items, newest first, unparseable ones skipped.
     pub async fn fetch(&self) -> Result<Vec<RequestItem>> {
-        let resp = self.http.get(&self.url).send().await.context("aur-requests feed")?;
-        if !resp.status().is_success() {
-            bail!("aur-requests feed: HTTP {}", resp.status());
-        }
-        let text = resp.text().await?;
-        Ok(parse_feed(&text))
+        Ok(requests_from(&self.0.fetch_entries().await?))
     }
+}
+
+// ---- aur-general ----------------------------------------------------------------
+
+pub struct AurGeneral(Feed);
+
+/// A list message that names a tracked package.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Mention {
+    pub pkgbase: String,
+    pub subject: String,
+    pub who: Option<String>,
+    /// Around the first occurrence, for the signal and the prompt.
+    pub excerpt: String,
+    pub link: String,
+    pub guid: String,
+    pub published: Option<String>,
+}
+
+impl AurGeneral {
+    pub fn new(url: &str) -> Self {
+        AurGeneral(Feed::new(url))
+    }
+
+    pub async fn fetch_mentions(&self, names: &[String]) -> Result<Vec<Mention>> {
+        Ok(mentions_in(&self.0.fetch_entries().await?, names))
+    }
+}
+
+/// Whole-word occurrence of `name` in `text` (package names contain `-`,
+/// `_`, `.`, `+`, `@`, so "word" means delimited by anything else).
+fn find_word(text: &str, name: &str) -> Option<usize> {
+    let is_name_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+' | '@');
+    let mut from = 0;
+    while let Some(i) = text[from..].find(name) {
+        let at = from + i;
+        let before_ok = text[..at].chars().next_back().is_none_or(|c| !is_name_char(c));
+        let after_ok = text[at + name.len()..].chars().next().is_none_or(|c| !is_name_char(c));
+        if before_ok && after_ok {
+            return Some(at);
+        }
+        from = at + name.len();
+    }
+    None
+}
+
+/// Names shorter than four characters match too much English to be worth a
+/// signal.
+pub fn mentions_in(entries: &[Entry], names: &[String]) -> Vec<Mention> {
+    let mut out = Vec::new();
+    for e in entries {
+        let text = format!("{}\n{}", e.title, e.description);
+        for name in names.iter().filter(|n| n.len() >= 4) {
+            let Some(at) = find_word(&text, name) else { continue };
+            let start = text[..at].char_indices().rev().nth(120).map(|(i, _)| i).unwrap_or(0);
+            let end = text[at..].char_indices().nth(240).map(|(i, _)| at + i).unwrap_or(text.len());
+            let excerpt = text[start..end].split_whitespace().collect::<Vec<_>>().join(" ");
+            out.push(Mention {
+                pkgbase: name.clone(),
+                subject: e.title.clone(),
+                who: e.author.clone(),
+                excerpt,
+                link: e.link.clone(),
+                guid: e.guid.clone(),
+                published: e.published.clone(),
+            });
+        }
+    }
+    out
 }
 
 // ---- RSS ------------------------------------------------------------------------
@@ -99,27 +200,50 @@ fn unescape(s: &str) -> String {
     s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&#39;", "'").replace("&apos;", "'").replace("&amp;", "&")
 }
 
-pub fn parse_feed(xml: &str) -> Vec<RequestItem> {
+pub fn parse_entries(xml: &str) -> Vec<Entry> {
     let mut out = Vec::new();
     let mut rest = xml;
     while let Some(i) = rest.find("<item>") {
         let Some(j) = rest[i..].find("</item>") else { break };
         let block = &rest[i..i + j];
         rest = &rest[i + j + 7..];
-        let title = element(block, "title").map(unescape).unwrap_or_default();
-        let Some(mut item) = parse_title(&title) else { continue };
-        item.link = element(block, "link").map(unescape).unwrap_or_default();
-        item.guid = element(block, "guid").map(unescape).unwrap_or_else(|| item.link.clone());
-        let desc = element(block, "description").map(unescape).unwrap_or_default();
-        let (who, body) = parse_body(&desc);
-        item.who = who;
-        item.body = body;
-        item.published = element(block, "pubDate")
-            .and_then(|d| time::OffsetDateTime::parse(d.trim(), &time::format_description::well_known::Rfc2822).ok())
-            .map(|t| repoman_common::clock::format(t.to_offset(time::UtcOffset::UTC)));
-        out.push(item);
+        let link = element(block, "link").map(unescape).unwrap_or_default();
+        let author = element(block, "author").map(unescape).map(|a| match a.rsplit_once('(') {
+            Some((_, name)) => name.trim_end_matches(')').trim().to_string(),
+            None => a.trim().to_string(),
+        });
+        out.push(Entry {
+            title: element(block, "title").map(unescape).unwrap_or_default(),
+            guid: element(block, "guid").map(unescape).unwrap_or_else(|| link.clone()),
+            link,
+            description: element(block, "description").map(unescape).unwrap_or_default(),
+            author: author.filter(|a| !a.is_empty()),
+            published: element(block, "pubDate")
+                .and_then(|d| time::OffsetDateTime::parse(d.trim(), &time::format_description::well_known::Rfc2822).ok())
+                .map(|t| repoman_common::clock::format(t.to_offset(time::UtcOffset::UTC))),
+        });
     }
     out
+}
+
+pub fn requests_from(entries: &[Entry]) -> Vec<RequestItem> {
+    entries
+        .iter()
+        .filter_map(|e| {
+            let mut item = parse_title(&e.title)?;
+            item.link = e.link.clone();
+            item.guid = e.guid.clone();
+            let (who, body) = parse_body(&e.description);
+            item.who = who;
+            item.body = body;
+            item.published = e.published.clone();
+            Some(item)
+        })
+        .collect()
+}
+
+pub fn parse_feed(xml: &str) -> Vec<RequestItem> {
+    requests_from(&parse_entries(xml))
 }
 
 /// `[PRQ#n] <Kind> Request for <pkgbase>[ <Outcome>]`.
@@ -229,5 +353,22 @@ Upstream &amp; package merged into extra as &quot;kwi&quot;.
         assert_eq!(r.outcome.as_deref(), Some("rejected"));
         let x = parse_title("[PRQ#7] Frobnicate Request for foo").unwrap();
         assert_eq!(x.kind, "other");
+    }
+
+    #[test]
+    fn mentions_match_whole_names_only() {
+        let entries = parse_entries(FEED);
+        assert_eq!(entries[0].author.as_deref(), Some("notify@aur.archlinux.org"));
+        let names = vec!["usbimager".to_string(), "kwi".to_string(), "image".to_string(), "perl-devel-nytprof".to_string()];
+        let m = mentions_in(&entries, &names);
+        let found: Vec<(&str, &str)> = m.iter().map(|x| (x.pkgbase.as_str(), x.subject.as_str())).collect();
+        assert_eq!(
+            found,
+            [("usbimager", "[PRQ#88998] Adoption Request for usbimager"), ("perl-devel-nytprof", "[PRQ#88993] Orphan Request for perl-devel-nytprof Accepted")],
+            "kwi is too short, image is inside usbimager: {m:#?}"
+        );
+        assert!(m[0].excerpt.contains("filed an adoption request for usbimager"), "{:?}", m[0].excerpt);
+        assert_eq!(find_word("foo-git is not foo", "foo"), Some(15));
+        assert_eq!(find_word("libfoo", "foo"), None);
     }
 }

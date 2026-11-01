@@ -49,12 +49,14 @@ function sigLabel(s) {
   const p = s.payload || {};
   if (s.source === "aur-security") return p.verdict || "";
   if (s.source === "aur-requests") return p.kind === "request_outcome" ? `${p.request} request #${p.prq} ${p.outcome}` : `${p.request} request #${p.prq}`;
+  if (s.source === "aur-general") return `mentioned in “${p.subject || ""}”`;
   return { adopted: `adopted by ${p.by}`, deleted: "deleted from the AUR", resubmitted: "deleted and resubmitted under the same name", history_rewritten: "git history replaced" }[p.kind] || p.kind || "";
 }
 function sigDetail(s) {
   const p = s.payload || {};
   if (s.source === "aur-security") return p.explanation || "";
   if (s.source === "aur-requests") return p.kind === "request_outcome" ? `by ${p.who || "?"}` : (p.body || "").split("\n").filter(Boolean).slice(1).join(" ").slice(0, 300);
+  if (s.source === "aur-general") return `${p.who ? `${p.who}: ` : ""}${p.excerpt || ""}`;
   switch (p.kind) {
     case "adopted": return `orphaned since ${p.orphaned_since ? ago(p.orphaned_since) : "before we watched"}; nothing auto-approves for ${p.quarantine_days} days`;
     case "deleted": return `missing since ${ago(p.missing_since)}; git repository ${p.git_gone ? "gone too" : "still answers"}; last ${p.last_version || "?"} by ${p.last_maintainer || "nobody"}`;

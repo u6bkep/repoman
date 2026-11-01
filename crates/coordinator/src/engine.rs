@@ -142,9 +142,7 @@ async fn execute(app: &AppState, run_id: &str) -> Result<RunEnd> {
         step(app, run_id, "poll").await?;
         progress(app, run_id, serde_json::json!({"phase": "poll", "detail": "asking the AUR and git sources for new commits"}));
         poll_aur(app).await?;
-        if let Err(e) = ingest_aur_requests(app).await {
-            tracing::warn!(error = %format!("{e:#}"), "aur-requests feed");
-        }
+        ingest_lists(app).await;
 
         step(app, run_id, "candidates").await?;
         progress(app, run_id, serde_json::json!({"phase": "candidates"}));
@@ -419,6 +417,51 @@ async fn missing_from_aur(app: &AppState, p: &PackageRow, prev: Option<SnapshotR
         app.store.event("aur.deleted", Some(&p.pkgbase), payload)?;
     }
     Ok(())
+}
+
+/// Both mailing-list feeds; failures are logged, never fatal to a run.
+pub async fn ingest_lists(app: &AppState) {
+    match ingest_aur_requests(app).await {
+        Ok(n) if n > 0 => tracing::info!(new_signals = n, "aur-requests"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %format!("{e:#}"), "aur-requests feed"),
+    }
+    match ingest_aur_general(app).await {
+        Ok(n) if n > 0 => tracing::info!(new_signals = n, "aur-general"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %format!("{e:#}"), "aur-general feed"),
+    }
+}
+
+/// Messages on aur-general that name a tracked package, as `info` signals
+/// (one per message and package, deduplicated by guid). Nothing blocks on
+/// them; the reviewer and the operator get to read them.
+pub async fn ingest_aur_general(app: &AppState) -> Result<usize> {
+    let Some(feed) = &app.aurgen else { return Ok(0) };
+    let names: Vec<String> = app.store.list_packages()?.into_iter().filter(|p| p.source_url.is_none()).map(|p| p.pkgbase).collect();
+    if names.is_empty() {
+        return Ok(0);
+    }
+    let mut added = 0;
+    for m in feed.fetch_mentions(&names).await? {
+        let existing = app.store.signals_of(&m.pkgbase)?;
+        if existing.iter().any(|s| s.source == "aur-general" && s.payload["guid"] == m.guid) {
+            continue;
+        }
+        let payload = serde_json::json!({
+            "kind": "mention",
+            "subject": m.subject,
+            "who": m.who,
+            "excerpt": m.excerpt,
+            "link": m.link,
+            "guid": m.guid,
+            "published": m.published,
+        });
+        app.store.add_signal(&m.pkgbase, None, "aur-general", "info", &payload)?;
+        app.store.event("aur_general.mention", Some(&m.pkgbase), payload)?;
+        added += 1;
+    }
+    Ok(added)
 }
 
 /// Read the aur-requests feed and record requests against tracked packages
@@ -908,6 +951,13 @@ async fn review_change(
                     s.payload["body"].as_str().unwrap_or("").lines().skip(2).collect::<Vec<_>>().join(" ")
                 ),
                 "aur-security" => format!("{}: {}", s.payload["verdict"].as_str().unwrap_or("?"), s.payload["explanation"].as_str().unwrap_or("")),
+                "aur-general" => format!(
+                    "mentioned on the list by {} in \"{}\": {}",
+                    s.payload["who"].as_str().unwrap_or("?"),
+                    s.payload["subject"].as_str().unwrap_or(""),
+                    s.payload["excerpt"].as_str().unwrap_or("")
+                ),
+                "aur" => format!("{} {}", s.kind().unwrap_or("state change"), s.payload),
                 _ => s.payload.to_string(),
             };
             format!("{} [{}]{} {}", s.source, s.severity, s.aur_commit.as_deref().map(|c| format!(" commit {}", &c[..c.len().min(10)])).unwrap_or_default(), what)

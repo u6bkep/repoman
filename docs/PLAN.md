@@ -462,7 +462,10 @@ candidates have no quarantine.
   aur-requests`) or the operator does; orphan and adoption filings and all
   outcomes are `info`. The feed holds 30 items, so a request older than the
   feed's horizon at first poll is never seen.
-- Future: aur-general ingestion (keyword match on tracked pkgbases).
+- aur-general (implemented 2026-11-01): the same feed reader; a message
+  whose subject or body contains a tracked pkgbase as a whole word (names
+  under four characters are skipped) becomes an `info` signal with an
+  excerpt. Never blocks; the reviewer and the operator read it.
 
 Signals are stored with the commit they concern (or the package, when
 `aur_commit` is null) and shown on the candidate, the package page and the

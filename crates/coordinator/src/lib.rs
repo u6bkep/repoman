@@ -39,6 +39,7 @@ pub struct AppState {
     pub cache: Arc<cache::Cache>,
     pub aursec: Option<Arc<aursec::AurSecurity>>,
     pub aurreq: Option<Arc<aurreq::AurRequests>>,
+    pub aurgen: Option<Arc<aurreq::AurGeneral>>,
     pub aurweb: Arc<aurweb::AurWeb>,
     pub engine: Arc<engine::Engine>,
 }
@@ -60,6 +61,7 @@ impl AppState {
         let aursec = config.aur_security_url.as_deref().filter(|u| !u.is_empty()).map(|u| Arc::new(aursec::AurSecurity::new(u)));
         let aurweb = Arc::new(aurweb::AurWeb::new(&config.aur_web_url));
         let aurreq = config.aur_requests_url.as_deref().filter(|u| !u.is_empty()).map(|u| Arc::new(aurreq::AurRequests::new(u)));
+        let aurgen = config.aur_general_url.as_deref().filter(|u| !u.is_empty()).map(|u| Arc::new(aurreq::AurGeneral::new(u)));
         if reviewer.enabled() && !reviewer.is_configured() {
             tracing::warn!(env = %config.reviewer.api_key_env, "reviewer enabled but no API key in the environment; candidates will record no verdict");
         }
@@ -77,6 +79,7 @@ impl AppState {
             cache,
             aursec,
             aurreq,
+            aurgen,
             aurweb,
             engine: engine::Engine::new(),
         })
@@ -112,17 +115,13 @@ pub async fn serve(config: CoordinatorConfig, store: Arc<Store>, listener: TcpLi
     });
     // aur-requests between runs: a request against one of our packages is
     // worth knowing about before the next run, and the feed is short.
-    if state.aurreq.is_some() {
+    if state.aurreq.is_some() || state.aurgen.is_some() {
         let st = state.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(st.config.aur_requests_poll_secs.max(60)));
             loop {
                 tick.tick().await;
-                match engine::ingest_aur_requests(&st).await {
-                    Ok(n) if n > 0 => tracing::info!(new_signals = n, "aur-requests"),
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!(error = %format!("{e:#}"), "aur-requests feed"),
-                }
+                engine::ingest_lists(&st).await;
             }
         });
     }

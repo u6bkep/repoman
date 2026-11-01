@@ -167,6 +167,8 @@ struct StubState {
     meta: Arc<Mutex<HashMap<String, AurMeta>>>,
     /// Body of the fake aur-requests RSS feed.
     feed: Arc<Mutex<String>>,
+    /// Body of the fake aur-general RSS feed.
+    general: Arc<Mutex<String>>,
     /// Comments on the fake AUR package pages, by pkgbase: (author, date, text).
     comments: Arc<Mutex<HashMap<String, Vec<(String, String, String)>>>>,
 }
@@ -191,6 +193,15 @@ async fn package_page(State(st): State<StubState>, AxPath(pkgbase): AxPath<Strin
 async fn requests_feed(State(st): State<StubState>) -> axum::response::Response {
     use axum::response::IntoResponse;
     ([(axum::http::header::CONTENT_TYPE, "application/rss+xml")], st.feed.lock().unwrap().clone()).into_response()
+}
+
+async fn general_feed(State(st): State<StubState>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    ([(axum::http::header::CONTENT_TYPE, "application/rss+xml")], st.general.lock().unwrap().clone()).into_response()
+}
+
+fn general_item(n: u32, subject: &str, who: &str, body: &str) -> String {
+    format!("<item><title>{subject}</title><link>https://lists.example/general/{n}/</link><description>{body}</description><author>x＠y.z ({who})</author><pubDate>Sun, 01 Nov 2026 20:21:53 +0000</pubDate><guid>https://lists.example/general/{n}/</guid></item>")
 }
 
 /// One aur-requests list message as the archive's feed renders it.
@@ -282,6 +293,7 @@ async fn start_stub(st: StubState) -> String {
         .route("/mirror/{repo}/{arch}/{file}", get(mirror_db))
         .route("/api/v1/checks/lookup", axum::routing::post(aursec_lookup))
         .route("/feed/", get(requests_feed))
+        .route("/general/", get(general_feed))
         .route("/pkgbase/{pkgbase}", get(package_page))
         .with_state(st);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -426,6 +438,7 @@ struct Harness {
     dangerous: Arc<Mutex<Vec<String>>>,
     meta: Arc<Mutex<HashMap<String, AurMeta>>>,
     feed: Arc<Mutex<String>>,
+    general: Arc<Mutex<String>>,
     comments: Arc<Mutex<HashMap<String, Vec<(String, String, String)>>>>,
     core_db: Arc<Mutex<(Vec<u8>, String)>>,
     specs: Arc<Mutex<Vec<JobSpec>>>,
@@ -467,6 +480,7 @@ async fn start_with(tweak: impl FnOnce(&mut CoordinatorConfig)) -> Harness {
     let meta: Arc<Mutex<HashMap<String, AurMeta>>> = Arc::new(Mutex::new(HashMap::new()));
     let feed = Arc::new(Mutex::new(feed_xml(&[])));
     let comments = Arc::new(Mutex::new(HashMap::new()));
+    let general = Arc::new(Mutex::new(feed_xml(&[])));
     let stub = start_stub(StubState {
         stamps: aur.stamps.clone(),
         versions: versions.clone(),
@@ -476,6 +490,7 @@ async fn start_with(tweak: impl FnOnce(&mut CoordinatorConfig)) -> Harness {
         dangerous: dangerous.clone(),
         meta: meta.clone(),
         feed: feed.clone(),
+        general: general.clone(),
         comments: comments.clone(),
     })
     .await;
@@ -505,6 +520,7 @@ async fn start_with(tweak: impl FnOnce(&mut CoordinatorConfig)) -> Harness {
         forge_checks: false,
         aur_security_url: Some(stub.clone()),
         aur_requests_url: Some(format!("{stub}/feed/")),
+        aur_general_url: Some(format!("{stub}/general/")),
         aur_web_url: stub.clone(),
         ..Default::default()
     };
@@ -537,6 +553,7 @@ async fn start_with(tweak: impl FnOnce(&mut CoordinatorConfig)) -> Harness {
         dangerous,
         meta,
         feed,
+        general,
         comments,
         core_db,
         specs,
@@ -1247,4 +1264,39 @@ async fn aur_requests_against_tracked_packages_become_signals() {
     assert_eq!(outcome["severity"], "info");
     assert_eq!(outcome["payload"]["outcome"], "rejected");
     assert!(h.get("/api/signals").await.as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn aur_general_mentions_are_info_signals() {
+    let h = start_with(|c| c.auto_approve = true).await;
+    // Names under four characters are never matched (too many English
+    // words), so this test's package is "frobnicator", not "foo".
+    h.post("/api/packages", json!({"pkgbase": "frobnicator", "streams": ["s1"], "class": "upstream-source"})).await;
+    h.publish_pkg("frobnicator", "1.0", &["glibc"], &[]);
+    assert_eq!(h.run().await["state"], "needs_input");
+    let c = h.get("/api/candidates").await.as_array().unwrap()[0].clone();
+    h.post(&format!("/api/candidates/{}/decide", c["id"].as_str().unwrap()), json!({"decision": "approve"})).await;
+    assert_eq!(h.run().await["state"], "done");
+    *h.general.lock().unwrap() = feed_xml(&[
+        general_item(1, "Re: Moderating in moderation", "alice", "nothing to do with us"),
+        general_item(2, "frobnicator-git is broken", "bob", "the frobnicator-git package fails to build"),
+        general_item(3, "[security] frobnicator ships a miner", "carol", "I ran strace on frobnicator 1.0 and it connects to a pool."),
+    ]);
+    assert_eq!(h.run().await["state"], "done");
+    let p = h.get("/api/packages/frobnicator").await;
+    let sigs = p["signals"].as_array().unwrap();
+    assert_eq!(sigs.len(), 1, "frobnicator-git is not frobnicator: {sigs:?}");
+    assert_eq!(sigs[0]["source"], "aur-general");
+    assert_eq!(sigs[0]["severity"], "info");
+    assert_eq!(sigs[0]["payload"]["who"], "carol");
+    assert!(sigs[0]["payload"]["excerpt"].as_str().unwrap().contains("connects to a pool"), "{}", sigs[0]["payload"]);
+    assert!(h.get("/api/signals").await.as_array().unwrap().is_empty(), "info never blocks");
+
+    // A routine bump still auto-approves; the mention is context, not a veto.
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    h.publish_pkg("frobnicator", "1.1", &["glibc"], &[]);
+    h.aur.stamps.lock().unwrap().insert("frobnicator".into(), now - 30 * 86_400);
+    assert_eq!(h.run().await["state"], "done");
+    assert_eq!(h.repo_db().iter().find(|p| p.name == "frobnicator").unwrap().version, "1.1-1");
+    assert_eq!(h.get("/api/packages/frobnicator").await["signals"].as_array().unwrap().len(), 1, "no duplicate");
 }
