@@ -413,7 +413,9 @@ Computed deterministically from:
   polkit rules.
 - Corroboration for routine updates via forge adapters (GitHub, GitLab,
   Codeberg in M2; others as needed): the version exists upstream as a tag or
-  release, and the release owner is unchanged.
+  release, and the release owner is unchanged. Implemented in
+  `coordinator::forge`: a mismatch adds `upstream_not_corroborated` and
+  raises the floor to medium; unknown hosts are `unconfirmed` and neutral.
 - Post-build inputs (step 11): artifact diff against the previous
   publication showing new privileged surface or setuid bits; writes outside
   expected paths; network attempts (M2).

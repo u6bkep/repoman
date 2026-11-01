@@ -65,6 +65,17 @@ pub struct CoordinatorConfig {
     /// clear on its own.
     #[serde(default)]
     pub reviewer: ReviewerConfig,
+    /// Ask GitHub, GitLab, and Codeberg whether the version a routine update
+    /// fetches exists as a tag under the baseline's owner.
+    #[serde(default = "default_true")]
+    pub forge_checks: bool,
+    /// Environment variable with a GitHub token (raises the API rate limit).
+    #[serde(default = "default_github_token_env")]
+    pub github_token_env: String,
+}
+
+fn default_github_token_env() -> String {
+    "GITHUB_TOKEN".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,6 +173,8 @@ impl Default for CoordinatorConfig {
             auto_approve: true,
             auto_approve_metadata: true,
             reviewer: ReviewerConfig::default(),
+            forge_checks: true,
+            github_token_env: default_github_token_env(),
         }
     }
 }

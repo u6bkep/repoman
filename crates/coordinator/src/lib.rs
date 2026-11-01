@@ -11,6 +11,7 @@ pub mod api;
 pub mod aur;
 pub mod blobs;
 pub mod engine;
+pub mod forge;
 pub mod gate;
 pub mod reviewer;
 pub mod hub;
@@ -30,6 +31,7 @@ pub struct AppState {
     pub publisher: Arc<publisher::Publisher>,
     pub keys: Arc<keys::Keys>,
     pub reviewer: Arc<reviewer::Reviewer>,
+    pub forge: Arc<forge::ForgeClient>,
     pub engine: Arc<engine::Engine>,
 }
 
@@ -45,6 +47,7 @@ impl AppState {
         let publisher = Arc::new(publisher::Publisher::new(&config)?);
         let keys = Arc::new(keys::Keys::new(&config.data_dir)?);
         let reviewer = Arc::new(reviewer::Reviewer::new(config.reviewer.clone()));
+        let forge = Arc::new(forge::ForgeClient::new(std::env::var(&config.github_token_env).ok().filter(|t| !t.is_empty())));
         if reviewer.enabled() && !reviewer.is_configured() {
             tracing::warn!(env = %config.reviewer.api_key_env, "reviewer enabled but no API key in the environment; candidates will record no verdict");
         }
@@ -58,6 +61,7 @@ impl AppState {
             publisher,
             keys,
             reviewer,
+            forge,
             engine: engine::Engine::new(),
         })
     }

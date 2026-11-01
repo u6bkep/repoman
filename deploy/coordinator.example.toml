@@ -20,6 +20,11 @@ quarantine_days = 3
 auto_approve = true
 auto_approve_metadata = true
 
+# Routine updates are checked against GitHub/GitLab/Codeberg: the tag must
+# exist under the baseline's owner. GITHUB_TOKEN in the environment raises
+# the rate limit.
+forge_checks = true
+
 # Claude API reviewer for structural and elevated-risk candidates. The key
 # comes from the environment (ANTHROPIC_API_KEY). Its risk can raise a
 # candidate's risk, never lower it. Set routine_model to also review routine

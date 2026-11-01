@@ -130,6 +130,8 @@ async fn srcinfo_matches(app: &AppState, pkgbase: &str, head: &str, committed: &
 /// material.
 pub struct Assessment {
     pub verdict: Verdict,
+    /// Forge corroboration of the sources, when checked.
+    pub corroboration: Option<crate::forge::Corroboration>,
     pub old_pkgbuild: Option<String>,
     pub new_pkgbuild: String,
     pub old_scripts: Vec<(String, String)>,
@@ -194,7 +196,7 @@ pub async fn assess(
         let dep = DepSpec::unversioned(name);
         names.iter().any(|n| streams.get(n).is_some_and(|ix| ix.index.satisfies(&dep)))
     };
-    let verdict = evaluate(&GateInput {
+    let mut verdict = evaluate(&GateInput {
         old: &old_si,
         new: head_si,
         old_pkgbuild: old_pkgbuild.as_deref(),
@@ -207,8 +209,27 @@ pub async fn assess(
         srcinfo_mismatch,
         is_official: &is_official,
     });
+    // Corroborate routine-looking updates against the upstream forge. A
+    // structural change is going to a human anyway; this is what catches a
+    // "routine" bump whose version was never released upstream, or whose
+    // sources quietly moved to another owner.
+    let mut corroboration = None;
+    if baseline.is_some() && app.config.forge_checks && verdict.diff_class != repoman_gate::DiffClass::Structural {
+        let c = app.forge.corroborate(Some(&old_si), head_si).await;
+        if c.result == crate::forge::Result_::Mismatch {
+            verdict.reasons.push(repoman_gate::Reason {
+                kind: "upstream_not_corroborated".into(),
+                detail: c.detail.clone(),
+                class: verdict.diff_class,
+                risk: repoman_gate::Risk::Medium,
+            });
+            verdict.floor_risk = verdict.floor_risk.max(repoman_gate::Risk::Medium);
+        }
+        corroboration = Some(c);
+    }
     Ok(Assessment {
         verdict,
+        corroboration,
         old_pkgbuild,
         new_pkgbuild,
         old_scripts,

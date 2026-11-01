@@ -341,6 +341,7 @@ async fn start_with(tweak: impl FnOnce(&mut CoordinatorConfig)) -> Harness {
         aur_rpc_url: format!("{stub}/rpc/v5"),
         aur_git_url: aur.git_url(),
         auto_approve: false,
+        forge_checks: false,
         ..Default::default()
     };
     let mut config = config;

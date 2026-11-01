@@ -566,6 +566,9 @@ async fn review_change(
         }
     };
     review["gate"] = serde_json::to_value(&a.verdict)?;
+    if let Some(c) = &a.corroboration {
+        review["corroboration"] = serde_json::to_value(c)?;
+    }
     let floor = a.verdict.floor_risk.as_str().to_string();
     let Some(model) = app.reviewer.model_for(&a.verdict) else {
         return Ok((Some(floor), None));

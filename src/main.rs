@@ -536,6 +536,9 @@ fn print_candidate(c: &Value) {
     if let Some(e) = r["gate_error"].as_str() {
         println!("gate      error: {e}");
     }
+    if let Some(c) = r["corroboration"].as_object() {
+        println!("upstream  {}: {}", s(&c["result"]), s(&c["detail"]));
+    }
     if let Some(reasons) = r["gate"]["reasons"].as_array()
         && !reasons.is_empty()
     {

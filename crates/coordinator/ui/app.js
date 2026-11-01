@@ -221,6 +221,7 @@ async function viewCandidate(id) {
       <dt>first seen on AUR</dt><dd>${agoEpoch(c.first_seen_last_modified)} <span class="muted">(quarantine clock)</span></dd>
       <dt>run</dt><dd><a href="#/runs/${esc(c.run_id)}">${short(c.run_id)}</a></dd>
       ${r.gate_error ? `<dt>gate error</dt><dd>${esc(r.gate_error)}</dd>` : ""}
+      ${r.corroboration ? `<dt>upstream</dt><dd>${pill(r.corroboration.result === "confirmed" ? "low" : r.corroboration.result === "mismatch" ? "high" : "")}${esc(r.corroboration.result)} <span class="muted">${esc(r.corroboration.detail)}</span></dd>` : ""}
       ${r.note ? `<dt>note</dt><dd>${esc(r.note)}</dd>` : ""}
     </dl></div>
     ${reasons ? `<h2>Reasons</h2><ul class="findings">${reasons}</ul>` : ""}
