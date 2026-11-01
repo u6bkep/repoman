@@ -6,8 +6,10 @@
 #   rsync -a --delete --exclude target --exclude .git <repo>/ /containers/repoman/src/
 #   docker compose up -d --build
 #
-# The container joins the docker1 macvlan and is reachable on the LAN as
-# repoman.b.intern.gecko.network:7800 with no port publishing.
+# Networking is owned by the host: ~/infra/net.yml generates a
+# docker-compose.override.yml that puts the container behind traefik-internal
+# (web-repoman) with egress for outbound internet; it is reachable as
+# https://repoman.b.gecko.network. Do not edit the override by hand.
 
 services:
   coordinator:

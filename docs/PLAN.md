@@ -741,7 +741,9 @@ prediction on first-seen packages.
 
 - Coordinator deployment: stack at `/containers/repoman` on the NAS per that
   host's conventions, see `deploy/compose.yaml`. Container `repoman` on the
-  `docker1` macvlan, reachable as `repoman.b.intern.gecko.network:7800`.
+  host-managed networks behind traefik-internal, reachable as
+  `https://repoman.b.gecko.network` (since 2026-11-01; the `*.b.intern` names
+  and the `docker1` macvlan are retired).
   SQLite at `/srv/db/repoman/coordinator` on the SSD; GPG home joins it in
   M1. Store, repos, images, and cache go under `/media/data/repoman` on the
   HDD array from M1. UI and repos exposed through the existing reverse proxy,

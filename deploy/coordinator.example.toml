@@ -4,7 +4,7 @@
 
 listen = "0.0.0.0:7800"
 # How workers and build roots reach this coordinator.
-public_url = "http://repoman.b.intern.gecko.network:7800"
+public_url = "https://repoman.b.gecko.network"
 data_dir = "/var/lib/repoman"
 bulk_dir = "/var/lib/repoman/bulk"
 orphan_grace_secs = 120

@@ -2,7 +2,7 @@
 # Runs on a build host as root (M1+): the executor needs mount, namespace,
 # and cgroup privileges. The worker connects out to the coordinator.
 
-coordinator = "ws://repoman.b.intern.gecko.network:7800/ws/worker"
+coordinator = "wss://repoman.b.gecko.network/ws/worker"
 name = "b-dtop"
 token = "replace-with-a-long-random-string"
 slots = 4

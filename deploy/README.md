@@ -24,7 +24,7 @@ array at `/media/data/repoman`.
 Once, after the coordinator is up:
 
 ```sh
-repoman --url http://repoman.b.intern.gecko.network:7800 keygen
+repoman --url https://repoman.b.gecko.network keygen
 ```
 
 Put the printed fingerprint into `coordinator.toml` as `signing_key` and
@@ -91,13 +91,13 @@ Each machine tracks one stream. Replace the old `[aur]` stanza with:
 ```ini
 [repoman]
 SigLevel = Required DatabaseRequired
-Server = http://repoman.b.intern.gecko.network:7800/repos/manjaro-stable/$arch
+Server = https://repoman.b.gecko.network/repos/manjaro-stable/$arch
 ```
 
 using `manjaro-unstable` on the desktop. Import the signing key once:
 
 ```sh
-curl -s http://repoman.b.intern.gecko.network:7800/repos/repoman.asc | sudo pacman-key --add -
+curl -s https://repoman.b.gecko.network/repos/repoman.asc -o /tmp/repoman.asc && sudo pacman-key --add /tmp/repoman.asc
 sudo pacman-key --lsign-key <fingerprint>
 ```
 
@@ -114,7 +114,7 @@ let a client use it too, add one line to each distribution stanza in
 
 ```
 [core]
-CacheServer = http://repoman.b.intern.gecko.network:7800/cache
+CacheServer = https://repoman.b.gecko.network/cache
 Include = /etc/pacman.d/mirrorlist
 ```
 
