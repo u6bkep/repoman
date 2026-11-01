@@ -42,6 +42,10 @@ pub struct Sandbox {
     /// command on the host side with the root mounted at `mountpoint`
     /// (bootstrapping an image with the host pacman).
     pub chroot: bool,
+    /// Offline sandboxes only: route all traffic into a sink interface with
+    /// an nftables counter and write the counter (nft JSON) here when the
+    /// command exits, so the worker can report network attempts.
+    pub netlog: Option<PathBuf>,
 }
 
 /// Who runs the command inside the root.
@@ -84,13 +88,28 @@ while [ $i -lt "${REPOMAN_BINDS:-0}" ]; do
   i=$((i+1))
 done
 hostname "${REPOMAN_HOSTNAME:-repoman}" 2>/dev/null || true
+NETCOUNT=0
 if [ "${REPOMAN_NET:-0}" = 1 ]; then
   cp -L /etc/resolv.conf "$ROOT/etc/resolv.conf" 2>/dev/null || true
 else
   ip link set lo up 2>/dev/null || true
   : > "$ROOT/etc/resolv.conf"
+  # Count attempts: a sink interface takes the default route, nftables
+  # counts and rejects what reaches it (reject, not drop, so connect()
+  # fails at once instead of waiting out TCP retries), and a fake
+  # nameserver gives DNS lookups somewhere to go.
+  if [ -n "${REPOMAN_NETLOG:-}" ] && command -v nft >/dev/null 2>&1 && ip link add repoman0 type dummy 2>/dev/null; then
+    ip addr add 10.255.255.1/32 dev repoman0 && ip link set repoman0 up       && ip route add default dev repoman0       && { ip -6 route add default dev repoman0 2>/dev/null || true; }       && printf 'table inet repoman {\n counter attempts {}\n chain out { type filter hook output priority 0; policy accept; oifname "repoman0" counter name "attempts" reject }\n}\n' | nft -f -       && printf 'nameserver 10.255.255.254\noptions timeout:1 attempts:1\n' > "$ROOT/etc/resolv.conf"       && NETCOUNT=1
+  fi
 fi
 if [ "${REPOMAN_CHROOT:-1}" = 1 ]; then
+  if [ "$NETCOUNT" = 1 ]; then
+    set +e
+    chroot "$ROOT" /bin/sh -c 'cd "$1" && shift && exec "$@"' sh "${REPOMAN_CWD:-/}" "$@"
+    st=$?
+    nft -j list counter inet repoman attempts > "$REPOMAN_NETLOG" 2>/dev/null || true
+    exit $st
+  fi
   exec chroot "$ROOT" /bin/sh -c 'cd "$1" && shift && exec "$@"' sh "${REPOMAN_CWD:-/}" "$@"
 fi
 cd "${REPOMAN_CWD:-/}"
@@ -167,6 +186,11 @@ impl Sandbox {
         }
         if let Some(cg) = &self.cgroup {
             cmd.env("REPOMAN_CGROUP", cg);
+        }
+        if let Some(n) = &self.netlog
+            && !self.network
+        {
+            cmd.env("REPOMAN_NETLOG", n);
         }
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -254,6 +278,7 @@ mod tests {
             cgroup: Some("/sys/fs/cgroup/x".into()),
             hostname: "repoman-build".into(),
             chroot: true,
+            netlog: None,
         };
         let cmd = sb
             .command(
@@ -295,6 +320,7 @@ mod tests {
             cgroup: None,
             hostname: "h".into(),
             chroot: true,
+            netlog: None,
         };
         let cmd = sb.command(&["true".into()], RunAs::Root, "/", &[]).unwrap();
         let args: Vec<String> = cmd.as_std().get_args().map(|a| a.to_string_lossy().to_string()).collect();

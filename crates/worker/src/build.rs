@@ -106,6 +106,7 @@ pub async fn run_build(ctx: &JobCtx, p: BuildParams<'_>) -> Result<JobResult> {
         cgroup: ctx.cgroup_path(),
         hostname: "repoman-build".into(),
         chroot: true,
+        netlog: Some(job_dir.join("netlog.json")),
     };
     sandbox(true).prepare_dirs()?;
     ctx.stage_done("provision");
@@ -213,6 +214,15 @@ pub async fn run_build(ctx: &JobCtx, p: BuildParams<'_>) -> Result<JobResult> {
     for w in &outside_writes {
         ctx.log(Fd::System, format!("wrote outside expected paths: /{w}"));
     }
+    let net_attempts = if p.allow_network {
+        0
+    } else {
+        let n = read_netlog(&job_dir.join("netlog.json"));
+        if n > 0 {
+            ctx.log(Fd::System, format!("{n} packets tried to leave the offline build (counted and rejected)"));
+        }
+        n
+    };
     ctx.stage_done("build");
 
     // ---- collect ----------------------------------------------------------
@@ -268,10 +278,28 @@ pub async fn run_build(ctx: &JobCtx, p: BuildParams<'_>) -> Result<JobResult> {
 
     Ok(JobResult::Build {
         artifacts,
-        net_attempts: 0,
+        net_attempts,
         outside_writes,
         upstream_rev,
     })
+}
+
+/// Packets the sandbox's nftables counter saw on the sink interface, from
+/// the `nft -j list counter` dump the setup script leaves behind. Zero when
+/// the file is missing (no nft, no dummy module) or unparseable.
+pub fn read_netlog(path: &Path) -> u64 {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return 0;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return 0;
+    };
+    v["nftables"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e["counter"]["packets"].as_u64())
+        .sum()
 }
 
 /// Regenerate SRCINFO from the PKGBUILD, offline, as the build user.
@@ -311,6 +339,7 @@ pub async fn run_inspect(ctx: &JobCtx, pkgbase: &str, image: &ImageRef, source_u
         cgroup: ctx.cgroup_path(),
         hostname: "repoman-inspect".into(),
         chroot: true,
+        netlog: None,
     };
     sb.prepare_dirs()?;
     ctx.stage_done("provision");
@@ -428,6 +457,17 @@ fn read_vcs_rev(builddir: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn netlog_counts_packets() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("netlog.json");
+        assert_eq!(read_netlog(&f), 0, "missing file");
+        std::fs::write(&f, r#"{"nftables":[{"metainfo":{"version":"1.1"}},{"counter":{"family":"inet","name":"attempts","table":"repoman","handle":1,"packets":7,"bytes":420}}]}"#).unwrap();
+        assert_eq!(read_netlog(&f), 7);
+        std::fs::write(&f, "garbage").unwrap();
+        assert_eq!(read_netlog(&f), 0);
+    }
+
     use super::*;
 
     #[test]

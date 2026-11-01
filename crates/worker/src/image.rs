@@ -147,6 +147,7 @@ pub async fn build_image(
         cgroup: ctx.cgroup_path(),
         hostname: "repoman-image".into(),
         chroot: false,
+        netlog: None,
     };
     boot.prepare_dirs()?;
     let mut argv: Vec<String> = vec![
@@ -180,6 +181,7 @@ pub async fn build_image(
         cgroup: ctx.cgroup_path(),
         hostname: "repoman-image".into(),
         chroot: true,
+        netlog: None,
     };
     sb.prepare_dirs()?;
     let mut script = String::from("set -e\n");
