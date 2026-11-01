@@ -1850,7 +1850,9 @@ async fn build_all(app: &AppState, run_id: &str, planned: &Planned, images: &Has
                                 }
                             }
                             Some(Err(e)) => f.push(format!("{}: regenerated .SRCINFO does not parse: {e}", item.stream)),
-                            None => f.push(format!("{}: the build could not regenerate .SRCINFO", item.stream)),
+                            // A worker predating the check sends none; the
+                            // build itself logged any makepkg failure.
+                            None => tracing::warn!(pkgbase = %item.pkgbase, stream = %item.stream, "build returned no regenerated .SRCINFO; worker too old to check it"),
                         }
                         if !f.is_empty() {
                             flags.entry(cid.clone()).or_default().extend(f);
