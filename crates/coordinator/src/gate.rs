@@ -52,6 +52,38 @@ async fn scripts(app: &AppState, pkgbase: &str, commit: &str, si: &Srcinfo, file
     out
 }
 
+/// For a package whose git repository is the project itself (a `source_url`
+/// package such as repoman), the tree is mostly source code and every commit
+/// adds files. Only the packaging files count for the gate's file-list rule:
+/// PKGBUILD, .SRCINFO, install scripts, hooks, and local `source=` entries.
+pub fn packaging_files(si: &Srcinfo, files: &[String]) -> Vec<String> {
+    let mut local: Vec<String> = Vec::new();
+    for (_, sec) in std::iter::once((&si.pkgbase, &si.base)).chain(si.packages.iter().map(|(n, s)| (n, s))) {
+        for (k, v) in &sec.fields {
+            if k == "source" || k.starts_with("source_") {
+                let name = v.split_once("::").map(|(n, _)| n).unwrap_or(v);
+                if !name.contains("://") && !name.starts_with("git+") {
+                    local.push(name.to_string());
+                }
+            }
+            if k == "install" || k == "changelog" {
+                local.push(v.clone());
+            }
+        }
+    }
+    files
+        .iter()
+        .filter(|f| {
+            f.as_str() == "PKGBUILD"
+                || f.as_str() == ".SRCINFO"
+                || f.ends_with(".install")
+                || f.ends_with(".hook")
+                || local.iter().any(|l| l == *f)
+        })
+        .cloned()
+        .collect()
+}
+
 /// Regenerate the SRCINFO at `head` in a sandbox and compare it with the
 /// committed one. `None` when no inspection could run.
 async fn srcinfo_matches(app: &AppState, pkgbase: &str, head: &str, committed: &Srcinfo, images: &HashMap<String, ImageRef>) -> Option<bool> {
@@ -103,6 +135,7 @@ pub async fn assess(
     head: &str,
     head_si: &Srcinfo,
     images: &HashMap<String, ImageRef>,
+    self_hosted: bool,
 ) -> Result<Verdict> {
     let old_si = match baseline {
         Some(b) => {
@@ -120,11 +153,15 @@ pub async fn assess(
         Some(b) => app.aur.show(pkgbase, &b.aur_commit, "PKGBUILD").await?,
         None => None,
     };
-    let new_files = app.aur.ls(pkgbase, head).await.unwrap_or_default();
-    let old_files = match baseline {
+    let mut new_files = app.aur.ls(pkgbase, head).await.unwrap_or_default();
+    let mut old_files = match baseline {
         Some(b) => app.aur.ls(pkgbase, &b.aur_commit).await.unwrap_or_default(),
         None => Vec::new(),
     };
+    if self_hosted {
+        new_files = packaging_files(head_si, &new_files);
+        old_files = packaging_files(&old_si, &old_files);
+    }
     let new_scripts = scripts(app, pkgbase, head, head_si, &new_files).await;
     let old_scripts = match baseline {
         Some(b) => scripts(app, pkgbase, &b.aur_commit, &old_si, &old_files).await,
@@ -158,4 +195,22 @@ pub async fn assess(
         srcinfo_mismatch,
         is_official: &is_official,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packaging_files_keep_only_what_makepkg_reads() {
+        let si = Srcinfo::parse(
+            "pkgbase = x\n\tpkgver = 1\n\tpkgrel = 1\n\tinstall = x.install\n\tsource = x::git+https://h/x.git\n\tsource = fix.patch\n\tsource_x86_64 = https://h/x.bin\npkgname = x\n",
+        )
+        .unwrap();
+        let files: Vec<String> = ["PKGBUILD", ".SRCINFO", "x.install", "fix.patch", "src/main.rs", "Cargo.toml", "pacman.hook"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(packaging_files(&si, &files), ["PKGBUILD", ".SRCINFO", "x.install", "fix.patch", "pacman.hook"]);
+    }
 }

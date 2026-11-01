@@ -388,7 +388,7 @@ async fn create_candidates(app: &AppState, run_id: &str, images: &HashMap<String
                     let mut review = serde_json::json!({"note": "no baseline; first review"});
                     let mut floor_risk = None;
                     match srcinfo_at(app, &p.pkgbase, &head).await {
-                        Ok(si) => match crate::gate::assess(app, &p.pkgbase, None, &head, &si, images).await {
+                        Ok(si) => match crate::gate::assess(app, &p.pkgbase, None, &head, &si, images, p.source_url.is_some()).await {
                             Ok(v) => {
                                 floor_risk = Some(v.floor_risk.as_str());
                                 review["gate"] = serde_json::to_value(&v)?;
@@ -442,7 +442,7 @@ async fn create_candidates(app: &AppState, run_id: &str, images: &HashMap<String
                     review["commits"] = serde_json::to_value(&commits)?;
                     let mut floor_risk = None;
                     match srcinfo_at(app, &p.pkgbase, &head).await {
-                        Ok(si) => match crate::gate::assess(app, &p.pkgbase, Some(b), &head, &si, images).await {
+                        Ok(si) => match crate::gate::assess(app, &p.pkgbase, Some(b), &head, &si, images, p.source_url.is_some()).await {
                             Ok(v) => {
                                 floor_risk = Some(v.floor_risk.as_str());
                                 review["gate"] = serde_json::to_value(&v)?;
