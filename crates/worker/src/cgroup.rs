@@ -43,8 +43,16 @@ impl CgroupManager {
 
     fn try_init() -> Result<PathBuf> {
         let own = own_cgroup()?;
-        let base = Path::new("/sys/fs/cgroup").join(own.trim_start_matches('/'));
-        anyhow::ensure!(base.is_dir(), "cgroup dir {} missing", base.display());
+        let own = Path::new("/sys/fs/cgroup").join(own.trim_start_matches('/'));
+        anyhow::ensure!(own.is_dir(), "cgroup dir {} missing", own.display());
+        // systemd's DelegateSubgroup=supervisor starts us already inside the
+        // leaf; the delegated base (where controllers can be enabled for job
+        // cgroups) is then our parent. Started elsewhere, we are in the base
+        // and create the leaf ourselves.
+        let (base, supervisor, already_in_leaf) = match own.file_name().and_then(|n| n.to_str()) {
+            Some("supervisor") => (own.parent().context("supervisor has no parent")?.to_path_buf(), own.clone(), true),
+            _ => (own.clone(), own.join("supervisor"), false),
+        };
         let available = std::fs::read_to_string(base.join("cgroup.controllers"))
             .context("reading cgroup.controllers")?;
         let wanted: Vec<&str> = CONTROLLERS
@@ -54,11 +62,12 @@ impl CgroupManager {
             .collect();
         anyhow::ensure!(wanted.contains(&"memory"), "memory controller not delegated to {}", base.display());
 
-        // Move ourselves out of the way.
-        let supervisor = base.join("supervisor");
-        std::fs::create_dir_all(&supervisor)?;
-        std::fs::write(supervisor.join("cgroup.procs"), std::process::id().to_string())
-            .context("moving worker into supervisor cgroup")?;
+        if !already_in_leaf {
+            // Move ourselves out of the way.
+            std::fs::create_dir_all(&supervisor)?;
+            std::fs::write(supervisor.join("cgroup.procs"), std::process::id().to_string())
+                .context("moving worker into supervisor cgroup")?;
+        }
         // Any leftover processes in the base (none expected) would block this.
         let enable = wanted.iter().map(|c| format!("+{c}")).collect::<Vec<_>>().join(" ");
         std::fs::write(base.join("cgroup.subtree_control"), enable)
