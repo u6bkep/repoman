@@ -278,15 +278,20 @@ async fn main() -> Result<()> {
             if api.json {
                 return print_json(&v);
             }
-            println!("{:<26} {:<28} {:<20} {:<14} {:<10} SUMMARY", "ID", "PKGBASE", "KIND", "STATE", "CLASS");
+            println!(
+                "{:<26} {:<28} {:<19} {:<13} {:<16} {:<11} {:<7} SUMMARY",
+                "ID", "PKGBASE", "KIND", "STATE", "CLASS", "DIFF", "RISK"
+            );
             for c in v.as_array().into_iter().flatten() {
                 println!(
-                    "{:<26} {:<28} {:<20} {:<14} {:<10} {}",
+                    "{:<26} {:<28} {:<19} {:<13} {:<16} {:<11} {:<7} {}",
                     s(&c["id"]),
                     s(&c["pkgbase"]),
                     s(&c["kind"]),
                     s(&c["state"]),
                     s(&c["class"]),
+                    s(&c["review"]["gate"]["diff_class"]),
+                    s(&c["floor_risk"]),
                     candidate_summary(c)
                 );
             }
@@ -294,7 +299,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Candidate { id } => {
             let v = api.get(&format!("/api/candidates/{id}")).await?;
-            print_json(&v)
+            api.emit(&v, || print_candidate(&v))
         }
         Cmd::Approve { id, class, note } => {
             let v = api
@@ -502,15 +507,95 @@ fn print_run(r: &Value) {
         }
 }
 
+fn print_candidate(c: &Value) {
+    let r = &c["review"];
+    println!(
+        "{} {} {} {}  (decided by {})",
+        s(&c["pkgbase"]),
+        s(&c["kind"]),
+        s(&c["state"]),
+        s(&c["id"]),
+        s(&c["decided_by"])
+    );
+    if let (Some(a), Some(b)) = (r["version_from"].as_str(), r["version_to"].as_str()) {
+        println!("version   {a} -> {b}");
+    }
+    if let Some(to) = c["aur_commit"].as_str() {
+        println!("commit    {} -> {}", r["from"].as_str().map(|x| &x[..x.len().min(10)]).unwrap_or("-"), &to[..to.len().min(10)]);
+    }
+    println!(
+        "class     {}   diff {}   floor risk {}   llm risk {}",
+        s(&c["class"]),
+        s(&r["gate"]["diff_class"]),
+        s(&c["floor_risk"]),
+        s(&c["llm_risk"])
+    );
+    if let Some(n) = c["note"].as_str() {
+        println!("note      {n}");
+    }
+    if let Some(e) = r["gate_error"].as_str() {
+        println!("gate      error: {e}");
+    }
+    if let Some(reasons) = r["gate"]["reasons"].as_array()
+        && !reasons.is_empty()
+    {
+        println!("reasons:");
+        for x in reasons {
+            println!("  [{:<6}] {:<28} {}", s(&x["risk"]), s(&x["kind"]), s(&x["detail"]));
+        }
+    }
+    if let Some(findings) = r["gate"]["findings"].as_array()
+        && !findings.is_empty()
+    {
+        println!("findings:");
+        for f in findings {
+            let where_ = match f["function"].as_str() {
+                Some(func) => format!("{}:{} {}()", s(&f["file"]), s(&f["line"]), func),
+                None => format!("{}:{}", s(&f["file"]), s(&f["line"])),
+            };
+            let note = f["note"].as_str().map(|n| format!("  ({n})")).unwrap_or_default();
+            println!("  [{:<6}] {:<22} {:<34} {}{}", s(&f["severity"]), s(&f["rule"]), where_, s(&f["excerpt"]), note);
+        }
+    }
+    if let Some(commits) = r["commits"].as_array()
+        && !commits.is_empty()
+    {
+        println!("commits:");
+        for k in commits {
+            let h = k["hash"].as_str().unwrap_or("");
+            println!("  {} {} {:<24} {}", &h[..h.len().min(10)], s(&k["date"]), truncate(&s(&k["author"]), 24), s(&k["subject"]));
+        }
+    }
+    if let Some(up) = r["upstream_rev"].as_str() {
+        println!("upstream  {up}");
+    }
+}
+
 fn candidate_summary(c: &Value) -> String {
     let r = &c["review"];
     let mut parts = Vec::new();
     if let (Some(a), Some(b)) = (r["version_from"].as_str(), r["version_to"].as_str()) {
         parts.push(format!("{a} -> {b}"));
     }
-    if let Some(ch) = r["changes"].as_array() {
+    if let Some(reasons) = r["gate"]["reasons"].as_array() {
+        let mut kinds: Vec<&str> = reasons
+            .iter()
+            .filter(|x| x["risk"].as_str() != Some("low"))
+            .filter_map(|x| x["kind"].as_str())
+            .collect();
+        kinds.dedup();
+        if !kinds.is_empty() {
+            parts.push(kinds.join(" "));
+        }
+    } else if let Some(ch) = r["changes"].as_array() {
         let keys: Vec<String> = ch.iter().map(|x| format!("{}.{}", s(&x["section"]), s(&x["key"]))).collect();
         parts.push(format!("changed: {}", keys.join(" ")));
+    }
+    if let Some(findings) = r["gate"]["findings"].as_array() {
+        let n = findings.iter().filter(|f| f["severity"].as_str() != Some("low")).count();
+        if n > 0 {
+            parts.push(format!("{n} lint finding{}", if n == 1 { "" } else { "s" }));
+        }
     }
     if let Some(n) = r["note"].as_str() {
         parts.push(n.to_string());

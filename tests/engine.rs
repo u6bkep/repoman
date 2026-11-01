@@ -245,6 +245,11 @@ impl JobRunner for FakeRunner {
                         upstream_rev: None,
                     }))
                 }
+                JobKind::Inspect { pkgbase, source_url, .. } => {
+                    let src = ctx.http.get(source_url).send().await?.error_for_status()?.bytes().await?;
+                    let srcinfo = extract_srcinfo(&src, pkgbase)?;
+                    Ok(Outcome::success_with(JobResult::Inspect { srcinfo }))
+                }
                 other => anyhow::bail!("fake runner cannot run {}", other.name()),
             }
         })
@@ -295,6 +300,12 @@ struct Harness {
 }
 
 async fn start() -> Harness {
+    start_with(false).await
+}
+
+/// `auto_approve` is off by default so the lifecycle tests drive every
+/// decision; the quarantine test turns it on.
+async fn start_with(auto_approve: bool) -> Harness {
     let tmp = tempfile::tempdir().unwrap();
     let aur = FakeAur::new(tmp.path());
     let versions = Arc::new(Mutex::new(HashMap::new()));
@@ -329,6 +340,7 @@ async fn start() -> Harness {
         }],
         aur_rpc_url: format!("{stub}/rpc/v5"),
         aur_git_url: aur.git_url(),
+        auto_approve,
         ..Default::default()
     };
     std::fs::create_dir_all(&config.data_dir).unwrap();
@@ -542,6 +554,13 @@ async fn onboarding_build_publish_update_cycle() {
     let changed: Vec<&str> = c["review"]["changes"].as_array().unwrap().iter().map(|x| x["key"].as_str().unwrap()).collect();
     assert_eq!(changed, ["pkgver", "source"]);
     assert_eq!(c["review"]["commits"].as_array().unwrap().len(), 1);
+    // The gate saw a plain version bump: routine, low risk, SRCINFO regenerated
+    // by the inspect job matched the committed one.
+    assert_eq!(c["review"]["gate"]["diff_class"], "routine", "{}", c["review"]["gate"]);
+    assert_eq!(c["floor_risk"], "low");
+    let kinds: Vec<&str> = c["review"]["gate"]["reasons"].as_array().unwrap().iter().map(|r| r["kind"].as_str().unwrap()).collect();
+    assert!(kinds.contains(&"version_bump") && !kinds.contains(&"srcinfo_mismatch"), "{kinds:?}");
+    assert!(h.specs.lock().unwrap().iter().any(|s| matches!(s.job, JobKind::Inspect { .. })), "inspect job ran");
     h.post(&format!("/api/candidates/{}/decide", c["id"].as_str().unwrap()), json!({"decision": "approve"})).await;
 
     let r5 = h.run().await;
@@ -571,4 +590,57 @@ async fn onboarding_build_publish_update_cycle() {
     assert_eq!(r7["state"], "done", "{r7}");
     assert_eq!(r7["summary"]["builds_planned"], 0);
     assert_eq!(h.repo_db().iter().find(|p| p.name == "bar").unwrap().version, "2.0-1");
+}
+
+#[tokio::test]
+async fn routine_update_auto_approves_after_quarantine() {
+    let h = start_with(true).await;
+    h.post("/api/packages", json!({"pkgbase": "foo", "streams": ["s1"], "class": "upstream-source"})).await;
+    h.publish_pkg("foo", "1.0", &["glibc"], &[]);
+    let r1 = h.run().await;
+    assert_eq!(r1["state"], "needs_input", "onboarding is never automatic: {r1}");
+    let pending = h.get("/api/candidates").await;
+    let c = &pending.as_array().unwrap()[0];
+    assert_eq!(c["kind"], "onboarding");
+    assert_eq!(c["floor_risk"], "low", "head lint of a clean PKGBUILD: {c}");
+    h.post(&format!("/api/candidates/{}/decide", c["id"].as_str().unwrap()), json!({"decision": "approve"})).await;
+    assert_eq!(h.run().await["state"], "done");
+
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    // A bump the AUR says was modified just now sits in quarantine.
+    h.publish_pkg("foo", "1.1", &["glibc"], &[]);
+    h.aur.stamps.lock().unwrap().insert("foo".into(), now);
+    let r2 = h.run().await;
+    assert_eq!(r2["state"], "needs_input", "{r2}");
+    let pending = h.get("/api/candidates").await;
+    let c = &pending.as_array().unwrap()[0];
+    assert_eq!(c["review"]["gate"]["diff_class"], "routine");
+    assert_eq!(c["floor_risk"], "low");
+    assert!(c["decided_by"].is_null());
+
+    // The head moves again, to a commit the AUR has shown for four days:
+    // the new candidate supersedes the quarantined one and goes through.
+    h.publish_pkg("foo", "1.2", &["glibc"], &[]);
+    h.aur.stamps.lock().unwrap().insert("foo".into(), now - 4 * 86_400);
+    let r3 = h.run().await;
+    assert_eq!(r3["state"], "done", "{r3}");
+    assert_eq!(r3["summary"]["builds_succeeded"], 1, "{}", r3["summary"]);
+    let published = h.get("/api/candidates?state=published").await;
+    let auto = published
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["pkgbase"] == "foo" && c["review"]["version_to"] == "1.2-1")
+        .expect("1.2 published");
+    assert_eq!(auto["decided_by"], "gate", "{auto}");
+    assert_eq!(h.repo_db().iter().find(|p| p.name == "foo").unwrap().version, "1.2-1");
+
+    // A structural change never auto-approves, however old.
+    h.publish_pkg("foo", "1.3", &["glibc", "libnotinrepos"], &[]);
+    h.aur.stamps.lock().unwrap().insert("foo".into(), now - 30 * 86_400);
+    let r4 = h.run().await;
+    assert_eq!(r4["state"], "needs_input", "{r4}");
+    let pending = h.get("/api/candidates").await;
+    let c = &pending.as_array().unwrap()[0];
+    assert_eq!(c["review"]["gate"]["diff_class"], "structural", "{}", c["review"]["gate"]);
 }

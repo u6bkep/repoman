@@ -11,6 +11,7 @@ pub mod api;
 pub mod aur;
 pub mod blobs;
 pub mod engine;
+pub mod gate;
 pub mod hub;
 pub mod keys;
 pub mod planner;

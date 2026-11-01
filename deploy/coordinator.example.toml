@@ -14,6 +14,12 @@ image_max_age_secs = 86400
 # Set after `repoman keygen`; publishing is unsigned until then.
 # signing_key = "FINGERPRINT"
 
+# Gate: routine and metadata-only updates with a low floor risk approve
+# themselves once the AUR has shown the commit for this many days.
+quarantine_days = 3
+auto_approve = true
+auto_approve_metadata = true
+
 [[workers]]
 name = "b-dtop"
 token = "replace-with-a-long-random-string"

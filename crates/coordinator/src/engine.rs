@@ -2,8 +2,11 @@
 //! progress so the UI can show where a run is, and a run that needs the
 //! operator parks in `needs_input` until `start_or_resume` is called again.
 //!
-//! M1 gate: every `update` and `onboarding` candidate waits for a manual
-//! decision; `vcs` and `dependency_rebuild` candidates are auto-approved.
+//! Gate: `update` candidates are classified and lint-checked (`crate::gate`);
+//! routine and metadata changes with a low floor risk auto-approve once they
+//! have sat on the AUR for the quarantine period and carry no negative
+//! signal. Everything else, and every `onboarding` candidate, waits for the
+//! operator. `vcs` and `dependency_rebuild` candidates are auto-approved.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -134,6 +137,12 @@ async fn execute(app: &AppState, run_id: &str) -> Result<RunEnd> {
 
         step(app, run_id, "candidates").await?;
         create_candidates(app, run_id, &images).await?;
+
+        step(app, run_id, "gate").await?;
+        let auto = auto_approve(app)?;
+        if auto > 0 {
+            tracing::info!(count = auto, "gate approved routine candidates after quarantine");
+        }
 
         let pending = app.store.candidates_in_states(&["pending"])?;
         if !pending.is_empty() {
@@ -376,6 +385,18 @@ async fn create_candidates(app: &AppState, run_id: &str, images: &HashMap<String
             None => {
                 if !open.iter().any(|c| c.kind == "onboarding" && c.aur_commit.as_deref() == Some(&head)) {
                     app.store.supersede_candidates(&p.pkgbase, &head)?;
+                    let mut review = serde_json::json!({"note": "no baseline; first review"});
+                    let mut floor_risk = None;
+                    match srcinfo_at(app, &p.pkgbase, &head).await {
+                        Ok(si) => match crate::gate::assess(app, &p.pkgbase, None, &head, &si, images).await {
+                            Ok(v) => {
+                                floor_risk = Some(v.floor_risk.as_str());
+                                review["gate"] = serde_json::to_value(&v)?;
+                            }
+                            Err(e) => review["gate_error"] = serde_json::Value::String(e.to_string()),
+                        },
+                        Err(e) => review["gate_error"] = serde_json::Value::String(e.to_string()),
+                    }
                     app.store.create_candidate(
                         run_id,
                         &NewCandidate {
@@ -384,8 +405,9 @@ async fn create_candidates(app: &AppState, run_id: &str, images: &HashMap<String
                             aur_commit: Some(&head),
                             first_seen_last_modified: Some(snap.last_modified),
                             class: p.provenance_class.as_deref(),
+                            floor_risk,
                             state: "pending",
-                            review: serde_json::json!({"note": "no baseline; first review"}),
+                            review,
                             ..Default::default()
                         },
                     )?;
@@ -418,6 +440,17 @@ async fn create_candidates(app: &AppState, run_id: &str, images: &HashMap<String
                         .unwrap_or_default();
                     let mut review = review;
                     review["commits"] = serde_json::to_value(&commits)?;
+                    let mut floor_risk = None;
+                    match srcinfo_at(app, &p.pkgbase, &head).await {
+                        Ok(si) => match crate::gate::assess(app, &p.pkgbase, Some(b), &head, &si, images).await {
+                            Ok(v) => {
+                                floor_risk = Some(v.floor_risk.as_str());
+                                review["gate"] = serde_json::to_value(&v)?;
+                            }
+                            Err(e) => review["gate_error"] = serde_json::Value::String(e.to_string()),
+                        },
+                        Err(e) => review["gate_error"] = serde_json::Value::String(e.to_string()),
+                    }
                     app.store.create_candidate(
                         run_id,
                         &NewCandidate {
@@ -425,7 +458,8 @@ async fn create_candidates(app: &AppState, run_id: &str, images: &HashMap<String
                             kind: "update",
                             aur_commit: Some(&head),
                             first_seen_last_modified: Some(snap.last_modified),
-                            class: None,
+                            class: p.provenance_class.as_deref(),
+                            floor_risk,
                             state: "pending",
                             review,
                             ..Default::default()
@@ -466,7 +500,6 @@ async fn create_candidates(app: &AppState, run_id: &str, images: &HashMap<String
     if !probe_jobs.is_empty() {
         app.hub.notify();
     }
-    let _ = images;
     for (p, head, job_id) in probe_jobs {
         let row = wait_job(app, &job_id).await?;
         let Some(JobResult::Probe { revisions }) = row.result else {
@@ -509,6 +542,58 @@ async fn create_candidates(app: &AppState, run_id: &str, images: &HashMap<String
         }
     }
     Ok(())
+}
+
+// ---- gate -----------------------------------------------------------------------
+
+/// Approve pending `update` candidates the deterministic gate is satisfied
+/// with: routine (or metadata, where allowed) class, low floor risk, past
+/// quarantine by the AUR's own LastModified clock, no negative signal.
+fn auto_approve(app: &AppState) -> Result<usize> {
+    if !app.config.auto_approve {
+        return Ok(0);
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let mut approved = 0;
+    for c in app.store.candidates_in_states(&["pending"])? {
+        if c.kind != "update" {
+            continue;
+        }
+        let Some(gate) = c.review.get("gate") else {
+            continue;
+        };
+        let class = gate["diff_class"].as_str().unwrap_or("structural");
+        let policy = app.store.get_package(&c.pkgbase)?.map(|p| p.policy).unwrap_or_default();
+        let metadata_ok = app.config.auto_approve_metadata && policy.get("auto_metadata").and_then(|v| v.as_bool()).unwrap_or(true);
+        let class_ok = class == "routine" || (class == "metadata" && metadata_ok);
+        if !class_ok || c.floor_risk.as_deref() != Some("low") {
+            continue;
+        }
+        let days = policy.get("quarantine_days").and_then(|v| v.as_u64()).unwrap_or(app.config.quarantine_days);
+        let Some(seen) = c.first_seen_last_modified else {
+            continue;
+        };
+        let age_days = (now - seen) / 86_400;
+        if now - seen < days as i64 * 86_400 {
+            tracing::debug!(pkgbase = %c.pkgbase, age_days, days, "candidate still in quarantine");
+            continue;
+        }
+        if app.store.has_negative_signal(&c.pkgbase, c.aur_commit.as_deref())? {
+            continue;
+        }
+        app.store.decide_candidate(
+            &c.id,
+            "approved",
+            "gate",
+            Some(&format!("auto-approved: {class} change, floor risk low, {age_days} days on the AUR")),
+        )?;
+        app.store.event("candidate.auto_approved", Some(&c.pkgbase), serde_json::json!({"id": c.id, "class": class}))?;
+        approved += 1;
+    }
+    Ok(approved)
 }
 
 // ---- plan -----------------------------------------------------------------------
@@ -1161,7 +1246,9 @@ async fn publish_all(app: &AppState, _run_id: &str, planned: &Planned, built: &B
             let hash = si.as_ref().map(|_| ()).and(None::<String>);
             let text = app.aur.show(&item.pkgbase, &item.aur_commit, ".SRCINFO").await.ok().flatten();
             let hash = text.as_deref().map(srcinfo_hash).or(hash);
-            app.store.set_baseline(&item.pkgbase, &item.aur_commit, hash.as_deref(), None)?;
+            let snap = app.store.get_snapshot(&item.pkgbase)?;
+            let maintainers = crate::gate::maintainer_set(snap.as_ref());
+            app.store.set_baseline(&item.pkgbase, &item.aur_commit, hash.as_deref(), None, &maintainers)?;
             app.store.set_candidate_state(&cid, "published")?;
         } else {
             let failed: Vec<&str> = outcomes.iter().filter(|(_, ok)| !ok).map(|(i, _)| i.stream.as_str()).collect();

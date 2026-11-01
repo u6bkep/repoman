@@ -155,6 +155,9 @@ package        (pkgbase PK, provenance_class, policy JSON, kind, added_at)
                 --   quarantine_days, auto_metadata
                 -- source_url: git repository for packages not on the AUR, with
                 --   an optional makepkg-style #branch=<name> fragment
+                -- coordinator config: quarantine_days (3), auto_approve (true),
+                --   auto_approve_metadata (true); policy.quarantine_days and
+                --   policy.auto_metadata override per package
 package_stream (pkgbase, stream, wanted BOOL, required BOOL)
 baseline       (pkgbase PK, aur_commit, srcinfo_hash, published_at, note)
 aur_snapshot   (pkgbase, fetched_at, last_modified, maintainer, submitter,

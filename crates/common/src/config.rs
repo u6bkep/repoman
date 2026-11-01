@@ -49,6 +49,18 @@ pub struct CoordinatorConfig {
     /// Unsigned publishing is refused when unset.
     #[serde(default)]
     pub signing_key: Option<String>,
+    /// Days a routine or metadata change must have been visible on the AUR
+    /// (by the server's LastModified as first observed) before the gate
+    /// approves it without an operator. policy.quarantine_days overrides.
+    #[serde(default = "default_quarantine_days")]
+    pub quarantine_days: u64,
+    /// Let the gate approve low-risk routine candidates after quarantine.
+    #[serde(default = "default_true")]
+    pub auto_approve: bool,
+    /// Also approve metadata-only changes; policy.auto_metadata = false
+    /// keeps a package manual.
+    #[serde(default = "default_true")]
+    pub auto_approve_metadata: bool,
 }
 
 impl Default for CoordinatorConfig {
@@ -68,6 +80,9 @@ impl Default for CoordinatorConfig {
             image_max_age_secs: default_image_max_age(),
             makepkg_conf_extra: String::new(),
             signing_key: None,
+            quarantine_days: default_quarantine_days(),
+            auto_approve: true,
+            auto_approve_metadata: true,
         }
     }
 }
@@ -131,6 +146,14 @@ fn default_listen() -> String {
 
 fn default_orphan_grace() -> u64 {
     120
+}
+
+fn default_quarantine_days() -> u64 {
+    3
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_aur_rpc() -> String {

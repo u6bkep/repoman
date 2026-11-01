@@ -1429,6 +1429,7 @@ dependencies = [
  "hex",
  "repoman-alpm",
  "repoman-common",
+ "repoman-gate",
  "repoman-store",
  "reqwest",
  "serde",

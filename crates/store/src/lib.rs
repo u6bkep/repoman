@@ -18,6 +18,7 @@ pub mod artifacts;
 pub mod images;
 pub mod packages;
 pub mod runs;
+pub mod signals;
 
 pub use artifacts::{ArtifactRow, PublicationRow};
 pub use images::ImageRow;

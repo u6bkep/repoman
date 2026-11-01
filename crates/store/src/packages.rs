@@ -33,6 +33,8 @@ pub struct BaselineRow {
     pub srcinfo_hash: Option<String>,
     pub published_at: String,
     pub note: Option<String>,
+    /// Maintainer and co-maintainers when this baseline was published.
+    pub maintainers: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -250,15 +252,17 @@ impl Store {
     pub fn get_baseline(&self, pkgbase: &str) -> Result<Option<BaselineRow>> {
         self.with(|c| {
             Ok(c.query_row(
-                "SELECT pkgbase, aur_commit, srcinfo_hash, published_at, note FROM baseline WHERE pkgbase = ?1",
+                "SELECT pkgbase, aur_commit, srcinfo_hash, published_at, note, maintainers FROM baseline WHERE pkgbase = ?1",
                 params![pkgbase],
                 |r| {
+                    let maintainers: String = r.get(5)?;
                     Ok(BaselineRow {
                         pkgbase: r.get(0)?,
                         aur_commit: r.get(1)?,
                         srcinfo_hash: r.get(2)?,
                         published_at: r.get(3)?,
                         note: r.get(4)?,
+                        maintainers: serde_json::from_str(&maintainers).unwrap_or_default(),
                     })
                 },
             )
@@ -266,15 +270,15 @@ impl Store {
         })
     }
 
-    pub fn set_baseline(&self, pkgbase: &str, aur_commit: &str, srcinfo_hash: Option<&str>, note: Option<&str>) -> Result<()> {
+    pub fn set_baseline(&self, pkgbase: &str, aur_commit: &str, srcinfo_hash: Option<&str>, note: Option<&str>, maintainers: &[String]) -> Result<()> {
         self.with(|c| {
             c.execute(
-                "INSERT INTO baseline (pkgbase, aur_commit, srcinfo_hash, published_at, note)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
+                "INSERT INTO baseline (pkgbase, aur_commit, srcinfo_hash, published_at, note, maintainers)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(pkgbase) DO UPDATE SET aur_commit = excluded.aur_commit,
                     srcinfo_hash = excluded.srcinfo_hash, published_at = excluded.published_at,
-                    note = excluded.note",
-                params![pkgbase, aur_commit, srcinfo_hash, clock::now(), note],
+                    note = excluded.note, maintainers = excluded.maintainers",
+                params![pkgbase, aur_commit, srcinfo_hash, clock::now(), note, serde_json::to_string(maintainers).unwrap_or_else(|_| "[]".into())],
             )?;
             Ok(())
         })
@@ -382,10 +386,11 @@ mod tests {
         assert_eq!(s.members_of_stream("stable").unwrap().len(), 1);
 
         assert!(s.get_baseline("yay").unwrap().is_none());
-        s.set_baseline("yay", "abc", Some("h1"), Some("onboarded")).unwrap();
+        s.set_baseline("yay", "abc", Some("h1"), Some("onboarded"), &["alice".to_string()]).unwrap();
         let b = s.get_baseline("yay").unwrap().unwrap();
         assert_eq!(b.aur_commit, "abc");
-        s.set_baseline("yay", "def", None, None).unwrap();
+        assert_eq!(b.maintainers, ["alice"]);
+        s.set_baseline("yay", "def", None, None, &[]).unwrap();
         assert_eq!(s.get_baseline("yay").unwrap().unwrap().aur_commit, "def");
 
         s.set_package_policy("yay", &serde_json::json!({"pgp": "skip"})).unwrap();

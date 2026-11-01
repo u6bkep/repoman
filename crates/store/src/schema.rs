@@ -187,6 +187,8 @@ pub const MIGRATIONS: &[&str] = &[
      CREATE INDEX publication_artifact_idx ON publication(artifact_sha);",
     // 3: packages may come from a git repository other than the AUR
     "ALTER TABLE package ADD COLUMN source_url TEXT;",
+    // 4: the maintainer set at publication, for the gate's maintainer-change signal
+    "ALTER TABLE baseline ADD COLUMN maintainers TEXT NOT NULL DEFAULT '[]';",
 ];
 
 pub fn migrate(conn: &Connection) -> Result<()> {
