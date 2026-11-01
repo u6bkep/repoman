@@ -175,7 +175,8 @@ async function viewCandidate(id) {
   const r = c.review || {};
   const gate = r.gate;
   const llm = r.llm;
-  const open = ["pending", "deferred"].includes(c.state);
+  const open = ["pending", "deferred", "publish_review", "failed"].includes(c.state);
+  const publishFlags = (r.publish_flags || []).map((f) => `<li>${pill("high")} ${esc(f)}</li>`).join("");
   const diffP = r.from || r.to || c.aur_commit ? api(`/api/candidates/${id}/diff`).catch((e) => ({ error: e.message })) : Promise.resolve(null);
   const jobsP = api(`/api/jobs?candidate=${id}`).catch(() => []);
   const [diff, jobs] = await Promise.all([diffP, jobsP]);
@@ -224,6 +225,7 @@ async function viewCandidate(id) {
       ${r.corroboration ? `<dt>upstream</dt><dd>${pill(r.corroboration.result === "confirmed" ? "low" : r.corroboration.result === "mismatch" ? "high" : "")}${esc(r.corroboration.result)} <span class="muted">${esc(r.corroboration.detail)}</span></dd>` : ""}
       ${r.note ? `<dt>note</dt><dd>${esc(r.note)}</dd>` : ""}
     </dl></div>
+    ${publishFlags ? `<h2>Built artifacts raised flags</h2><div class="panel"><p class="muted">The build succeeded but the artifacts differ from what the stream serves in ways that matter on the installing system. Approve to rebuild and publish; reject to drop this commit.</p><ul class="findings">${publishFlags}</ul></div>` : ""}
     ${reasons ? `<h2>Reasons</h2><ul class="findings">${reasons}</ul>` : ""}
     ${findings ? `<h2>Lint findings</h2><ul class="findings">${findings}</ul>` : ""}
     ${llmHtml}

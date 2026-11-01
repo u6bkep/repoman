@@ -418,7 +418,11 @@ Computed deterministically from:
   raises the floor to medium; unknown hosts are `unconfirmed` and neutral.
 - Post-build inputs (step 11): artifact diff against the previous
   publication showing new privileged surface or setuid bits; writes outside
-  expected paths; network attempts (M2).
+  expected paths; network attempts (M2). Implemented as `engine::artifact_flags`
+  plus the worker's outside-write and network-attempt reports: a flagged
+  candidate parks in `publish_review` with `review.publish_flags`; approving
+  it sets `publish_cleared` and the next run rebuilds and publishes. Setuid
+  bits still need modes from the worker (open).
 
 ### 10.4 Quarantine
 

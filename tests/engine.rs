@@ -96,6 +96,22 @@ impl FakeAur {
         *e += 60;
     }
 
+    /// Publish a version whose SRCINFO references an install script that is
+    /// also committed, for the artifact-diff tests.
+    fn publish_with_install(&self, pkgbase: &str, pkgver: &str, depends: &[&str]) {
+        let wd = self.work.join(pkgbase);
+        assert!(wd.exists(), "publish {pkgbase} first");
+        self.publish_inner(pkgbase, pkgver, depends, &[], "master");
+        let si = std::fs::read_to_string(wd.join(".SRCINFO")).unwrap().replace("\tpkgrel = 1\n", &format!("\tpkgrel = 1\n\tinstall = {pkgbase}.install\n"));
+        std::fs::write(wd.join(".SRCINFO"), si).unwrap();
+        std::fs::write(wd.join(format!("{pkgbase}.install")), "post_install() { :; }\n").unwrap();
+        self.git(&wd, &["add", "-A"]);
+        self.git(&wd, &["commit", "-q", "-m", &format!("{pkgbase} {pkgver} install script")]);
+        self.git(&wd, &["push", "-q", "origin", "master"]);
+        let mut st = self.stamps.lock().unwrap();
+        *st.entry(pkgbase.to_string()).or_insert(1_700_000_000) += 60;
+    }
+
     /// Like publish, but commits on `branch` (created from master if new)
     /// and pushes only that branch, leaving master where it was.
     fn publish_on_branch(&self, pkgbase: &str, branch: &str, pkgver: &str, depends: &[&str], makedepends: &[&str]) {
@@ -233,7 +249,7 @@ impl JobRunner for FakeRunner {
                             depends,
                             provides: vec![],
                             paths: vec![format!("usr/bin/{name}")],
-                            has_install_script: false,
+                            has_install_script: si.base.first("install").is_some(),
                             buildinfo: json!({}),
                         });
                     }
@@ -734,4 +750,42 @@ async fn structural_update_is_sent_to_the_reviewer() {
     assert!(prompt.contains("libnotinrepos"), "prompt shows the diff");
     assert!(prompt.contains("new_aur_dependency"), "prompt shows the gate reasons");
     assert!(prompt.contains("version: 1.0-1 -> 1.1-1"), "{prompt}");
+}
+
+#[tokio::test]
+async fn artifacts_with_new_install_script_wait_in_publish_review() {
+    let h = start_with(|_| {}).await;
+    h.post("/api/packages", json!({"pkgbase": "foo", "streams": ["s1"], "class": "upstream-source"})).await;
+    h.publish_pkg("foo", "1.0", &["glibc"], &[]);
+    assert_eq!(h.run().await["state"], "needs_input");
+    let c = h.get("/api/candidates").await.as_array().unwrap()[0].clone();
+    h.post(&format!("/api/candidates/{}/decide", c["id"].as_str().unwrap()), json!({"decision": "approve"})).await;
+    assert_eq!(h.run().await["state"], "done");
+
+    // 1.1 gains an install script. The gate makes it structural (operator
+    // approves the PKGBUILD), the build succeeds, and the artifact diff then
+    // parks it: the previous publication had no install script.
+    h.aur.publish_with_install("foo", "1.1", &["glibc"]);
+    h.versions.lock().unwrap().insert("foo".into(), "1.1-1".into());
+    let r = h.run().await;
+    assert_eq!(r["state"], "needs_input", "{r}");
+    let c = h.get("/api/candidates").await.as_array().unwrap()[0].clone();
+    assert_eq!(c["review"]["gate"]["diff_class"], "structural");
+    h.post(&format!("/api/candidates/{}/decide", c["id"].as_str().unwrap()), json!({"decision": "approve"})).await;
+    let r2 = h.run().await;
+    assert_eq!(r2["state"], "needs_input", "{r2}");
+    let held = h.get("/api/candidates?state=publish_review").await;
+    let held = held.as_array().unwrap();
+    assert_eq!(held.len(), 1, "{held:?}");
+    let flags = held[0]["review"]["publish_flags"].as_array().unwrap();
+    assert!(flags[0].as_str().unwrap().contains("install script appeared"), "{flags:?}");
+    assert_eq!(h.repo_db().iter().find(|p| p.name == "foo").unwrap().version, "1.0-1", "not published yet");
+    // It shows in the default queue, and approving it clears the way.
+    assert!(h.get("/api/candidates").await.as_array().unwrap().iter().any(|c| c["state"] == "publish_review"));
+    h.post(&format!("/api/candidates/{}/decide", held[0]["id"].as_str().unwrap()), json!({"decision": "approve", "note": "unit file is expected"})).await;
+    let r3 = h.run().await;
+    assert_eq!(r3["state"], "done", "{r3}");
+    assert_eq!(h.repo_db().iter().find(|p| p.name == "foo").unwrap().version, "1.1-1");
+    let published = h.get("/api/candidates?state=published").await;
+    assert!(published.as_array().unwrap().iter().any(|c| c["id"] == held[0]["id"]));
 }

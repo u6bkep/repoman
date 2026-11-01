@@ -430,7 +430,8 @@ async fn list_candidates(State(st): State<AppState>, Query(q): Query<CandidatesQ
     let states: Vec<&str> = match q.state.as_deref() {
         Some("all") => repoman_store::runs::OPEN_STATES.iter().copied().chain(["published", "rejected", "superseded"]).collect(),
         Some(s) => vec![s],
-        None => vec!["pending"],
+        // Both states wait on the operator.
+        None => vec!["pending", "publish_review"],
     };
     Ok(axum::Json(st.store.candidates_in_states(&states).map_err(internal)?))
 }
@@ -539,8 +540,15 @@ pub struct Decision {
 
 async fn decide_candidate(State(st): State<AppState>, Path(id): Path<String>, axum::Json(d): axum::Json<Decision>) -> Result<axum::Json<CandidateRow>, ApiError> {
     let c = st.store.get_candidate(&id).map_err(internal)?.ok_or(not_found("no such candidate"))?;
-    if !matches!(c.state.as_str(), "pending" | "deferred" | "failed") {
+    if !matches!(c.state.as_str(), "pending" | "deferred" | "failed" | "publish_review") {
         return Err((StatusCode::CONFLICT, format!("candidate is {}", c.state)));
+    }
+    if c.state == "publish_review" && d.decision == "approve" {
+        // The artifacts were seen and accepted: the next run rebuilds and
+        // publishes without stopping on the same flags.
+        let mut review = c.review.clone();
+        review["publish_cleared"] = serde_json::Value::Bool(true);
+        st.store.set_candidate_review(&id, None, None, None, &review).map_err(internal)?;
     }
     let state = match d.decision.as_str() {
         "approve" => "approved",

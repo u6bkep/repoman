@@ -18,6 +18,8 @@ use repoman_alpm::srcinfo::Srcinfo;
 use repoman_common::clock;
 use repoman_common::config::StreamConfig;
 use repoman_common::proto::{ImageRef, JobKind, JobResult, JobState};
+use repoman_common::proto::ArtifactInfo;
+use repoman_store::artifacts::ArtifactRow;
 use repoman_store::{CandidateRow, NewCandidate, PackageRow, SnapshotRow};
 use sha2::{Digest, Sha256};
 
@@ -165,7 +167,7 @@ async fn execute(app: &AppState, run_id: &str) -> Result<RunEnd> {
         step(app, run_id, "publish").await?;
         let scope = PublishScope {
             only: None,
-            exclude: built.published_candidates.clone(),
+            exclude: built.published_candidates.union(&built.held_candidates).cloned().collect(),
         };
         let published = built.published_count + publish_all(app, run_id, &planned, &built.results, &scope).await?;
 
@@ -175,6 +177,7 @@ async fn execute(app: &AppState, run_id: &str) -> Result<RunEnd> {
             "builds_succeeded": built.results.values().filter(|r| r.is_ok()).count(),
             "builds_failed": built.results.values().filter(|r| r.is_err()).count(),
             "published": published,
+            "held_for_review": built.held_candidates.len(),
             "skipped": planned.skipped,
         });
         break;
@@ -182,6 +185,12 @@ async fn execute(app: &AppState, run_id: &str) -> Result<RunEnd> {
 
     step(app, run_id, "cleanup").await?;
     let _ = app.publisher.remove_staging(run_id);
+    let held = app.store.candidates_in_states(&["publish_review"])?;
+    if !held.is_empty() {
+        // Built artifacts raised flags; the operator decides, then the next
+        // run rebuilds and publishes the cleared ones.
+        return Ok(RunEnd::NeedsInput(held.len()));
+    }
     Ok(RunEnd::Done(summary))
 }
 
@@ -993,7 +1002,77 @@ pub struct BuildOutcome {
     pub results: BTreeMap<BuildKey, Result<Vec<String>, String>>,
     /// Candidates already published incrementally during the build phase.
     pub published_candidates: HashSet<String>,
+    /// Candidates whose builds succeeded but whose artifacts raised flags;
+    /// parked in `publish_review` for the operator, not published.
+    pub held_candidates: HashSet<String>,
     pub published_count: usize,
+}
+
+/// Paths whose appearance in a package is a new privileged surface on the
+/// installing system: anything executed by root or at boot, auth policy,
+/// loader configuration, package manager hooks.
+const PRIVILEGED_PREFIXES: &[&str] = &[
+    "etc/sudoers",
+    "etc/polkit-1/",
+    "usr/share/polkit-1/rules.d/",
+    "usr/lib/systemd/system/",
+    "etc/systemd/system/",
+    "usr/lib/systemd/system-generators/",
+    "usr/lib/systemd/user/",
+    "usr/share/libalpm/hooks/",
+    "etc/pacman.d/hooks/",
+    "etc/profile.d/",
+    "etc/ld.so.conf.d/",
+    "etc/ld.so.preload",
+    "etc/cron",
+    "usr/lib/sysusers.d/",
+    "usr/lib/tmpfiles.d/",
+    "etc/xdg/autostart/",
+    "usr/share/dbus-1/system-services/",
+    "etc/dbus-1/system.d/",
+    "usr/lib/security/",
+    "etc/pam.d/",
+    "usr/lib/modules-load.d/",
+    "etc/modules-load.d/",
+    "usr/lib/udev/rules.d/",
+    "etc/udev/rules.d/",
+    "usr/lib/NetworkManager/dispatcher.d/",
+    "etc/NetworkManager/dispatcher.d/",
+];
+
+fn is_privileged(path: &str) -> bool {
+    let p = path.trim_start_matches('/');
+    PRIVILEGED_PREFIXES.iter().any(|pre| p.starts_with(pre))
+}
+
+/// Post-build flags for one artifact against what the stream currently
+/// serves for the same pkgname. Nothing to compare against on a first
+/// publication: the PKGBUILD review covered it.
+pub fn artifact_flags(prev: Option<&ArtifactRow>, a: &ArtifactInfo) -> Vec<String> {
+    let Some(prev) = prev else {
+        return Vec::new();
+    };
+    let mut flags = Vec::new();
+    if a.has_install_script && !prev.has_install {
+        flags.push(format!("{}: install script appeared", a.pkgname));
+    }
+    let before: HashSet<&str> = prev.paths.iter().map(String::as_str).collect();
+    let mut added: Vec<&str> = a
+        .paths
+        .iter()
+        .map(String::as_str)
+        .filter(|p| !before.contains(p) && is_privileged(p))
+        .collect();
+    added.sort();
+    if !added.is_empty() {
+        let shown: Vec<&str> = added.iter().take(8).copied().collect();
+        flags.push(format!(
+            "{}: new privileged paths {shown:?}{}",
+            a.pkgname,
+            if added.len() > 8 { format!(" (+{} more)", added.len() - 8) } else { String::new() }
+        ));
+    }
+    flags
 }
 
 /// Which candidates a publish pass covers.
@@ -1015,6 +1094,8 @@ impl PublishScope {
 async fn build_all(app: &AppState, run_id: &str, planned: &Planned, images: &HashMap<String, ImageRef>) -> Result<BuildOutcome> {
     let mut results: BTreeMap<BuildKey, Result<Vec<String>, String>> = BTreeMap::new();
     let mut published_candidates: HashSet<String> = HashSet::new();
+    let mut held_candidates: HashSet<String> = HashSet::new();
+    let mut flags: HashMap<String, Vec<String>> = HashMap::new(); // candidate -> publish flags
     let mut published_count = 0usize;
     let mut in_flight: HashMap<String, (BuildKey, u32)> = HashMap::new(); // job id -> (key, attempt)
     let mut remaining: Vec<BuildItem> = planned.per_stream.values().flatten().cloned().collect();
@@ -1022,6 +1103,7 @@ async fn build_all(app: &AppState, run_id: &str, planned: &Planned, images: &Has
         return Ok(BuildOutcome {
             results,
             published_candidates,
+            held_candidates,
             published_count,
         });
     }
@@ -1095,8 +1177,24 @@ async fn build_all(app: &AppState, run_id: &str, planned: &Planned, images: &Has
             let row = app.store.get_job(&job_id)?.context("job vanished")?;
             let item = planned.per_stream[&key.0].iter().find(|b| b.pkgbase == key.1).unwrap();
             match (row.state, row.result) {
-                (JobState::Done, Some(JobResult::Build { artifacts, outside_writes, upstream_rev, .. })) => {
+                (JobState::Done, Some(JobResult::Build { artifacts, outside_writes, upstream_rev, net_attempts })) => {
                     let mut shas = Vec::new();
+                    if let Some(cid) = &item.candidate_id {
+                        let mut f = Vec::new();
+                        for a in &artifacts {
+                            let prev = app.store.live_artifact(&item.stream, &a.pkgname)?;
+                            f.extend(artifact_flags(prev.as_ref(), a).into_iter().map(|x| format!("{}: {x}", item.stream)));
+                        }
+                        if !outside_writes.is_empty() {
+                            f.push(format!("{}: build wrote outside the build tree: {:?}", item.stream, outside_writes.iter().take(6).collect::<Vec<_>>()));
+                        }
+                        if net_attempts > 0 && !item.allow_network {
+                            f.push(format!("{}: {net_attempts} network attempts during the offline build", item.stream));
+                        }
+                        if !f.is_empty() {
+                            flags.entry(cid.clone()).or_default().extend(f);
+                        }
+                    }
                     for a in &artifacts {
                         app.store
                             .insert_artifact(a, Some(&job_id), &item.stream, Some(&item.aur_commit), upstream_rev.as_deref())?;
@@ -1124,6 +1222,28 @@ async fn build_all(app: &AppState, run_id: &str, planned: &Planned, images: &Has
                             .flatten()
                             .filter(|b| b.candidate_id.as_deref() == Some(cid))
                             .all(|b| matches!(results.get(&(b.stream.clone(), b.pkgbase.clone())), Some(Ok(_))));
+                        if complete
+                            && let Some(f) = flags.get(cid)
+                            && !f.is_empty()
+                        {
+                            // A human looks at the built artifacts before they
+                            // reach the repo, unless they already did for this
+                            // candidate and approved from publish_review.
+                            let cleared = app
+                                .store
+                                .get_candidate(cid)?
+                                .is_some_and(|c| c.review["publish_cleared"].as_bool() == Some(true));
+                            if !cleared {
+                                let mut review = app.store.get_candidate(cid)?.map(|c| c.review).unwrap_or_default();
+                                review["publish_flags"] = serde_json::to_value(f)?;
+                                app.store.set_candidate_review(cid, None, None, None, &review)?;
+                                app.store.decide_candidate(cid, "publish_review", "engine", Some("built; artifact flags need a decision"))?;
+                                app.store.event("candidate.publish_review", Some(&item.pkgbase), serde_json::json!({"id": cid, "flags": f}))?;
+                                tracing::warn!(pkgbase = %item.pkgbase, flags = ?f, "holding publication for review");
+                                held_candidates.insert(cid.clone());
+                                continue;
+                            }
+                        }
                         if complete {
                             let scope = PublishScope {
                                 only: Some(HashSet::from([cid.clone()])),
@@ -1162,6 +1282,7 @@ async fn build_all(app: &AppState, run_id: &str, planned: &Planned, images: &Has
     Ok(BuildOutcome {
         results,
         published_candidates,
+        held_candidates,
         published_count,
     })
 }
@@ -1318,4 +1439,61 @@ async fn publish_all(app: &AppState, _run_id: &str, planned: &Planned, built: &B
         }
     }
     Ok(published)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(pkgname: &str, paths: &[&str], install: bool) -> ArtifactInfo {
+        ArtifactInfo {
+            sha256: "x".into(),
+            filename: format!("{pkgname}-1-1-x86_64.pkg.tar.zst"),
+            size: 1,
+            pkgname: pkgname.into(),
+            pkgbase: pkgname.into(),
+            pkgver: "1-1".into(),
+            arch: "x86_64".into(),
+            depends: vec![],
+            provides: vec![],
+            paths: paths.iter().map(|p| p.to_string()).collect(),
+            has_install_script: install,
+            buildinfo: serde_json::json!({}),
+        }
+    }
+
+    fn prev(paths: &[&str], install: bool) -> ArtifactRow {
+        ArtifactRow {
+            sha256: "p".into(),
+            job_id: None,
+            pkgbase: "foo".into(),
+            pkgname: "foo".into(),
+            pkgver: "0-1".into(),
+            arch: "x86_64".into(),
+            stream: "s1".into(),
+            filename: "foo-0-1-x86_64.pkg.tar.zst".into(),
+            size: 1,
+            sig_sha256: None,
+            aur_commit: None,
+            upstream_rev: None,
+            depends: vec![],
+            provides: vec![],
+            paths: paths.iter().map(|p| p.to_string()).collect(),
+            has_install: install,
+            buildinfo: serde_json::json!({}),
+            needed: None,
+            created_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn artifact_flags_catch_new_privileged_surface() {
+        let p = prev(&["usr/bin/foo", "usr/lib/systemd/system/foo.service"], false);
+        assert!(artifact_flags(None, &info("foo", &["etc/sudoers.d/foo"], true)).is_empty(), "first publication");
+        assert!(artifact_flags(Some(&p), &info("foo", &["usr/bin/foo", "usr/lib/systemd/system/foo.service", "usr/share/doc/x"], false)).is_empty());
+        let f = artifact_flags(Some(&p), &info("foo", &["usr/bin/foo", "etc/sudoers.d/foo", "usr/share/libalpm/hooks/foo.hook"], true));
+        assert_eq!(f.len(), 2, "{f:?}");
+        assert!(f[0].contains("install script appeared"));
+        assert!(f[1].contains("etc/sudoers.d/foo") && f[1].contains("foo.hook"));
+    }
 }
