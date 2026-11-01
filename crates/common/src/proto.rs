@@ -228,6 +228,9 @@ pub struct ArtifactInfo {
     pub paths: Vec<String>,
     #[serde(default)]
     pub has_install_script: bool,
+    /// Payload files with the setuid or setgid bit.
+    #[serde(default)]
+    pub setuid_paths: Vec<String>,
     /// `.BUILDINFO` key/values as JSON.
     #[serde(default)]
     pub buildinfo: serde_json::Value,

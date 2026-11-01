@@ -26,6 +26,7 @@ pub struct ArtifactRow {
     pub provides: Vec<String>,
     pub paths: Vec<String>,
     pub has_install: bool,
+    pub setuid_paths: Vec<String>,
     pub buildinfo: serde_json::Value,
     pub needed: Option<serde_json::Value>,
     pub created_at: String,
@@ -49,7 +50,7 @@ pub struct ArtifactPublication {
 }
 
 const COLS: &str = "sha256, job_id, pkgbase, pkgname, pkgver, arch, stream, filename, size, sig_sha256, \
-                    aur_commit, upstream_rev, depends, provides, paths, has_install, buildinfo, needed, created_at";
+                    aur_commit, upstream_rev, depends, provides, paths, has_install, buildinfo, needed, created_at, setuid_paths";
 
 fn row_to_artifact(r: &rusqlite::Row) -> rusqlite::Result<ArtifactRow> {
     let json = |i: usize| -> rusqlite::Result<serde_json::Value> {
@@ -81,6 +82,7 @@ fn row_to_artifact(r: &rusqlite::Row) -> rusqlite::Result<ArtifactRow> {
         buildinfo: json(16)?,
         needed: if needed.is_null() { None } else { Some(needed) },
         created_at: r.get(18)?,
+        setuid_paths: strs(19)?,
     })
 }
 
@@ -106,8 +108,8 @@ impl Store {
         self.with(|c| {
             c.execute(
                 "INSERT INTO artifact (sha256, job_id, pkgbase, pkgname, pkgver, arch, stream, filename, size,
-                                       aur_commit, upstream_rev, depends, provides, paths, has_install, buildinfo, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                                       aur_commit, upstream_rev, depends, provides, paths, has_install, buildinfo, created_at, setuid_paths)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
                  ON CONFLICT(sha256) DO UPDATE SET job_id = excluded.job_id",
                 params![
                     info.sha256,
@@ -127,6 +129,7 @@ impl Store {
                     info.has_install_script,
                     info.buildinfo.to_string(),
                     clock::now(),
+                    serde_json::to_string(&info.setuid_paths)?,
                 ],
             )?;
             Ok(())
@@ -386,6 +389,7 @@ mod tests {
             provides: vec![],
             paths: vec!["usr/bin/x".into()],
             has_install_script: false,
+            setuid_paths: vec![],
             buildinfo: serde_json::json!({}),
         }
     }

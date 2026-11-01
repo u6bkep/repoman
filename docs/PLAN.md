@@ -421,8 +421,9 @@ Computed deterministically from:
   expected paths; network attempts (M2). Implemented as `engine::artifact_flags`
   plus the worker's outside-write and network-attempt reports: a flagged
   candidate parks in `publish_review` with `review.publish_flags`; approving
-  it sets `publish_cleared` and the next run rebuilds and publishes. Setuid
-  bits still need modes from the worker (open).
+  it sets `publish_cleared` and the next run rebuilds and publishes. The
+  worker reports setuid/setgid payload files; new ones are flagged even on a
+  first publication.
 
 ### 10.4 Quarantine
 

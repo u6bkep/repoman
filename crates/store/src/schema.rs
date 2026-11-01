@@ -189,6 +189,8 @@ pub const MIGRATIONS: &[&str] = &[
     "ALTER TABLE package ADD COLUMN source_url TEXT;",
     // 4: the maintainer set at publication, for the gate's maintainer-change signal
     "ALTER TABLE baseline ADD COLUMN maintainers TEXT NOT NULL DEFAULT '[]';",
+    // 5: setuid/setgid payload files, for the artifact diff
+    "ALTER TABLE artifact ADD COLUMN setuid_paths TEXT NOT NULL DEFAULT '[]';",
 ];
 
 pub fn migrate(conn: &Connection) -> Result<()> {

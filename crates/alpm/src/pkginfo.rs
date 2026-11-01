@@ -122,6 +122,8 @@ pub struct PackageMeta {
     pub buildinfo: Option<KeyValues>,
     pub install_script: Option<String>,
     pub paths: Vec<String>,
+    /// Payload files carrying the setuid or setgid bit.
+    pub setuid_paths: Vec<String>,
 }
 
 pub fn read_package_meta(bytes: &[u8]) -> Result<PackageMeta> {
@@ -156,7 +158,12 @@ pub fn read_package_meta(bytes: &[u8]) -> Result<PackageMeta> {
                 meta.install_script = Some(s);
             }
             ".MTREE" | ".CHANGELOG" => {}
-            p if !p.starts_with('.') => meta.paths.push(p.to_string()),
+            p if !p.starts_with('.') => {
+                if entry.header().entry_type().is_file() && entry.header().mode().unwrap_or(0) & 0o6000 != 0 {
+                    meta.setuid_paths.push(p.to_string());
+                }
+                meta.paths.push(p.to_string());
+            }
             _ => {}
         }
     }

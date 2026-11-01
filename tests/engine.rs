@@ -250,6 +250,7 @@ impl JobRunner for FakeRunner {
                             provides: vec![],
                             paths: vec![format!("usr/bin/{name}")],
                             has_install_script: si.base.first("install").is_some(),
+                            setuid_paths: vec![],
                             buildinfo: json!({}),
                         });
                     }

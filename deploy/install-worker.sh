@@ -25,6 +25,8 @@ src_config=${1:-$owner_home/.config/repoman/worker.toml}
 
 if pacman -Q repoman-git >/dev/null 2>&1; then
     echo "using packaged repoman $(pacman -Q repoman-git | cut -d' ' -f2)"
+    # Leftovers from an earlier fallback install would shadow the package.
+    rm -f /etc/systemd/system/repoman-worker.service /usr/local/bin/repoman
 else
     bin=$repo_dir/target/release/repoman
     [[ -x $bin ]] || { echo "neither repoman-git nor a release build is available" >&2; exit 1; }

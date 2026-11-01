@@ -1049,10 +1049,16 @@ fn is_privileged(path: &str) -> bool {
 /// serves for the same pkgname. Nothing to compare against on a first
 /// publication: the PKGBUILD review covered it.
 pub fn artifact_flags(prev: Option<&ArtifactRow>, a: &ArtifactInfo) -> Vec<String> {
-    let Some(prev) = prev else {
-        return Vec::new();
-    };
     let mut flags = Vec::new();
+    // setuid/setgid is rare enough to surface even on a first publication.
+    let prev_setuid: HashSet<&str> = prev.map(|p| p.setuid_paths.iter().map(String::as_str).collect()).unwrap_or_default();
+    let new_setuid: Vec<&str> = a.setuid_paths.iter().map(String::as_str).filter(|p| !prev_setuid.contains(p)).collect();
+    if !new_setuid.is_empty() {
+        flags.push(format!("{}: setuid/setgid files {new_setuid:?}", a.pkgname));
+    }
+    let Some(prev) = prev else {
+        return flags;
+    };
     if a.has_install_script && !prev.has_install {
         flags.push(format!("{}: install script appeared", a.pkgname));
     }
@@ -1458,6 +1464,7 @@ mod tests {
             provides: vec![],
             paths: paths.iter().map(|p| p.to_string()).collect(),
             has_install_script: install,
+            setuid_paths: vec![],
             buildinfo: serde_json::json!({}),
         }
     }
@@ -1480,6 +1487,7 @@ mod tests {
             provides: vec![],
             paths: paths.iter().map(|p| p.to_string()).collect(),
             has_install: install,
+            setuid_paths: vec![],
             buildinfo: serde_json::json!({}),
             needed: None,
             created_at: String::new(),
@@ -1495,5 +1503,11 @@ mod tests {
         assert_eq!(f.len(), 2, "{f:?}");
         assert!(f[0].contains("install script appeared"));
         assert!(f[1].contains("etc/sudoers.d/foo") && f[1].contains("foo.hook"));
+        let mut suid = info("foo", &["usr/bin/foo"], false);
+        suid.setuid_paths = vec!["usr/bin/foo".into()];
+        assert_eq!(artifact_flags(None, &suid).len(), 1, "setuid shows even on first publication");
+        let mut p2 = p.clone();
+        p2.setuid_paths = vec!["usr/bin/foo".into()];
+        assert!(artifact_flags(Some(&p2), &suid).is_empty(), "unchanged setuid is not re-flagged");
     }
 }
