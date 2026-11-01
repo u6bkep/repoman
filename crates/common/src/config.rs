@@ -104,10 +104,6 @@ pub struct CoordinatorConfig {
     /// packages become signals. Unset or empty disables it.
     #[serde(default = "default_aur_requests_url")]
     pub aur_requests_url: Option<String>,
-    /// How often to read the feed between runs (it holds 30 items and the
-    /// list moves at a few an hour).
-    #[serde(default = "default_aur_requests_poll_secs")]
-    pub aur_requests_poll_secs: u64,
     /// RSS feed of aur-general; messages naming a tracked package become
     /// `info` signals the reviewer reads. Unset or empty disables it.
     #[serde(default = "default_aur_general_url")]
@@ -122,9 +118,6 @@ fn default_aur_requests_url() -> Option<String> {
     Some("https://lists.archlinux.org/archives/list/aur-requests@lists.archlinux.org/feed/".into())
 }
 
-fn default_aur_requests_poll_secs() -> u64 {
-    1800
-}
 
 fn default_aur_web() -> String {
     "https://aur.archlinux.org".into()
@@ -260,7 +253,6 @@ impl Default for CoordinatorConfig {
             aur_security_url: default_aur_security_url(),
             adoption_quarantine_days: default_adoption_quarantine_days(),
             aur_requests_url: default_aur_requests_url(),
-            aur_requests_poll_secs: default_aur_requests_poll_secs(),
             aur_general_url: default_aur_general_url(),
         }
     }

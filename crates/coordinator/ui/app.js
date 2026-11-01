@@ -162,10 +162,11 @@ function progressLine(run) {
   switch (p.phase) {
     case "streams": case "poll": case "images": return `${esc(p.detail || p.phase)}${since}`;
     case "candidates": return `${esc(p.detail || "creating candidates")}${since}`;
-    case "gate": return `gate: deciding routine candidates${since}`;
+    case "gate": return `gate: classifying pending candidates${since}`;
+    case "resolve": return `resolving dependencies${since}`;
     case "probes": {
       const left = (p.total ?? 0) - (p.done ?? 0);
-      return `probing VCS upstreams: ${p.done ?? 0}/${p.total ?? 0}${left ? `, ${left} still answering` : ""}${p.last ? ` (last: ${esc(p.last)} on ${esc(p.worker || "?")})` : ""}${since}`;
+      return `probing VCS upstreams: ${p.done ?? 0}/${p.total ?? 0}${left ? `, ${left} still answering` : ""}${p.last ? ` (last: ${esc(p.last)})` : ""}${since}`;
     }
     case "plan": return `planning builds${since}`;
     case "build": {
@@ -195,56 +196,38 @@ function candidateSummary(c) {
   return parts.join("; ");
 }
 
-// ---- decision logic mirrored from the engine's auto_approve ----------------------
-// Used to tell the reader what will happen on its own, and why something
-// needs a human. Config comes from /api/config; package policy from the
-// package rows; blocking signals from /api/signals.
+// ---- decisions ---------------------------------------------------------------------
+// The engine records its verdict on every pending candidate at each check
+// (review.decision: approve | quarantine{until} | needs_you{reasons}). The
+// UI only displays it. Config is for wording and the stream list.
 
-let ctx = { config: null, policies: {}, blocking: [] };
+let ctx = { config: null, packages: [] };
 async function loadContext() {
-  const [config, pkgs, blocking] = await Promise.all([api("/api/config"), api("/api/packages"), api("/api/signals")]);
-  const policies = {};
-  for (const p of pkgs) policies[p.pkgbase] = p.policy || {};
-  ctx = { config, policies, blocking, packages: pkgs };
+  const [config, packages] = await Promise.all([api("/api/config"), api("/api/packages")]);
+  ctx = { config, packages };
   return ctx;
 }
+function decisionOf(c) { return c.review?.decision || null; }
 function quarantineDays(pkgbase) {
-  const pol = ctx.policies[pkgbase] || {};
+  const pol = (ctx.packages || []).find((p) => p.pkgbase === pkgbase)?.policy || {};
   return pol.quarantine_days ?? ctx.config?.quarantine_days ?? 3;
 }
-// Why the gate will not approve this on its own, as a list of short reasons;
-// empty means it will, once quarantine ends.
-function needsHumanBecause(c) {
-  const r = c.review || {};
-  const out = [];
-  if (c.kind === "onboarding") out.push("first review of a new package");
-  if (c.kind !== "update" && c.kind !== "onboarding") out.push(`${c.kind} candidate`);
-  if (c.state === "publish_review") out.push("built artifacts raised flags");
-  if (c.state === "failed") out.push("build failed");
-  if (r.gate_error) out.push("gate could not assess it");
-  const cls = r.gate?.diff_class;
-  if (cls === "structural") out.push(`structural: ${[...new Set((r.gate.reasons || []).filter((x) => x.class === "structural").map((x) => x.kind))].join(", ") || "see reasons"}`);
-  if (cls === "metadata" && !(ctx.config?.auto_approve_metadata && (ctx.policies[c.pkgbase]?.auto_metadata ?? true))) out.push("metadata change; auto-approval of metadata is off");
-  if (c.floor_risk && c.floor_risk !== "low") out.push(`lint floor is ${c.floor_risk}`);
-  if (c.llm_risk && c.llm_risk !== "low") out.push(`reviewer says ${c.llm_risk}`);
-  const sig = ctx.blocking.filter((s) => s.pkgbase === c.pkgbase);
-  if (sig.length) out.push(`${sig.length} blocking signal${sig.length > 1 ? "s" : ""}: ${[...new Set(sig.map(sigLabel))].join(", ")}`);
-  if (!ctx.config?.auto_approve) out.push("auto-approval is disabled");
-  return out;
+function needsYou(c) {
+  if (c.state === "publish_review" || c.state === "failed") return true;
+  const d = decisionOf(c);
+  return !d || d.kind === "needs_you";
 }
-function quarantineEnds(c) {
-  if (!c.first_seen_last_modified) return null;
-  return new Date((c.first_seen_last_modified + quarantineDays(c.pkgbase) * 86400) * 1000).toISOString();
-}
-// "gate approves in 2d 3h" / "gate approves at next run" / list of blockers.
+// Whose decision it is and when, for the queue.
 function decisionCell(c) {
-  const why = needsHumanBecause(c);
-  if (why.length) return `<span class="pill high">you</span> <span class="muted">${esc(why.join("; "))}</span>`;
-  const ends = quarantineEnds(c);
-  if (!ends) return `<span class="pill high">you</span> <span class="muted">no AUR timestamp</span>`;
-  return Date.parse(ends) <= Date.now()
-    ? `<span class="pill low">gate</span> <span class="muted">approves at the next run</span>`
-    : `<span class="pill low">gate</span> <span class="muted" title="${esc(absolute(ends))}">approves ${relative(ends)} (quarantine ${quarantineDays(c.pkgbase)}d)</span>`;
+  if (c.state === "publish_review") return `<span class="pill high">you</span> <span class="muted">built artifacts raised flags</span>`;
+  if (c.state === "failed") return `<span class="pill high">you</span> <span class="muted">build failed</span>`;
+  const d = decisionOf(c);
+  if (!d) return `<span class="pill high">you</span> <span class="muted">not assessed yet; run a check</span>`;
+  if (d.kind === "quarantine") {
+    const until = new Date(d.until * 1000).toISOString();
+    return `<span class="pill low">gate</span> <span class="muted" title="${esc(absolute(until))}">at the first check after ${esc(new Date(until).toLocaleString([], { dateStyle: "medium", timeStyle: "short" }))} (${relative(until)})</span>`;
+  }
+  return `<span class="pill high">you</span> <span class="muted">${esc((d.reasons || []).join("; "))}</span>`;
 }
 
 // ---- signals -----------------------------------------------------------------------
@@ -360,15 +343,20 @@ document.addEventListener("click", (e) => {
 async function header() {
   try {
     const [h, pending, workers, runs] = await Promise.all([api("/api/health"), api("/api/candidates"), api("/api/workers"), api("/api/runs")]);
-    document.getElementById("queue-count").textContent = pending.length || "";
+    const you = pending.filter(needsYou).length;
+    const clock = pending.length - you;
+    document.getElementById("queue-count").textContent = you || "";
     const online = workers.filter((w) => w.connected).length;
     const active = runs.find((r) => r.state === "running");
     let phase = "idle";
     if (active) {
       const p = active.progress || {};
-      phase = p.phase === "build" ? `building ${p.done ?? 0}/${p.total ?? 0}` : p.phase === "probes" ? `probing ${p.done ?? 0}/${p.total ?? 0}` : p.detail || p.phase || active.step || "running";
-    } else if (runs.some((r) => r.state === "needs_input")) {
-      phase = "waiting for decisions";
+      phase = `${active.kind}: ` + (p.phase === "build" ? `building ${p.done ?? 0}/${p.total ?? 0}` : p.phase === "probes" ? `probing ${p.done ?? 0}/${p.total ?? 0}` : p.detail || p.phase || active.step || "running");
+    } else {
+      const bits = [];
+      if (you) bits.push(`${you} need${you === 1 ? "s" : ""} you`);
+      if (clock) bits.push(`${clock} in quarantine`);
+      if (bits.length) phase = bits.join(", ");
     }
     const busy = workers.reduce((n, w) => n + (w.running?.length || 0), 0);
     $status.textContent = `${phase} · ${online}/${workers.length} workers${busy ? `, ${busy} job${busy > 1 ? "s" : ""} running` : ""}`;
@@ -379,15 +367,17 @@ setInterval(header, 5000);
 // ---- queue -------------------------------------------------------------------
 
 async function viewQueue() {
-  const [pending, deferred, runs] = await Promise.all([
-    api("/api/candidates"), api("/api/candidates?state=deferred"), api("/api/runs"), loadContext(),
+  const [pending, deferred, approved, runs] = await Promise.all([
+    api("/api/candidates"), api("/api/candidates?state=deferred"), api("/api/candidates?state=approved"), api("/api/runs"), loadContext(),
   ]);
-  const active = runs.find((r) => r.state === "running" || r.state === "needs_input");
+  if (location.hash !== "#/queue") return;
+  const active = runs.find((r) => r.state === "running");
   const activeRun = active ? await api(`/api/runs/${active.id}`) : null;
+  const last = runs.find((r) => r.state !== "running");
   const held = pending.filter((c) => c.state === "publish_review");
   const rest = pending.filter((c) => c.state !== "publish_review");
-  const you = rest.filter((c) => needsHumanBecause(c).length);
-  const clock = rest.filter((c) => !needsHumanBecause(c).length);
+  const you = rest.filter(needsYou);
+  const clock = rest.filter((c) => !needsYou(c));
   const headers = ["package", "change", "class", "diff", "floor", "llm", "on AUR", "decides", "notes"];
   const cells = (c) => [
     `<a href="#/packages/${esc(c.pkgbase)}">${esc(c.pkgbase)}</a> <span class="muted">${esc(c.kind)}</span>`,
@@ -398,28 +388,42 @@ async function viewQueue() {
     `<span class="ellipsis">${esc(candidateSummary(c))}</span>`,
   ];
   const opts = { cells, href: (c) => `#/candidates/${c.id}` };
+  const approvedCells = (c) => [
+    `<a href="#/packages/${esc(c.pkgbase)}">${esc(c.pkgbase)}</a> <span class="muted">${esc(c.kind)}</span>`,
+    versionChange(c.review || {}) || dash(c.review?.upstream_rev && short(c.review.upstream_rev, 12)),
+    dash(c.class), pill(c.review?.gate?.diff_class), pill(c.floor_risk), pill(c.llm_risk), agoEpoch(c.first_seen_last_modified),
+    `<span class="muted">${esc(c.decided_by || "")} ${ago(c.decided_at)}</span>`, `<span class="ellipsis">${esc(c.note || candidateSummary(c))}</span>`,
+  ];
+  const busy = !!active;
   swap(`
     <div class="row between">
       <h1>Queue</h1>
       <div class="row">
-        ${active ? `<a href="#/runs/${active.id}">run ${short(active.id)} ${pill(active.state)}</a>` : `<span class="muted">no run active</span>`}
-        <button class="primary" id="start-run">${active?.state === "needs_input" ? "Resume run" : "Start run"}</button>
+        ${active ? `<a href="#/runs/${active.id}">${esc(active.kind)} ${short(active.id)} ${pill(active.state)}</a>` : last ? `<a href="#/runs/${last.id}" class="muted">last: ${esc(last.kind)} ${relative(last.finished_at || last.started_at)} ${pill(last.state)}</a>` : ""}
+        <button id="op-check" ${busy ? "disabled" : ""} title="Poll the AUR and git sources, assess changes, probe VCS upstreams. Builds nothing.">Check for updates</button>
+        <button id="op-build" ${busy || !approved.length ? "disabled" : ""} title="Build and publish every approved candidate.">Build approved (${approved.length})</button>
+        <button class="primary" id="op-update" ${busy ? "disabled" : ""} title="Check, then build everything the check leaves approved.">Update</button>
       </div>
     </div>
-    ${activeRun && activeRun.state === "running" ? `<div class="panel">run <a href="#/runs/${activeRun.id}" class="mono">${short(activeRun.id)}</a> · ${progressLine(activeRun)}</div>` : ""}
+    ${activeRun ? `<div class="panel">${esc(activeRun.kind)} <a href="#/runs/${activeRun.id}" class="mono">${short(activeRun.id)}</a> · ${progressLine(activeRun)}</div>` : ""}
     <h2>Needs you (${you.length + held.length})</h2>
-    ${held.length ? `<p class="muted">Built, but the artifacts differ from what the stream serves in a way that matters; approve to publish, reject to drop.</p>${table(headers, held, { ...opts, empty: "" })}` : ""}
+    ${held.length ? `<p class="muted">Built, but the artifacts differ from what the stream serves in a way that matters; approve to publish exactly what was built, reject to drop.</p>${table(headers, held, { ...opts, empty: "" })}` : ""}
     ${table(headers, you, { ...opts, empty: held.length ? "" : "nothing waits on a decision" })}
     <h2>Waiting on the clock (${clock.length})</h2>
-    <p class="muted">Routine changes the gate will approve once they have been visible on the AUR for the quarantine period. Approve to skip the wait, reject to drop; otherwise leave them.</p>
+    <p class="muted">Routine changes the gate approves at the first check after they have been on the AUR for the quarantine period. Approve to skip the wait, reject to drop; otherwise leave them.</p>
     ${table(headers, clock, { ...opts, empty: "nothing in quarantine" })}
+    <h2>Approved, not yet built (${approved.length})</h2>
+    ${table(["package", "change", "class", "diff", "floor", "llm", "on AUR", "approved", "notes"], approved, { cells: approvedCells, href: (c) => `#/candidates/${c.id}`, empty: "nothing authorised and unbuilt" })}
     ${deferred.length ? `<h2>Deferred (${deferred.length})</h2>${table(headers, deferred, opts)}` : ""}
   `);
-  document.getElementById("start-run").onclick = async (e) => {
-    e.target.disabled = true;
-    try { const r = await post("/api/runs"); toast(`run ${short(r.id)} ${r.resumed ? "resumed" : "started"}`); location.hash = `#/runs/${r.id}`; }
-    catch (err) { toast(err.message, true); e.target.disabled = false; }
+  const start = async (btn, body) => {
+    btn.disabled = true;
+    try { const r = await post("/api/runs", body); toast(`${body.kind} ${short(r.id)} started`); location.hash = `#/runs/${r.id}`; }
+    catch (err) { toast(err.message, true); btn.disabled = false; }
   };
+  document.getElementById("op-check").onclick = (e) => start(e.target, { kind: "check" });
+  document.getElementById("op-build").onclick = (e) => start(e.target, { kind: "build" });
+  document.getElementById("op-update").onclick = (e) => start(e.target, { kind: "update" });
 }
 viewQueue.refresh = 5000;
 
@@ -451,7 +455,8 @@ function changesTable(changes) {
 }
 
 async function viewCandidate(id) {
-  const [c] = await Promise.all([api(`/api/candidates/${id}`), ctx.config ? Promise.resolve() : loadContext()]);
+  const [c, runs] = await Promise.all([api(`/api/candidates/${id}`), api("/api/runs"), ctx.config ? Promise.resolve() : loadContext()]);
+  const busy = runs.some((r) => r.state === "running");
   const r = c.review || {};
   const gate = r.gate;
   const llm = r.llm;
@@ -487,17 +492,20 @@ async function viewCandidate(id) {
 
   // The decision line: what happens if you do nothing.
   let decision = "";
+  const d = decisionOf(c);
   if (c.state === "pending" || c.state === "deferred") {
-    const why = needsHumanBecause(c);
-    if (why.length) decision = `<div class="panel callout"><b>Needs you.</b> ${esc(why.join(". "))}.</div>`;
-    else {
-      const ends = quarantineEnds(c);
-      decision = `<div class="panel callout low"><b>The gate will approve this on its own</b> ${ends && Date.parse(ends) > Date.now() ? `<span title="${esc(absolute(ends))}">${relative(ends)}</span>, when it has been on the AUR for ${quarantineDays(c.pkgbase)} days` : "at the next run"}, unless a signal appears first. Approve to skip the wait; reject to drop this commit.</div>`;
+    if (!d) decision = `<div class="panel callout"><b>Not assessed yet.</b> Run a check; the gate records its verdict then.</div>`;
+    else if (d.kind === "needs_you") decision = `<div class="panel callout"><b>Needs you.</b> ${esc(d.reasons.join(". "))}.</div>`;
+    else if (d.kind === "quarantine") {
+      const until = new Date(d.until * 1000).toISOString();
+      decision = `<div class="panel callout low"><b>The gate will approve this on its own</b> at the first check after <span title="${esc(absolute(until))}">${esc(new Date(until).toLocaleString([], { dateStyle: "medium", timeStyle: "short" }))}</span> (${relative(until)}), when it has been on the AUR for ${quarantineDays(c.pkgbase)} days, unless a signal appears first. Approve to skip the wait; reject to drop this commit.</div>`;
     }
+  } else if (c.state === "approved") {
+    decision = `<div class="panel callout low"><b>Authorised.</b> The next build takes it${c.decided_by ? `; approved by ${esc(c.decided_by)} ${relative(c.decided_at)}` : ""}.</div>`;
   } else if (c.state === "publish_review") {
-    decision = `<div class="panel callout"><b>Built and held.</b> The artifacts differ from what the stream serves in ways that matter on the installing system (below). Approve to rebuild and publish; reject to drop this commit.</div>`;
+    decision = `<div class="panel callout"><b>Built and held.</b> The artifacts differ from what the stream serves in ways that matter on the installing system (below). Approve to publish exactly these artifacts; reject to drop this commit.</div>`;
   } else if (c.state === "failed") {
-    decision = `<div class="panel callout"><b>Build failed.</b> See the builds below. Approve to retry at the next run; reject to drop this commit; fix the policy first if the log says why.</div>`;
+    decision = `<div class="panel callout"><b>Build failed.</b> See the builds below. It stays authorised and is retried by the next build; reject to drop this commit; fix the policy first if the log says why.</div>`;
   }
   const builtVersions = [...new Set(jobs.flatMap((j) => (j.result?.artifacts || []).map((a) => a.pkgver)))];
 
@@ -508,9 +516,10 @@ async function viewCandidate(id) {
         ${c.kind === "onboarding" || !c.class ? `<select id="class"><option value="">class…</option>${classes.map((k) => `<option ${k === c.class ? "selected" : ""}>${k}</option>`).join("")}</select>` : ""}
         <input id="note" placeholder="note (optional)" size="32">
         <button class="primary" data-decision="approve">Approve</button>
+        <button class="primary" data-decision="approve" data-build="1" ${busy ? "disabled" : ""} title="Approve and start a build of this candidate now">Approve &amp; build</button>
         <button data-decision="defer">Defer</button>
         <button class="danger" data-decision="reject">Reject</button>
-      </div>` : `<div class="muted">decided by ${dash(c.decided_by)} ${ago(c.decided_at)}${c.note ? ` — ${esc(c.note)}` : ""}</div>`}
+      </div>` : c.state === "approved" ? `<div class="row" id="decide"><span class="muted">approved by ${dash(c.decided_by)} ${ago(c.decided_at)}</span><button class="primary" id="build-one" ${busy ? "disabled" : ""}>Build now</button></div>` : `<div class="muted">decided by ${dash(c.decided_by)} ${ago(c.decided_at)}${c.note ? ` — ${esc(c.note)}` : ""}</div>`}
     </div>
     ${decision}
     <div class="panel">${kv([
@@ -538,14 +547,27 @@ async function viewCandidate(id) {
     ${commits ? `<h2>Commits</h2><table><tbody>${commits}</tbody></table>` : ""}
   `);
   wireSignalClears();
-  document.querySelectorAll("#decide button").forEach((b) => b.onclick = async () => {
+  const buildOne = async () => {
+    const r = await post("/api/runs", { kind: "build", candidates: [id] });
+    toast(`build ${short(r.id)} started`);
+    location.hash = `#/runs/${r.id}`;
+  };
+  document.getElementById("build-one")?.addEventListener("click", async (e) => {
+    e.target.disabled = true;
+    try { await buildOne(); } catch (err) { toast(err.message, true); e.target.disabled = false; }
+  });
+  document.querySelectorAll("#decide button[data-decision]").forEach((b) => b.onclick = async () => {
     const decision = b.dataset.decision;
     const body = { decision, note: document.getElementById("note").value || null };
     const cls = document.getElementById("class")?.value;
     if (cls) body.class = cls;
     document.querySelectorAll("#decide button").forEach((x) => x.disabled = true);
-    try { const res = await post(`/api/candidates/${id}/decide`, body); toast(`${res.pkgbase} ${res.state}`); location.hash = "#/queue"; }
-    catch (e) { toast(e.message, true); document.querySelectorAll("#decide button").forEach((x) => x.disabled = false); }
+    try {
+      const res = await post(`/api/candidates/${id}/decide`, body);
+      toast(`${res.pkgbase} ${res.state}`);
+      if (b.dataset.build && res.state === "approved") await buildOne();
+      else location.hash = "#/queue";
+    } catch (e) { toast(e.message, true); document.querySelectorAll("#decide button").forEach((x) => x.disabled = false); }
   });
 }
 
@@ -577,22 +599,43 @@ function jobsTable(jobs) {
 async function viewRuns() {
   const runs = await api("/api/runs");
   swap(`
-    <div class="row between"><h1>Runs</h1><button class="primary" id="start-run">Start run</button></div>
-    ${table(["run", "state", "step", "started", "took", "planned", "ok", "failed", "published", "held", "skipped"], runs, {
+    <div class="row between"><h1>Activity</h1><a class="btn" href="#/queue">Start one from the queue</a></div>
+    ${table(["operation", "state", "doing", "started", "took", "outcome"], runs, {
       href: (r) => `#/runs/${r.id}`,
       cells: (r) => [
-        `<span class="mono">${short(r.id)}</span>`, pill(r.state), r.state === "running" ? progressLine(r) : dash(r.step), ago(r.started_at),
-        dur(r.started_at, r.finished_at), dash(r.summary?.builds_planned), dash(r.summary?.builds_succeeded), r.summary?.builds_failed ? `<span class="pill high">${r.summary.builds_failed}</span>` : dash(r.summary?.builds_failed), dash(r.summary?.published), dash(r.summary?.held_for_review), r.summary?.skipped?.length ? `<span class="pill medium">${r.summary.skipped.length}</span>` : dash(r.summary?.skipped?.length),
+        `<b>${esc(r.kind)}</b> <span class="mono muted">${short(r.id)}</span>`, pill(r.state), r.state === "running" ? progressLine(r) : "", ago(r.started_at),
+        dur(r.started_at, r.finished_at), `<span class="ellipsis">${esc(runOutcome(r))}</span>`,
       ],
-      empty: "no runs yet",
+      empty: "nothing has run yet",
     })}`);
-  document.getElementById("start-run").onclick = async (e) => {
-    e.target.disabled = true;
-    try { const r = await post("/api/runs"); location.hash = `#/runs/${r.id}`; }
-    catch (err) { toast(err.message, true); e.target.disabled = false; }
-  };
 }
 viewRuns.refresh = 5000;
+
+// One line on what an operation achieved.
+function runOutcome(r) {
+  const s = r.summary || {};
+  if (s.error) return `aborted: ${s.error}`;
+  const parts = [];
+  const check = r.kind === "check" ? s : s.check;
+  if (check) {
+    if (check.new_candidates) parts.push(`${check.new_candidates} new`);
+    if (check.approved) parts.push(`${check.approved} approved`);
+    if (check.needs_you) parts.push(`${check.needs_you} need you`);
+    if (check.quarantined) parts.push(`${check.quarantined} in quarantine`);
+    if (check.probes?.behind?.length) parts.push(`${check.probes.behind.length} VCS behind`);
+    if (check.probes?.failed?.length) parts.push(`${check.probes.failed.length} probes failed`);
+    if (check.discovered) parts.push(`${check.discovered} dependencies discovered`);
+  }
+  if (r.kind !== "check") {
+    if (s.builds_planned != null) parts.push(`${s.builds_succeeded ?? 0}/${s.builds_planned} built`);
+    if (s.builds_failed) parts.push(`${s.builds_failed} failed`);
+    if (s.published) parts.push(`${s.published} published`);
+    if (s.published_as_reviewed) parts.push(`${s.published_as_reviewed} as reviewed`);
+    if (s.held_for_review) parts.push(`${s.held_for_review} held`);
+    if (s.skipped?.length) parts.push(`${s.skipped.length} skipped`);
+  }
+  return parts.join(", ") || (r.state === "done" ? "nothing to do" : "");
+}
 
 // Steps of a run from its run.step events, with how long each took.
 function stepTimeline(r) {
@@ -611,9 +654,9 @@ function stepTimeline(r) {
 async function viewRun(id) {
   const r = await api(`/api/runs/${id}`);
   if (location.hash !== `#/runs/${id}`) return;
-  const open = r.state === "running" || r.state === "needs_input";
   const s = r.summary || {};
-  const hasSummary = Object.keys(s).length > 0;
+  const check = r.kind === "check" ? s : s.check;
+  const hasBuild = r.kind !== "check" && s.builds_planned != null;
   const cands = table(["package", "kind", "state", "change", "diff", "floor", "llm", "decided by", "notes"], r.candidates, {
     href: (c) => `#/candidates/${c.id}`,
     cells: (c) => [esc(c.pkgbase), esc(c.kind), pill(c.state), versionChange(c.review || {}) || "-", pill(c.review?.gate?.diff_class), pill(c.floor_risk), pill(c.llm_risk), dash(c.decided_by), `<span class="ellipsis">${esc(candidateSummary(c))}</span>`],
@@ -626,15 +669,20 @@ async function viewRun(id) {
   const probeFails = probes.filter((j) => j.state === "failed" || j.error);
   swap(`
     <div class="row between">
-      <h1>Run <span class="mono">${short(id)}</span> ${pill(r.state)} ${r.step ? `<span class="muted">step ${esc(r.step)}</span>` : ""}</h1>
-      ${r.state === "needs_input" ? `<a class="btn" href="#/queue">Decide pending candidates</a>` : ""}
+      <h1>${esc(r.kind[0].toUpperCase() + r.kind.slice(1))} <span class="mono">${short(id)}</span> ${pill(r.state)} ${r.step ? `<span class="muted">step ${esc(r.step)}</span>` : ""}</h1>
+      ${check && (check.needs_you || 0) + (check.held || 0) > 0 ? `<a class="btn" href="#/queue">${(check.needs_you || 0) + (check.held || 0)} waiting for you in the queue</a>` : ""}
     </div>
-    <div class="muted">started ${ago(r.started_at)}${r.state === "running" ? ` · running for ${dur(r.started_at)}` : r.state === "needs_input" ? ` · worked ${dur(r.started_at, r.progress?.at)}, parked ${ago(r.progress?.at)} waiting for decisions; resume from the queue when you have made them` : ` · took ${dur(r.started_at, r.finished_at)}${r.finished_at ? ` · finished ${ago(r.finished_at)}` : ""}`}</div>
+    <div class="muted">started ${ago(r.started_at)}${r.state === "running" ? ` · running for ${dur(r.started_at)}` : ` · took ${dur(r.started_at, r.finished_at)}${r.finished_at ? ` · finished ${ago(r.finished_at)}` : ""}`}${s.error ? ` · <span class="high">${esc(s.error)}</span>` : ""}</div>
     ${r.state === "running" ? `<div class="panel">${progressLine(r)}</div>` : ""}
     ${stepTimeline(r)}
-    ${hasSummary ? `<div class="cards">
+    ${check ? `<h2>Check</h2><div class="cards">
+      <div class="card"><div class="label">candidates</div><div class="big">${check.new_candidates ?? 0}<span class="muted"> new</span></div><div class="muted">${check.approved ?? 0} approved · ${check.needs_you ?? 0} need you · ${check.quarantined ?? 0} in quarantine${check.held ? ` · ${check.held} held` : ""}${check.failed ? ` · ${check.failed} failed` : ""}</div></div>
+      <div class="card"><div class="label">VCS probes</div><div class="big">${check.probes?.total ?? 0}</div><div class="muted">${(check.probes?.behind || []).length ? `behind: ${check.probes.behind.map(esc).join(", ")}` : "nothing moved upstream"}${(check.probes?.failed || []).length ? ` · <span class="high">failed: ${check.probes.failed.map(esc).join(", ")}</span>` : ""}</div></div>
+      <div class="card"><div class="label">dependencies</div><div class="big">${check.discovered ?? 0}<span class="muted"> discovered</span></div><div class="muted">${(check.unresolved || []).length ? `${check.unresolved.length} could not be resolved; see below` : "everything resolves"}</div></div>
+    </div>${(check.unresolved || []).length ? table(["package", "stream", "reason"], check.unresolved, { href: (x) => `#/packages/${x.pkgbase}`, cells: (x) => [esc(x.pkgbase), dash(x.stream), `<span class="wrap">${esc(x.reason)}</span>`] }) : ""}` : ""}
+    ${hasBuild ? `<h2>Build</h2><div class="cards">
       <div class="card"><div class="label">builds</div><div class="big">${s.builds_succeeded ?? 0}<span class="muted"> / ${s.builds_planned ?? 0}</span></div><div class="muted">${s.builds_failed ? `<span class="high">${s.builds_failed} failed</span>` : "none failed"} · ${(s.streams || []).join(", ") || "no streams"}</div></div>
-      <div class="card"><div class="label">published</div><div class="big">${s.published ?? 0}</div><div class="muted">${s.held_for_review ? `${s.held_for_review} held for artifact review` : "nothing held"}</div></div>
+      <div class="card"><div class="label">published</div><div class="big">${s.published ?? 0}</div><div class="muted">${s.published_as_reviewed ? `${s.published_as_reviewed} as reviewed · ` : ""}${s.held_for_review ? `${s.held_for_review} held for artifact review` : "nothing held"}${s.selection ? ` · selection of ${s.selection}` : ""}</div></div>
       <div class="card"><div class="label">skipped</div><div class="big">${(s.skipped || []).length}</div><div class="muted">${(s.skipped || []).length ? "could not be planned; see below" : "everything planned was built"}</div></div>
       <div class="card"><div class="label">jobs</div><div class="big">${jobs.length}</div><div class="muted">${Object.entries(byKind).map(([k, n]) => `${n} ${k}`).join(", ") || "none"}${probeFails.length ? ` · <span class="high">${probeFails.length} probe${probeFails.length > 1 ? "s" : ""} failed</span>` : ""}</div></div>
     </div>` : ""}

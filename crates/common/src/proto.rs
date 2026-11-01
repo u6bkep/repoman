@@ -123,19 +123,6 @@ pub enum JobKind {
         #[serde(default)]
         memory_limit: Option<u64>,
     },
-    /// Regenerate SRCINFO from the PKGBUILD in a sandbox.
-    Inspect {
-        pkgbase: String,
-        aur_commit: String,
-        image: ImageRef,
-        source_url: String,
-    },
-    /// Query upstream VCS heads for a package's sources.
-    Probe {
-        pkgbase: String,
-        /// makepkg `source=` entries that are VCS fetches.
-        sources: Vec<String>,
-    },
 }
 
 impl JobKind {
@@ -152,14 +139,12 @@ impl JobKind {
             JobKind::Noop { .. } => "noop",
             JobKind::Image { .. } => "image",
             JobKind::Build { .. } => "build",
-            JobKind::Inspect { .. } => "inspect",
-            JobKind::Probe { .. } => "probe",
         }
     }
 
     pub fn image(&self) -> Option<&ImageRef> {
         match self {
-            JobKind::Build { image, .. } | JobKind::Inspect { image, .. } => Some(image),
+            JobKind::Build { image, .. } => Some(image),
             _ => None,
         }
     }
@@ -279,13 +264,10 @@ pub enum JobResult {
         /// Revision actually built for VCS packages, from pkgver().
         #[serde(default, skip_serializing_if = "Option::is_none")]
         upstream_rev: Option<String>,
-    },
-    Inspect {
-        srcinfo: String,
-    },
-    Probe {
-        /// (source entry, upstream revision)
-        revisions: Vec<(String, String)>,
+        /// `makepkg --printsrcinfo` output from the build root, for the
+        /// coordinator to compare with the committed .SRCINFO.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        srcinfo: Option<String>,
     },
 }
 
@@ -429,8 +411,11 @@ mod tests {
 
     #[test]
     fn outcome_with_result_round_trips() {
-        let o = Outcome::success_with(JobResult::Probe {
-            revisions: vec![("git+https://x".into(), "abc".into())],
+        let o = Outcome::success_with(JobResult::Image {
+            sha256: "abc".into(),
+            size: 1,
+            filename: "x.tar.zst".into(),
+            packages: vec!["glibc 2.44-1".into()],
         });
         let s = serde_json::to_string(&o).unwrap();
         let back: Outcome = serde_json::from_str(&s).unwrap();

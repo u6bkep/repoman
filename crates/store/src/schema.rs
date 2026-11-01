@@ -220,6 +220,11 @@ pub const MIGRATIONS: &[&str] = &[
     // image builds, not only the builds its candidates own
     "ALTER TABLE job ADD COLUMN run_id TEXT;
      CREATE INDEX job_run_idx ON job(run_id) WHERE run_id IS NOT NULL;",
+    // 10: operations have a kind (check | build | update) and a request;
+    // the probe time lives on the snapshot now that probes are not jobs
+    "ALTER TABLE run ADD COLUMN kind TEXT NOT NULL DEFAULT 'update';
+     ALTER TABLE run ADD COLUMN request TEXT NOT NULL DEFAULT '{}';
+     ALTER TABLE aur_snapshot ADD COLUMN probed_at TEXT;",
 ];
 
 pub fn migrate(conn: &Connection) -> Result<()> {

@@ -67,7 +67,8 @@ can reopen a decision on evidence rather than drift.
 | Coordinator location | Container on the NAS (Ubuntu docker host, always on, hosts the repos and reverse proxy). Arch-based image so `pacstrap`, `repo-add`, `gpg`, `bsdtar` are present. | Coordinator on the desktop: v1 ran there only because it builds well; the desktop is now a worker. Publishing over NFS: removed a failure class. |
 | Artifact storage | Content-addressed store on the NAS; repo URLs resolve to store objects through the publication table at serve time. | Plain directories with copies per repo: duplicates `any` packages. Hardlinks or reflinks: workable fallback for an external static server, but DB-driven serving gives retention and dedupe for free. |
 | State store | SQLite on the NAS SSD, single writer in the coordinator, append-only event table. | Postgres: unnecessary for one operator. |
-| Trigger model | User-triggered "update run". No cron, no scheduler. | Unattended polling: operator explicitly does not want it. |
+| Trigger model | Operator-triggered operations, three kinds: **check** (gather information: polls, assessment, gate, probes, dependency resolution; never builds, never waits), **build** (execute what is authorised: approved candidates, all or a selection), **update** (check then build). No cron, no scheduler, nothing on a timer, not even feed reads. (Revised 2026-11-01.) | Unattended polling: operator explicitly does not want it. The single "update run" that assessed, then parked in `needs_input` until every candidate was decided, then built (2026-10-31 to 2026-11-01): it assumed batch review sessions and periodic polling; with neither, a candidate in quarantine stalled approved builds behind it indefinitely and the run reported on decisions it did not own. |
+| Information gathering vs execution | Only the coordinator gathers information (AUR RPC, git mirrors, `git ls-remote` probes, list feeds, AUR comments). Workers execute only authorised builds and image builds; the one PKGBUILD execution before approval, `makepkg --printsrcinfo`, moved into the build itself, where the PKGBUILD runs anyway, and a mismatch holds the artifacts. (2026-11-01.) | Inspect and probe jobs on workers: a worker running code from an unapproved commit, and a check that hangs when no worker is on. |
 | LLM backend | Direct Claude API over HTTPS from Rust with structured outputs. Default model `claude-opus-5-5`; `claude-sonnet-5-5` for bulk routine triage. API credits bundled with the Max plan fund it. | Shelling out to `claude -p` with subscription login: works, tested, but sits in a gray zone of the Claude Code licence once the tool is published for others. |
 | Review authority | Heuristics compute a floor. The LLM may raise risk, never lower it. Structural changes always wait for the human. | LLM as sole gate: prompt-injectable via PKGBUILD content. Human reviews everything: becomes a rubber stamp. |
 | Quarantine clock | AUR server-side `LastModified` as first observed by repoman, stored on the candidate. | Git commit date: the pusher controls it and can backdate past the quarantine window. |
@@ -199,20 +200,29 @@ Artifacts and their detached signatures live in the content store under
 their sha256. Repo directories hold only the database files; package URLs are
 resolved through `publication` at serve time.
 
-## 7. The update run
+## 7. Operations
 
-Triggered from the UI or `repoman update`. The run is a loop over steps 1–8
-until no new candidates appear, then 9–12. Each step is resumable; an
-interrupted run shows where it stopped.
+Three operator-triggered operations, one at a time, each persisting its
+step and progress so the UI shows where it is and an interrupted one shows
+where it stopped. Nothing waits for the operator inside an operation.
+
+**Check** gathers information and ends. **Build** executes what is
+authorised and ends. **Update** is a check followed by a build; the
+one-click path. Decisions are per candidate and taken whenever the
+operator gets to them: approving changes state and nothing else; the next
+build (or "Approve & build", which starts one for that candidate) takes it.
+
+### 7.1 Check
 
 1. **Refresh streams.** Fetch each stream's sync databases if the mirror's
    `Last-Modified` moved. Parse into the provides and version index.
    Rebuild base images older than a day (section 8.1).
 2. **Poll AUR.** One RPC multiinfo call for every pkgbase in `package`.
    Compare `LastModified`, `Maintainer`, and co-maintainers with the stored
-   snapshot. For `vcs` packages, enqueue `probe` jobs that run `git ls-remote`
-   against the source and compare with the latest published artifact's
-   `upstream_rev` per stream.
+   snapshot (section 10.5 lists the signals this raises). Read the list
+   feeds. For `vcs` packages, the coordinator itself runs `git ls-remote`
+   against each source (45 s timeout, six at a time) and compares with the
+   latest published artifact's `upstream_rev` per stream.
 3. **Fetch changed repos.** `git fetch` for pkgbases whose `LastModified`
    moved. Record head commit and the commits since the baseline.
 4. **Create candidates.** For each pkgbase whose head differs from the
@@ -223,22 +233,37 @@ interrupted run shows where it stopped.
    carried forward, not recreated. A `rejected` candidate stays rejected
    until the head moves.
 5. **Classify.** For `update` candidates: parse baseline and head SRCINFO,
-   run the diff classifier and heuristic lint, compute the floor risk, and
-   enqueue an `inspect` job that regenerates SRCINFO from the PKGBUILD in a
-   sandbox and compares. `vcs` candidates skip classification: the AUR
-   content is unchanged; they are gated by build evidence and artifact diff.
+   run the diff classifier and heuristic lint, compute the floor risk. The
+   committed SRCINFO is taken at its word here; the build regenerates it
+   from the PKGBUILD and a mismatch holds the artifacts (step 11). `vcs`
+   candidates skip classification: the AUR content is unchanged; they are
+   gated by build evidence and artifact diff.
 6. **Signals and corroboration.** Query the aur-security lookup API for
    candidate commits; record AUR state changes; run forge adapters for
    routine updates. Store in `signal` and `corroboration`. Signals persist
    across runs.
 7. **LLM review.** For candidates above the routine class, or flagged by any
    signal, call the API reviewer. Store prompt, response, model, and cost.
-8. **Queue.** Present candidates in three groups: auto-approved routine
-   changes past quarantine, routine changes inside quarantine, and everything
-   needing a decision. Onboarding candidates require a provenance class and a
-   stream membership. The operator approves, rejects, or defers. If the
-   planner (step 9) discovered new AUR dependencies, the run returns to step 2
-   for them and the dependents wait in `needs_input`.
+8. **Gate.** Every pending candidate is classified and the verdict stored
+   on it (`review.decision`): *approve* (routine or metadata class, low
+   floor, past quarantine by the AUR's own `LastModified`, no blocking
+   signal) is applied; *quarantine* carries the time after which a check
+   will approve it; *needs you* carries the reasons. The UI displays the
+   verdict, never recomputes it. Then dependencies are resolved as the
+   build would (step 9, without building): unknown AUR dependencies are
+   added as packages and polled in the same check, so their onboarding
+   candidates exist when it ends; dependents of an undecided package are
+   reported as unresolved with that reason. The check ends with counts:
+   new, approved, needs you, in quarantine, probes, unresolved.
+
+### 7.2 Build
+
+Takes the approved candidates, or a selection of them plus what they build
+against. Candidates held in `publish_review` and then approved are
+published as reviewed: the artifacts the operator looked at, from the
+content store, not a rebuild (falls back to a rebuild only if a blob is
+gone). Undecided candidates are not in the plan and hold nothing up.
+
 9. **Plan.** For approved candidates, resolve depends, makedepends, and
    checkdepends per member stream against the stream index and the set of
    AUR packages. Unknown AUR dependencies are inserted into `package` as
@@ -257,7 +282,8 @@ interrupted run shows where it stopped.
 11. **Post-build review and publish.** Run `elfscan` and the artifact diff
     against the previous publication. A network attempt count above zero
     (M2), writes outside expected paths, or new privileged surface moves the
-    candidate to `publish_review` for the operator. Otherwise sign, add to
+    candidate to `publish_review` for the operator, as does a regenerated
+   SRCINFO that differs from the committed one. Otherwise sign, add to
     each member stream's repo, write the databases atomically, record
     publications, advance the baseline, retire superseded publications, apply
     retention.

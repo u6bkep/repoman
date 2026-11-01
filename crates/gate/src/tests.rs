@@ -18,7 +18,6 @@ struct Case {
     maintainer_changed: bool,
     adopted_from_orphan: bool,
     history_rewritten: bool,
-    srcinfo_mismatch: Option<bool>,
     official: Vec<&'static str>,
 }
 
@@ -53,7 +52,6 @@ impl Case {
             maintainer_changed: false,
             adopted_from_orphan: false,
             history_rewritten: false,
-            srcinfo_mismatch: None,
             official: vec!["glibc", "python", "jq", "git"],
         }
     }
@@ -75,7 +73,6 @@ impl Case {
             maintainer_changed: self.maintainer_changed,
             adopted_from_orphan: self.adopted_from_orphan,
             history_rewritten: self.history_rewritten,
-            srcinfo_mismatch: self.srcinfo_mismatch,
             is_official: &is_official,
         })
     }
@@ -241,15 +238,6 @@ fn unchanged_install_script_is_not_re_raised() {
 }
 
 #[test]
-fn srcinfo_mismatch_is_high() {
-    let mut c = Case::bump("1.0.0", "1.0.1");
-    c.srcinfo_mismatch = Some(true);
-    let v = c.run();
-    assert_eq!(v.floor_risk, Risk::High);
-    assert!(kinds(&v).contains(&"srcinfo_mismatch"));
-}
-
-#[test]
 fn hidden_unicode_in_pkgbuild_is_high() {
     let mut c = Case::bump("1.0.0", "1.0.1");
     c.new_pkgbuild = c.new_pkgbuild.replace("  cd \"foo-$pkgver\"\n", "  cd \"foo-$pkgver\" \u{202E}\n");
@@ -275,7 +263,6 @@ fn onboarding_without_baseline_lints_the_head_only() {
         maintainer_changed: false,
         adopted_from_orphan: false,
         history_rewritten: false,
-        srcinfo_mismatch: None,
         is_official: &|_| true,
     });
     assert_eq!(v.diff_class, DiffClass::Routine);

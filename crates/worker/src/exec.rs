@@ -174,15 +174,6 @@ impl JobRunner for RealRunner {
                 )
                 .await
                 .map(Outcome::success_with),
-                JobKind::Inspect {
-                    pkgbase,
-                    image,
-                    source_url,
-                    ..
-                } => crate::build::run_inspect(ctx, pkgbase, image, source_url)
-                    .await
-                    .map(Outcome::success_with),
-                JobKind::Probe { sources, .. } => crate::probe::run_probe(ctx, sources).await.map(Outcome::success_with),
             }
         })
     }

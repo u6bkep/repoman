@@ -2,17 +2,14 @@
 //! state: mirrors, snapshots, baselines, stream indexes, and an inspect job
 //! that regenerates the SRCINFO in a sandbox.
 
-use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use repoman_alpm::depspec::DepSpec;
 use repoman_alpm::srcinfo::Srcinfo;
-use repoman_common::proto::{ImageRef, JobKind, JobResult};
 use repoman_gate::{GateInput, Verdict, evaluate};
 use repoman_store::{BaselineRow, SnapshotRow};
 
 use crate::AppState;
-use crate::engine::wait_job;
 
 /// Maintainer plus co-maintainers, sorted, as stored on the baseline and
 /// compared at review time.
@@ -84,50 +81,6 @@ pub fn packaging_files(si: &Srcinfo, files: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Regenerate the SRCINFO at `head` in a sandbox and compare it with the
-/// committed one. `None` when no inspection could run.
-async fn srcinfo_matches(app: &AppState, run_id: &str, pkgbase: &str, head: &str, committed: &Srcinfo, images: &HashMap<String, ImageRef>) -> Option<bool> {
-    let image = app
-        .config
-        .streams_sorted()
-        .into_iter()
-        .find_map(|s| images.get(&s.name).cloned())?;
-    let job = app
-        .store
-        .create_job_for(
-            &JobKind::Inspect {
-                pkgbase: pkgbase.to_string(),
-                aur_commit: head.to_string(),
-                image,
-                source_url: format!("{}/api/sources/{pkgbase}/{head}.tar", app.config.public_url),
-            },
-            Some(pkgbase),
-            None,
-            None,
-            Some(run_id),
-        )
-        .ok()?;
-    app.hub.notify();
-    let row = match wait_job(app, &job.id).await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(pkgbase, error = %e, "inspect job failed");
-            return None;
-        }
-    };
-    let Some(JobResult::Inspect { srcinfo }) = row.result else {
-        tracing::warn!(pkgbase, error = ?row.error, "inspect job produced no SRCINFO");
-        return None;
-    };
-    match Srcinfo::parse(&srcinfo) {
-        Ok(regenerated) => Some(regenerated.diff(committed).is_empty() && committed.diff(&regenerated).is_empty()),
-        Err(e) => {
-            tracing::warn!(pkgbase, error = %e, "regenerated SRCINFO does not parse");
-            Some(false)
-        }
-    }
-}
-
 /// What the gate read, kept for the LLM reviewer so both see the same
 /// material.
 pub struct Assessment {
@@ -146,12 +99,10 @@ pub struct Assessment {
 /// `head_si` is the committed SRCINFO at `head`.
 pub async fn assess(
     app: &AppState,
-    run_id: &str,
     pkgbase: &str,
     baseline: Option<&BaselineRow>,
     head: &str,
     head_si: &Srcinfo,
-    images: &HashMap<String, ImageRef>,
     self_hosted: bool,
     history_rewritten: bool,
 ) -> Result<Assessment> {
@@ -194,10 +145,6 @@ pub async fn assess(
     // adoption quarantine; while it stands, every change is a new
     // maintainer's change.
     let adopted_from_orphan = app.store.active_signal(pkgbase, "aur", "adopted")?.is_some();
-    let srcinfo_mismatch = match baseline {
-        Some(_) => srcinfo_matches(app, run_id, pkgbase, head, head_si, images).await.map(|ok| !ok),
-        None => None,
-    };
     let streams = &app.streams;
     let names = streams.names();
     let is_official = |name: &str| {
@@ -216,7 +163,6 @@ pub async fn assess(
         maintainer_changed,
         adopted_from_orphan,
         history_rewritten,
-        srcinfo_mismatch,
         is_official: &is_official,
     });
     // Corroborate routine-looking updates against the upstream forge. A

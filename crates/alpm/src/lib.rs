@@ -8,6 +8,7 @@ pub mod pacman_conf;
 pub mod pkginfo;
 pub mod srcinfo;
 pub mod syncdb;
+pub mod vcs;
 pub mod version;
 
 pub use depspec::{Cmp, DepSpec};

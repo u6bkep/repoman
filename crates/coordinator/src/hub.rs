@@ -415,8 +415,7 @@ pub fn required_capability(job: &repoman_common::proto::JobKind) -> Option<&'sta
     match job {
         JobKind::Noop { .. } => None,
         JobKind::Image { .. } => Some("image"),
-        JobKind::Build { .. } | JobKind::Inspect { .. } => Some("build"),
-        JobKind::Probe { .. } => Some("probe"),
+        JobKind::Build { .. } => Some("build"),
     }
 }
 

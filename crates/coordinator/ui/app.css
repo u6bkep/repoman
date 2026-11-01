@@ -73,7 +73,7 @@ pre.log { max-height: 60vh; white-space: pre-wrap; }
 .pill.pending, .pill.running, .pill.building, .pill.assigned { color: var(--accent); border-color: var(--accent); }
 .pill.done, .pill.published, .pill.approved, .pill.built { color: var(--low); border-color: var(--low); }
 .pill.failed, .pill.rejected { color: var(--high); border-color: var(--high); }
-.pill.needs_input, .pill.deferred, .pill.publish_review { color: var(--medium); border-color: var(--medium); }
+..pill.deferred, .pill.publish_review { color: var(--medium); border-color: var(--medium); }
 .pill.routine { color: var(--low); border-color: var(--low); }
 .pill.metadata { color: var(--medium); border-color: var(--medium); }
 .pill.structural { color: var(--high); border-color: var(--high); }

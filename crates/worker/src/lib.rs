@@ -22,7 +22,6 @@ pub mod cgroup;
 pub mod exec;
 pub mod image;
 pub mod logs;
-pub mod probe;
 pub mod sandbox;
 pub mod upload;
 
@@ -70,9 +69,8 @@ impl WorkerState {
                     caps.push("image".to_string());
                 }
             }
-            Err(why) => tracing::warn!(%why, "sandbox unavailable; this worker will only run noop and probe jobs"),
+            Err(why) => tracing::warn!(%why, "sandbox unavailable; this worker will only run noop jobs"),
         }
-        caps.push("probe".to_string());
         let cgroups = if caps.iter().any(|c| c == "build") {
             cgroup::CgroupManager::init()
         } else {

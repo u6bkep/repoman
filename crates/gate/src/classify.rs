@@ -312,14 +312,6 @@ pub fn classify_change(input: &GateInput<'_>) -> Vec<Reason> {
             Risk::High,
         ));
     }
-    if input.srcinfo_mismatch == Some(true) {
-        out.push(reason(
-            "srcinfo_mismatch",
-            "regenerated .SRCINFO differs from the committed one",
-            DiffClass::Structural,
-            Risk::High,
-        ));
-    }
     out
 }
 

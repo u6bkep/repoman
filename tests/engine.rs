@@ -385,12 +385,9 @@ impl JobRunner for FakeRunner {
                         net_attempts: 0,
                         outside_writes: vec![],
                         upstream_rev: None,
+                        // The committed one, regenerated: no mismatch flag.
+                        srcinfo: Some(srcinfo.clone()),
                     }))
-                }
-                JobKind::Inspect { pkgbase, source_url, .. } => {
-                    let src = ctx.http.get(source_url).send().await?.error_for_status()?.bytes().await?;
-                    let srcinfo = extract_srcinfo(&src, pkgbase)?;
-                    Ok(Outcome::success_with(JobResult::Inspect { srcinfo }))
                 }
                 other => anyhow::bail!("fake runner cannot run {}", other.name()),
             }
@@ -533,7 +530,7 @@ async fn start_with(tweak: impl FnOnce(&mut CoordinatorConfig)) -> Harness {
     let specs = Arc::new(Mutex::new(Vec::new()));
     let state = WorkerState::with_runner(
         2,
-        vec!["build".into(), "image".into(), "probe".into()],
+        vec!["build".into(), "image".into()],
         Arc::new(FakeRunner { specs: specs.clone() }),
     );
     let wcfg = WorkerConfig {
@@ -600,7 +597,7 @@ impl Harness {
     async fn seed_foo(&self) {
         self.post("/api/packages", json!({"pkgbase": "foo", "streams": ["s1"], "class": "upstream-source"})).await;
         self.publish_pkg("foo", "1.0", &["glibc"], &[]);
-        assert_eq!(self.run().await["state"], "needs_input");
+        assert_eq!(self.run().await["state"], "done");
         let c = self.get("/api/candidates").await.as_array().unwrap()[0].clone();
         self.post(&format!("/api/candidates/{}/decide", c["id"].as_str().unwrap()), json!({"decision": "approve"})).await;
         assert_eq!(self.run().await["state"], "done");
@@ -611,19 +608,32 @@ impl Harness {
         self.versions.lock().unwrap().insert(pkgbase.to_string(), format!("{ver}-1"));
     }
 
-    /// Start or resume a run and wait until it finishes or needs input.
-    async fn run(&self) -> Value {
-        let started = self.post("/api/runs", json!({})).await;
-        let id = started["id"].as_str().unwrap().to_string();
+    /// Start an operation and wait until it finishes.
+    async fn op(&self, body: Value) -> Value {
+        let started = self.post("/api/runs", body).await;
+        let id = started["id"].as_str().unwrap_or_else(|| panic!("no run id: {started}")).to_string();
         let deadline = Instant::now() + Duration::from_secs(90);
         loop {
             let v = self.get(&format!("/api/runs/{id}")).await;
-            if v["finished_at"].is_string() || v["state"] == "needs_input" {
+            if v["finished_at"].is_string() {
                 return v;
             }
-            assert!(Instant::now() < deadline, "run did not settle: {v}");
+            assert!(Instant::now() < deadline, "operation did not settle: {v}");
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+    }
+
+    /// An update: a check followed by a build of everything authorised.
+    async fn run(&self) -> Value {
+        self.op(json!({"kind": "update"})).await
+    }
+
+    async fn check(&self) -> Value {
+        self.op(json!({"kind": "check"})).await
+    }
+
+    async fn build(&self, candidates: &[&str]) -> Value {
+        self.op(json!({"kind": "build", "candidates": candidates})).await
     }
 
     fn repo_db(&self) -> Vec<repoman_alpm::syncdb::SyncPackage> {
@@ -642,7 +652,7 @@ async fn onboarding_build_publish_update_cycle() {
 
     // Run 1: everything is new, so two onboarding candidates wait for us.
     let r1 = h.run().await;
-    assert_eq!(r1["state"], "needs_input", "{r1}");
+    assert_eq!(r1["state"], "done", "{r1}");
     let pending = h.get("/api/candidates").await;
     let pending = pending.as_array().unwrap();
     assert_eq!(pending.len(), 2, "{pending:?}");
@@ -710,7 +720,7 @@ async fn onboarding_build_publish_update_cycle() {
     let src = format!("{}/selfhosted.git", h.aur.git_url());
     h.post("/api/packages", json!({"pkgbase": "selfhosted", "streams": ["s1"], "source": src})).await;
     let rg = h.run().await;
-    assert_eq!(rg["state"], "needs_input", "{rg}");
+    assert_eq!(rg["state"], "done", "{rg}");
     let pending = h.get("/api/candidates").await;
     let c = &pending.as_array().unwrap()[0];
     assert_eq!(c["pkgbase"], "selfhosted");
@@ -730,7 +740,7 @@ async fn onboarding_build_publish_update_cycle() {
     let branched = format!("{src}#branch=next");
     h.post("/api/packages", json!({"pkgbase": "selfhosted", "streams": ["s1"], "source": branched})).await;
     let rb = h.run().await;
-    assert_eq!(rb["state"], "needs_input", "{rb}");
+    assert_eq!(rb["state"], "done", "{rb}");
     let pending = h.get("/api/candidates").await;
     let c = pending.as_array().unwrap().iter().find(|c| c["pkgbase"] == "selfhosted").expect("branch candidate");
     assert_eq!(c["review"]["version_to"], "0.2-1", "{c}");
@@ -746,7 +756,7 @@ async fn onboarding_build_publish_update_cycle() {
     // bar is rebuilt as a dependent, and the repo carries the new versions.
     h.publish_pkg("foo", "1.1", &["glibc"], &["cmake"]);
     let r4 = h.run().await;
-    assert_eq!(r4["state"], "needs_input", "{r4}");
+    assert_eq!(r4["state"], "done", "{r4}");
     let pending = h.get("/api/candidates").await;
     let pending = pending.as_array().unwrap();
     assert_eq!(pending.len(), 1);
@@ -758,13 +768,11 @@ async fn onboarding_build_publish_update_cycle() {
     let changed: Vec<&str> = c["review"]["changes"].as_array().unwrap().iter().map(|x| x["key"].as_str().unwrap()).collect();
     assert_eq!(changed, ["pkgver", "source"]);
     assert_eq!(c["review"]["commits"].as_array().unwrap().len(), 1);
-    // The gate saw a plain version bump: routine, low risk, SRCINFO regenerated
-    // by the inspect job matched the committed one.
+    // The gate saw a plain version bump: routine, low risk.
     assert_eq!(c["review"]["gate"]["diff_class"], "routine", "{}", c["review"]["gate"]);
     assert_eq!(c["floor_risk"], "low");
     let kinds: Vec<&str> = c["review"]["gate"]["reasons"].as_array().unwrap().iter().map(|r| r["kind"].as_str().unwrap()).collect();
-    assert!(kinds.contains(&"version_bump") && !kinds.contains(&"srcinfo_mismatch"), "{kinds:?}");
-    assert!(h.specs.lock().unwrap().iter().any(|s| matches!(s.job, JobKind::Inspect { .. })), "inspect job ran");
+    assert!(kinds.contains(&"version_bump"), "{kinds:?}");
     // Builds carry a predicted memory limit: the default for a package with no recorded peaks.
     assert!(h.specs.lock().unwrap().iter().any(|s| matches!(&s.job, JobKind::Build { memory_limit: Some(l), .. } if *l == 4 << 30)), "default footprint");
     // The UI's supporting endpoints: on-demand packaging diff, package history, static files.
@@ -799,7 +807,7 @@ async fn onboarding_build_publish_update_cycle() {
     // A rejected update stays rejected until the head moves.
     h.publish_pkg("bar", "2.1", &["foo", "python"], &[]);
     let r6 = h.run().await;
-    assert_eq!(r6["state"], "needs_input");
+    assert_eq!(r6["state"], "done");
     let pending = h.get("/api/candidates").await;
     let c = &pending.as_array().unwrap()[0];
     h.post(&format!("/api/candidates/{}/decide", c["id"].as_str().unwrap()), json!({"decision": "reject", "note": "nope"})).await;
@@ -815,7 +823,7 @@ async fn routine_update_auto_approves_after_quarantine() {
     h.post("/api/packages", json!({"pkgbase": "foo", "streams": ["s1"], "class": "upstream-source"})).await;
     h.publish_pkg("foo", "1.0", &["glibc"], &[]);
     let r1 = h.run().await;
-    assert_eq!(r1["state"], "needs_input", "onboarding is never automatic: {r1}");
+    assert_eq!(r1["state"], "done", "onboarding is never automatic: {r1}");
     let pending = h.get("/api/candidates").await;
     let c = &pending.as_array().unwrap()[0];
     assert_eq!(c["kind"], "onboarding");
@@ -828,7 +836,7 @@ async fn routine_update_auto_approves_after_quarantine() {
     h.publish_pkg("foo", "1.1", &["glibc"], &[]);
     h.aur.stamps.lock().unwrap().insert("foo".into(), now);
     let r2 = h.run().await;
-    assert_eq!(r2["state"], "needs_input", "{r2}");
+    assert_eq!(r2["state"], "done", "{r2}");
     let pending = h.get("/api/candidates").await;
     let c = &pending.as_array().unwrap()[0];
     assert_eq!(c["review"]["gate"]["diff_class"], "routine");
@@ -856,7 +864,7 @@ async fn routine_update_auto_approves_after_quarantine() {
     h.publish_pkg("foo", "1.3", &["glibc", "libnotinrepos"], &[]);
     h.aur.stamps.lock().unwrap().insert("foo".into(), now - 30 * 86_400);
     let r4 = h.run().await;
-    assert_eq!(r4["state"], "needs_input", "{r4}");
+    assert_eq!(r4["state"], "done", "{r4}");
     let pending = h.get("/api/candidates").await;
     let c = &pending.as_array().unwrap()[0];
     assert_eq!(c["review"]["gate"]["diff_class"], "structural", "{}", c["review"]["gate"]);
@@ -904,7 +912,7 @@ async fn structural_update_is_sent_to_the_reviewer() {
     h.post("/api/packages", json!({"pkgbase": "foo", "streams": ["s1"], "class": "upstream-source"})).await;
     h.publish_pkg("foo", "1.0", &["glibc"], &[]);
     let r1 = h.run().await;
-    assert_eq!(r1["state"], "needs_input", "{r1}");
+    assert_eq!(r1["state"], "done", "{r1}");
     let pending = h.get("/api/candidates").await;
     let c = &pending.as_array().unwrap()[0];
     // Onboarding of a clean package: low floor risk, so no API call is spent.
@@ -927,7 +935,7 @@ async fn structural_update_is_sent_to_the_reviewer() {
     *h.feed.lock().unwrap() = feed_xml(&[feed_item(100, "Deletion", "foo", None, "mallory", "Upstream is dead.")]);
     h.publish_pkg("foo", "1.1", &["glibc", "libnotinrepos"], &[]);
     let r2 = h.run().await;
-    assert_eq!(r2["state"], "needs_input", "{r2}");
+    assert_eq!(r2["state"], "done", "{r2}");
     let pending = h.get("/api/candidates").await;
     let c = &pending.as_array().unwrap()[0];
     assert_eq!(c["review"]["gate"]["diff_class"], "structural");
@@ -963,7 +971,7 @@ async fn artifacts_with_new_install_script_wait_in_publish_review() {
     let h = start_with(|_| {}).await;
     h.post("/api/packages", json!({"pkgbase": "foo", "streams": ["s1"], "class": "upstream-source"})).await;
     h.publish_pkg("foo", "1.0", &["glibc"], &[]);
-    assert_eq!(h.run().await["state"], "needs_input");
+    assert_eq!(h.run().await["state"], "done");
     let c = h.get("/api/candidates").await.as_array().unwrap()[0].clone();
     h.post(&format!("/api/candidates/{}/decide", c["id"].as_str().unwrap()), json!({"decision": "approve"})).await;
     assert_eq!(h.run().await["state"], "done");
@@ -974,12 +982,12 @@ async fn artifacts_with_new_install_script_wait_in_publish_review() {
     h.aur.publish_with_install("foo", "1.1", &["glibc"]);
     h.versions.lock().unwrap().insert("foo".into(), "1.1-1".into());
     let r = h.run().await;
-    assert_eq!(r["state"], "needs_input", "{r}");
+    assert_eq!(r["state"], "done", "{r}");
     let c = h.get("/api/candidates").await.as_array().unwrap()[0].clone();
     assert_eq!(c["review"]["gate"]["diff_class"], "structural");
     h.post(&format!("/api/candidates/{}/decide", c["id"].as_str().unwrap()), json!({"decision": "approve"})).await;
     let r2 = h.run().await;
-    assert_eq!(r2["state"], "needs_input", "{r2}");
+    assert_eq!(r2["state"], "done", "{r2}");
     let held = h.get("/api/candidates?state=publish_review").await;
     let held = held.as_array().unwrap();
     assert_eq!(held.len(), 1, "{held:?}");
@@ -1002,7 +1010,7 @@ async fn cache_serves_verified_upstream_files() {
     // Streams load on the first run; trigger one so the index knows cmake.
     h.post("/api/packages", json!({"pkgbase": "foo", "streams": ["s1"]})).await;
     h.publish_pkg("foo", "1.0", &["glibc"], &[]);
-    assert_eq!(h.run().await["state"], "needs_input");
+    assert_eq!(h.run().await["state"], "done");
     let before = h.mirror_requests.lock().unwrap().len();
 
     // Miss: fetched from the mirror, verified, served.
@@ -1043,7 +1051,7 @@ async fn aur_security_signal_blocks_auto_approval() {
     let h = start_with(|c| c.auto_approve = true).await;
     h.post("/api/packages", json!({"pkgbase": "foo", "streams": ["s1"], "class": "upstream-source"})).await;
     h.publish_pkg("foo", "1.0", &["glibc"], &[]);
-    assert_eq!(h.run().await["state"], "needs_input");
+    assert_eq!(h.run().await["state"], "done");
     let c = h.get("/api/candidates").await.as_array().unwrap()[0].clone();
     h.post(&format!("/api/candidates/{}/decide", c["id"].as_str().unwrap()), json!({"decision": "approve"})).await;
     assert_eq!(h.run().await["state"], "done");
@@ -1052,7 +1060,7 @@ async fn aur_security_signal_blocks_auto_approval() {
     h.dangerous.lock().unwrap().push("foo".into());
     h.publish_pkg("foo", "1.1", &["glibc"], &[]);
     let r = h.run().await;
-    assert_eq!(r["state"], "needs_input", "{r}");
+    assert_eq!(r["state"], "done", "{r}");
     let c = h.get("/api/candidates").await.as_array().unwrap()[0].clone();
     assert_eq!(c["review"]["gate"]["diff_class"], "routine");
     assert!(c["decided_by"].is_null(), "not auto-approved: {c}");
@@ -1068,7 +1076,7 @@ async fn soname_bump_in_stream_rebuilds_dependents() {
     let h = start().await;
     h.post("/api/packages", json!({"pkgbase": "foo", "streams": ["s1"], "class": "upstream-source"})).await;
     h.publish_pkg("foo", "1.0", &["glibc", "libfoo"], &[]);
-    assert_eq!(h.run().await["state"], "needs_input");
+    assert_eq!(h.run().await["state"], "done");
     let c = h.get("/api/candidates").await.as_array().unwrap()[0].clone();
     h.post(&format!("/api/candidates/{}/decide", c["id"].as_str().unwrap()), json!({"decision": "approve"})).await;
     assert_eq!(h.run().await["state"], "done");
@@ -1130,7 +1138,7 @@ async fn adoption_from_orphan_blocks_until_cleared() {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
     h.aur.stamps.lock().unwrap().insert("foo".into(), now - 30 * 86_400);
     let r = h.run().await;
-    assert_eq!(r["state"], "needs_input", "{r}");
+    assert_eq!(r["state"], "done", "{r}");
     let c = h.get("/api/candidates").await.as_array().unwrap()[0].clone();
     let c = h.get(&format!("/api/candidates/{}", c["id"].as_str().unwrap())).await;
     assert_eq!(c["review"]["gate"]["diff_class"], "structural", "{}", c["review"]["gate"]);
@@ -1198,7 +1206,7 @@ async fn deleted_then_resubmitted_base_is_flagged() {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
     h.aur.stamps.lock().unwrap().insert("foo".into(), now - 30 * 86_400);
     let r = h.run().await;
-    assert_eq!(r["state"], "needs_input", "{r}");
+    assert_eq!(r["state"], "done", "{r}");
     let c = h.get("/api/candidates").await.as_array().unwrap()[0].clone();
     let c = h.get(&format!("/api/candidates/{}", c["id"].as_str().unwrap())).await;
     assert_eq!(c["review"]["gate"]["diff_class"], "structural", "{}", c["review"]["gate"]);
@@ -1242,7 +1250,7 @@ async fn aur_requests_against_tracked_packages_become_signals() {
     h.publish_pkg("foo", "1.1", &["glibc"], &[]);
     h.aur.stamps.lock().unwrap().insert("foo".into(), now - 30 * 86_400);
     let r = h.run().await;
-    assert_eq!(r["state"], "needs_input", "{r}");
+    assert_eq!(r["state"], "done", "{r}");
     assert_eq!(h.get("/api/packages/foo").await["signals"].as_array().unwrap().len(), 1, "same message is not recorded twice");
 
     // A Package Maintainer rejects the request: the filing clears itself
@@ -1273,7 +1281,7 @@ async fn aur_general_mentions_are_info_signals() {
     // words), so this test's package is "frobnicator", not "foo".
     h.post("/api/packages", json!({"pkgbase": "frobnicator", "streams": ["s1"], "class": "upstream-source"})).await;
     h.publish_pkg("frobnicator", "1.0", &["glibc"], &[]);
-    assert_eq!(h.run().await["state"], "needs_input");
+    assert_eq!(h.run().await["state"], "done");
     let c = h.get("/api/candidates").await.as_array().unwrap()[0].clone();
     h.post(&format!("/api/candidates/{}/decide", c["id"].as_str().unwrap()), json!({"decision": "approve"})).await;
     assert_eq!(h.run().await["state"], "done");
@@ -1299,4 +1307,115 @@ async fn aur_general_mentions_are_info_signals() {
     assert_eq!(h.run().await["state"], "done");
     assert_eq!(h.repo_db().iter().find(|p| p.name == "frobnicator").unwrap().version, "1.1-1");
     assert_eq!(h.get("/api/packages/frobnicator").await["signals"].as_array().unwrap().len(), 1, "no duplicate");
+}
+
+#[tokio::test]
+async fn check_gathers_and_build_executes_separately() {
+    let h = start_with(|c| c.auto_approve = true).await;
+    h.post("/api/packages", json!({"pkgbase": "foo", "streams": ["s1"], "class": "upstream-source"})).await;
+    h.post("/api/packages", json!({"pkgbase": "bar", "streams": ["s1"], "class": "upstream-source"})).await;
+    h.publish_pkg("foo", "1.0", &["glibc"], &[]);
+    h.publish_pkg("bar", "1.0", &["glibc"], &[]);
+
+    // A check creates the onboarding candidates and builds nothing.
+    let c1 = h.check().await;
+    assert_eq!(c1["kind"], "check");
+    assert_eq!(c1["state"], "done", "{c1}");
+    assert_eq!(c1["summary"]["new_candidates"], 2, "{}", c1["summary"]);
+    assert_eq!(c1["summary"]["needs_you"], 2);
+    assert!(h.specs.lock().unwrap().iter().all(|s| !matches!(s.job, JobKind::Build { .. })), "a check never builds");
+    let pending = h.get("/api/candidates").await;
+    let pending = pending.as_array().unwrap().clone();
+    assert!(pending.iter().all(|c| c["review"]["decision"]["kind"] == "needs_you"), "{pending:?}");
+    assert!(pending[0]["review"]["decision"]["reasons"][0].as_str().unwrap().contains("first review"), "{}", pending[0]["review"]["decision"]);
+
+    // Approve both, build only foo: bar stays approved and unbuilt.
+    for c in &pending {
+        h.post(&format!("/api/candidates/{}/decide", c["id"].as_str().unwrap()), json!({"decision": "approve", "class": "upstream-source"})).await;
+    }
+    let foo = pending.iter().find(|c| c["pkgbase"] == "foo").unwrap()["id"].as_str().unwrap().to_string();
+    let b1 = h.build(&[&foo]).await;
+    assert_eq!(b1["kind"], "build");
+    assert_eq!(b1["state"], "done", "{b1}");
+    assert_eq!(b1["summary"]["builds_succeeded"], 1, "{}", b1["summary"]);
+    assert_eq!(b1["summary"]["selection"], 1);
+    let names: Vec<String> = h.repo_db().iter().map(|p| p.name.clone()).collect();
+    assert_eq!(names, ["foo"]);
+    assert_eq!(h.get("/api/candidates?state=approved").await.as_array().unwrap().len(), 1, "bar still authorised");
+
+    // A build with no selection takes the rest.
+    let b2 = h.build(&[]).await;
+    assert_eq!(b2["summary"]["builds_succeeded"], 1, "{}", b2["summary"]);
+    let mut names: Vec<String> = h.repo_db().iter().map(|p| p.name.clone()).collect();
+    names.sort();
+    assert_eq!(names, ["bar", "foo"]);
+}
+
+#[tokio::test]
+async fn quarantined_candidate_holds_nothing_up() {
+    let h = start_with(|c| c.auto_approve = true).await;
+    h.post("/api/packages", json!({"pkgbase": "foo", "streams": ["s1"], "class": "upstream-source"})).await;
+    h.post("/api/packages", json!({"pkgbase": "bar", "streams": ["s1"], "class": "upstream-source"})).await;
+    h.publish_pkg("foo", "1.0", &["glibc"], &[]);
+    h.publish_pkg("bar", "1.0", &["glibc"], &[]);
+    assert_eq!(h.run().await["state"], "done");
+    for c in h.get("/api/candidates").await.as_array().unwrap() {
+        h.post(&format!("/api/candidates/{}/decide", c["id"].as_str().unwrap()), json!({"decision": "approve", "class": "upstream-source"})).await;
+    }
+    assert_eq!(h.run().await["summary"]["builds_succeeded"], 2);
+
+    // foo bumps just now (quarantined); bar bumps a month ago (approved by
+    // the gate). One update builds bar and leaves foo waiting on the clock.
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    h.publish_pkg("foo", "1.1", &["glibc"], &[]);
+    h.aur.stamps.lock().unwrap().insert("foo".into(), now);
+    h.publish_pkg("bar", "1.1", &["glibc"], &[]);
+    h.aur.stamps.lock().unwrap().insert("bar".into(), now - 30 * 86_400);
+    let r = h.run().await;
+    assert_eq!(r["state"], "done", "{r}");
+    assert_eq!(r["summary"]["check"]["quarantined"], 1, "{}", r["summary"]);
+    assert_eq!(r["summary"]["check"]["approved"], 1);
+    assert_eq!(r["summary"]["builds_succeeded"], 1, "{}", r["summary"]);
+    assert_eq!(h.repo_db().iter().find(|p| p.name == "bar").unwrap().version, "1.1-1");
+    assert_eq!(h.repo_db().iter().find(|p| p.name == "foo").unwrap().version, "1.0-1", "foo waits");
+    let c = h.get("/api/candidates").await.as_array().unwrap()[0].clone();
+    assert_eq!(c["pkgbase"], "foo");
+    assert_eq!(c["review"]["decision"]["kind"], "quarantine", "{}", c["review"]["decision"]);
+    let until = c["review"]["decision"]["until"].as_i64().unwrap();
+    assert!(until > now + 2 * 86_400 && until <= now + 3 * 86_400 + 5, "until={until} now={now}");
+}
+
+#[tokio::test]
+async fn cleared_hold_publishes_the_reviewed_artifacts() {
+    let h = start_with(|_| {}).await;
+    h.post("/api/packages", json!({"pkgbase": "foo", "streams": ["s1"], "class": "upstream-source"})).await;
+    h.publish_pkg("foo", "1.0", &["glibc"], &[]);
+    assert_eq!(h.run().await["state"], "done");
+    let c = h.get("/api/candidates").await.as_array().unwrap()[0].clone();
+    h.post(&format!("/api/candidates/{}/decide", c["id"].as_str().unwrap()), json!({"decision": "approve"})).await;
+    assert_eq!(h.run().await["state"], "done");
+
+    h.aur.publish_with_install("foo", "1.1", &["glibc"]);
+    h.versions.lock().unwrap().insert("foo".into(), "1.1-1".into());
+    assert_eq!(h.run().await["state"], "done");
+    let c = h.get("/api/candidates").await.as_array().unwrap()[0].clone();
+    h.post(&format!("/api/candidates/{}/decide", c["id"].as_str().unwrap()), json!({"decision": "approve"})).await;
+    assert_eq!(h.run().await["summary"]["held_for_review"], 1);
+    let held = h.get("/api/candidates?state=publish_review").await.as_array().unwrap()[0].clone();
+    let jobs = h.get(&format!("/api/jobs?candidate={}", held["id"].as_str().unwrap())).await;
+    let reviewed_sha = jobs[0]["result"]["artifacts"][0]["sha256"].as_str().unwrap().to_string();
+    let builds_before = h.specs.lock().unwrap().iter().filter(|s| matches!(s.job, JobKind::Build { .. })).count();
+
+    // Approving the hold publishes exactly what was reviewed: no new build.
+    h.post(&format!("/api/candidates/{}/decide", held["id"].as_str().unwrap()), json!({"decision": "approve"})).await;
+    let r = h.build(&[]).await;
+    assert_eq!(r["state"], "done", "{r}");
+    assert_eq!(r["summary"]["published_as_reviewed"], 1, "{}", r["summary"]);
+    assert_eq!(r["summary"]["builds_planned"], 0, "{}", r["summary"]);
+    let builds_after = h.specs.lock().unwrap().iter().filter(|s| matches!(s.job, JobKind::Build { .. })).count();
+    assert_eq!(builds_after, builds_before, "no rebuild");
+    assert_eq!(h.repo_db().iter().find(|p| p.name == "foo").unwrap().version, "1.1-1");
+    let hist = h.get("/api/packages/foo/history").await;
+    let live = hist["publications"].as_array().unwrap().iter().find(|p| p["retired_at"].is_null()).unwrap();
+    assert_eq!(live["artifact"]["sha256"], reviewed_sha, "the reviewed artifact is what the repo serves");
 }

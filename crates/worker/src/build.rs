@@ -185,6 +185,22 @@ pub async fn run_build(ctx: &JobCtx, p: BuildParams<'_>) -> Result<JobResult> {
     }
     ctx.stage_done("sources");
 
+    // ---- srcinfo: what the PKGBUILD really declares --------------------------
+    // The gate reviewed the committed .SRCINFO; a PKGBUILD that generates a
+    // different one is lying to it. Regenerated here, where the PKGBUILD is
+    // being executed anyway, and compared by the coordinator before publish.
+    ctx.stage("srcinfo");
+    let script = "makepkg --printsrcinfo > /build/SRCINFO.generated";
+    let cmd = sandbox(false).command(&["/bin/sh".into(), "-c".into(), script.into()], user, &cwd, &user_env)?;
+    let (status, tail) = run_logged(ctx, cmd, Some(ctx.timeout())).await?;
+    let srcinfo = if status.success() {
+        std::fs::read_to_string(build_dir.join("SRCINFO.generated")).ok()
+    } else {
+        ctx.log(Fd::System, format!("makepkg --printsrcinfo failed ({status}): {}", tail.join(" | ")));
+        None
+    };
+    ctx.stage_done("srcinfo");
+
     // ---- build (offline unless policy allows network) ----------------------
     ctx.stage("build");
     if p.allow_network {
@@ -295,6 +311,7 @@ pub async fn run_build(ctx: &JobCtx, p: BuildParams<'_>) -> Result<JobResult> {
         net_attempts,
         outside_writes,
         upstream_rev,
+        srcinfo,
     })
 }
 
@@ -328,66 +345,6 @@ pub fn read_netlog(path: &Path) -> u64 {
         .flatten()
         .filter_map(|e| e["counter"]["packets"].as_u64())
         .sum()
-}
-
-/// Regenerate SRCINFO from the PKGBUILD, offline, as the build user.
-pub async fn run_inspect(ctx: &JobCtx, pkgbase: &str, image: &ImageRef, source_url: &str) -> Result<JobResult> {
-    let cfg = &ctx.config;
-    let job_dir = ctx.job_dir();
-    let upper = job_dir.join("upper");
-    let work = job_dir.join("work");
-    let mnt = job_dir.join("root");
-    let build_dir = job_dir.join("build");
-    ctx.stage("provision");
-    let lower = ensure_image(ctx, image).await?;
-    for d in [&upper, &work, &mnt, &build_dir] {
-        tokio::fs::create_dir_all(d).await?;
-    }
-    let src_tar = job_dir.join("source.tar");
-    download(&ctx.http, source_url, &src_tar).await?;
-    let mut cmd = tokio::process::Command::new("bsdtar");
-    cmd.arg("-xf").arg(&src_tar).arg("-C").arg(&build_dir)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let (status, tail) = run_logged(ctx, cmd, None).await?;
-    if !status.success() {
-        bail!("extracting source tarball failed: {}", tail.join(" | "));
-    }
-    chown_recursive(&build_dir, cfg.build_uid)?;
-    let sb = Sandbox {
-        root: RootSource::Overlay {
-            lower,
-            upper,
-            work,
-        },
-        mountpoint: mnt,
-        binds: vec![(build_dir.clone(), "/build".into())],
-        network: false,
-        cgroup: ctx.cgroup_path(),
-        hostname: "repoman-inspect".into(),
-        chroot: true,
-        netlog: None,
-    };
-    sb.prepare_dirs()?;
-    ctx.stage_done("provision");
-
-    ctx.stage("printsrcinfo");
-    let out_path = build_dir.join("SRCINFO.generated");
-    let script = "makepkg --printsrcinfo > /build/SRCINFO.generated";
-    let cmd = sb.command(
-        &["/bin/sh".into(), "-c".into(), script.into()],
-        RunAs::User { uid: cfg.build_uid, gid: cfg.build_uid },
-        &format!("/build/{pkgbase}"),
-        &[("HOME".into(), "/build".into())],
-    )?;
-    let (status, tail) = run_logged(ctx, cmd, Some(std::time::Duration::from_secs(600))).await?;
-    if !status.success() {
-        bail!("makepkg --printsrcinfo failed ({status}): {}", tail.join(" | "));
-    }
-    let srcinfo = std::fs::read_to_string(&out_path)?;
-    ctx.stage_done("printsrcinfo");
-    Ok(JobResult::Inspect { srcinfo })
 }
 
 async fn download(http: &reqwest::Client, url: &str, dest: &Path) -> Result<()> {
@@ -466,7 +423,7 @@ fn dir_size(path: &Path) -> Result<u64> {
 /// `name::` prefix if given, else the URL's last path component without
 /// `.git`.
 pub fn vcs_checkout_dir(source: &str) -> Option<String> {
-    let vcs = crate::probe::VcsSource::parse(source)?;
+    let vcs = repoman_alpm::vcs::VcsSource::parse(source)?;
     if let Some((name, _)) = source.split_once("::") {
         return Some(name.to_string());
     }

@@ -21,6 +21,7 @@ pub mod reviewer;
 pub mod hub;
 pub mod keys;
 pub mod planner;
+pub mod probe;
 pub mod publisher;
 pub mod streams;
 
@@ -102,28 +103,12 @@ pub async fn run(config: CoordinatorConfig) -> Result<()> {
 pub async fn serve(config: CoordinatorConfig, store: Arc<Store>, listener: TcpListener) -> Result<()> {
     let state = AppState::new(config, store)?;
     tokio::spawn(state.hub.clone().dispatcher());
-    // Cache eviction on a schedule, independent of runs.
-    let cache = state.cache.clone();
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
-        loop {
-            tick.tick().await;
-            if let Err(e) = cache.maintain() {
-                tracing::warn!(error = %format!("{e:#}"), "cache maintenance failed");
-            }
-        }
-    });
-    // aur-requests between runs: a request against one of our packages is
-    // worth knowing about before the next run, and the feed is short.
-    if state.aurreq.is_some() || state.aurgen.is_some() {
-        let st = state.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(st.config.aur_requests_poll_secs.max(60)));
-            loop {
-                tick.tick().await;
-                engine::ingest_lists(&st).await;
-            }
-        });
+    // Nothing runs on a timer: information is gathered by a check the
+    // operator starts, and builds execute what the operator authorised.
+    match state.store.abort_stale_runs() {
+        Ok(n) if n > 0 => tracing::warn!(count = n, "closed operations left running by a previous coordinator"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "closing stale operations"),
     }
     axum::serve(listener, api::router(state)).await?;
     Ok(())

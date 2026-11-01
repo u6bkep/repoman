@@ -62,8 +62,6 @@ pub struct GateInput<'a> {
     /// The baseline commit is not an ancestor of the head: the AUR
     /// repository was deleted and resubmitted.
     pub history_rewritten: bool,
-    /// Regenerated SRCINFO (from an inspect job) differed from the committed one.
-    pub srcinfo_mismatch: Option<bool>,
     /// Whether a dependency name is satisfiable from the official repos.
     pub is_official: &'a dyn Fn(&str) -> bool,
 }

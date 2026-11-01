@@ -10,6 +10,10 @@ use crate::Store;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunRow {
     pub id: String,
+    /// check | build | update (a check followed by a build)
+    pub kind: String,
+    /// What was asked for: a candidate selection for builds.
+    pub request: serde_json::Value,
     pub started_at: String,
     pub finished_at: Option<String>,
     pub state: String,
@@ -83,8 +87,11 @@ fn row_to_candidate(r: &rusqlite::Row) -> rusqlite::Result<CandidateRow> {
 fn row_to_run(r: &rusqlite::Row) -> rusqlite::Result<RunRow> {
     let summary: String = r.get(5)?;
     let progress: String = r.get(6)?;
+    let request: String = r.get(8)?;
     Ok(RunRow {
         id: r.get(0)?,
+        kind: r.get(7)?,
+        request: serde_json::from_str(&request).unwrap_or(serde_json::Value::Null),
         started_at: r.get(1)?,
         finished_at: r.get(2)?,
         state: r.get(3)?,
@@ -97,22 +104,35 @@ fn row_to_run(r: &rusqlite::Row) -> rusqlite::Result<RunRow> {
 impl Store {
     // ---- runs -------------------------------------------------------------
 
-    pub fn create_run(&self) -> Result<RunRow> {
+    pub fn create_run(&self, kind: &str, request: &serde_json::Value) -> Result<RunRow> {
         let id = repoman_common::new_id();
         self.with(|c| {
             c.execute(
-                "INSERT INTO run (id, started_at, state) VALUES (?1, ?2, 'running')",
-                params![id, clock::now()],
+                "INSERT INTO run (id, started_at, state, kind, request) VALUES (?1, ?2, 'running', ?3, ?4)",
+                params![id, clock::now(), kind, request.to_string()],
             )?;
             Ok(())
         })?;
         Ok(self.get_run(&id)?.expect("run just inserted"))
     }
 
+    /// Operations left `running` by a coordinator that died: nothing will
+    /// finish them. Returns how many were closed.
+    pub fn abort_stale_runs(&self) -> Result<usize> {
+        self.with(|c| {
+            Ok(c.execute(
+                "UPDATE run SET state = 'aborted', finished_at = ?1, step = NULL,
+                        summary = json_set(summary, '$.error', 'coordinator restarted')
+                 WHERE finished_at IS NULL",
+                params![clock::now()],
+            )?)
+        })
+    }
+
     pub fn get_run(&self, id: &str) -> Result<Option<RunRow>> {
         self.with(|c| {
             Ok(c.query_row(
-                "SELECT id, started_at, finished_at, state, step, summary, progress FROM run WHERE id = ?1",
+                "SELECT id, started_at, finished_at, state, step, summary, progress, kind, request FROM run WHERE id = ?1",
                 params![id],
                 row_to_run,
             )
@@ -124,7 +144,7 @@ impl Store {
     pub fn active_run(&self) -> Result<Option<RunRow>> {
         self.with(|c| {
             Ok(c.query_row(
-                "SELECT id, started_at, finished_at, state, step, summary, progress FROM run
+                "SELECT id, started_at, finished_at, state, step, summary, progress, kind, request FROM run
                  WHERE finished_at IS NULL ORDER BY started_at DESC LIMIT 1",
                 [],
                 row_to_run,
@@ -136,7 +156,7 @@ impl Store {
     pub fn list_runs(&self, limit: u32) -> Result<Vec<RunRow>> {
         self.with(|c| {
             let mut st = c.prepare(
-                "SELECT id, started_at, finished_at, state, step, summary, progress FROM run
+                "SELECT id, started_at, finished_at, state, step, summary, progress, kind, request FROM run
                  ORDER BY started_at DESC LIMIT ?1",
             )?;
             Ok(st
@@ -385,7 +405,7 @@ mod tests {
     fn run_and_candidate_lifecycle() {
         let s = Store::open_memory().unwrap();
         assert!(s.active_run().unwrap().is_none());
-        let run = s.create_run().unwrap();
+        let run = s.create_run("check", &serde_json::json!({})).unwrap();
         assert_eq!(s.active_run().unwrap().unwrap().id, run.id);
         s.set_run_step(&run.id, "running", Some("poll")).unwrap();
 

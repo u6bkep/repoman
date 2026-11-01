@@ -38,12 +38,11 @@ adoption_quarantine_days = 30
 # The aur-requests mailing list (RSS of the archive). Deletion and merge
 # requests against tracked packages block auto-approval until a Package
 # Maintainer rejects them or you clear them; orphan and adoption requests are
-# recorded as context. Read at every run and every aur_requests_poll_secs.
+# recorded as context. Read at every check; nothing polls on a timer.
 aur_requests_url = "https://lists.archlinux.org/archives/list/aur-requests@lists.archlinux.org/feed/"
-aur_requests_poll_secs = 1800
 
 # aur-general discussion: messages naming a tracked package become info
-# signals (context for the reviewer, never blocking). Same poll interval.
+# signals (context for the reviewer, never blocking). Read at every check.
 aur_general_url = "https://lists.archlinux.org/archives/list/aur-general@lists.archlinux.org/feed/"
 
 # The AUR website, read once per LLM review for the package's comments.

@@ -208,7 +208,7 @@ pub struct CreateJob {
 }
 
 async fn create_job(State(st): State<AppState>, axum::Json(req): axum::Json<CreateJob>) -> Result<(StatusCode, axum::Json<JobRow>), ApiError> {
-    if !matches!(req.job, JobKind::Noop { .. } | JobKind::Probe { .. }) {
+    if !matches!(req.job, JobKind::Noop { .. }) {
         return Err(bad_request("only noop and probe jobs can be submitted directly; builds come from runs"));
     }
     let row = st
@@ -526,11 +526,18 @@ struct StartedRun {
     id: String,
 }
 
-async fn start_run(State(st): State<AppState>) -> Result<(StatusCode, axum::Json<StartedRun>), ApiError> {
+/// `POST /api/runs` with `{"kind": "check" | "build" | "update", "candidates": [...]}`;
+/// an empty body means update.
+async fn start_run(State(st): State<AppState>, body: axum::body::Bytes) -> Result<(StatusCode, axum::Json<StartedRun>), ApiError> {
     if st.config.streams.is_empty() {
         return Err(bad_request("no streams configured"));
     }
-    let id = st.engine.start_or_resume(st.clone()).map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")))?;
+    let req: crate::engine::OpRequest = if body.trim_ascii().is_empty() {
+        crate::engine::OpRequest::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|e| bad_request(format!("bad request body: {e}")))?
+    };
+    let id = st.engine.start(st.clone(), req).map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")))?;
     Ok((StatusCode::ACCEPTED, axum::Json(StartedRun { id })))
 }
 

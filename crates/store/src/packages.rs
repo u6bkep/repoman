@@ -63,6 +63,9 @@ pub struct SnapshotRow {
     /// When we first saw the package without a maintainer.
     #[serde(default)]
     pub orphaned_since: Option<String>,
+    /// Last upstream VCS probe, for `policy.probe_interval_hours`.
+    #[serde(default)]
+    pub probed_at: Option<String>,
 }
 
 impl Store {
@@ -304,7 +307,7 @@ impl Store {
             Ok(c.query_row(
                 "SELECT pkgbase, fetched_at, version, last_modified, maintainer, submitter, comaintainers,
                         out_of_date, votes, popularity, head_commit, package_base_id, first_submitted,
-                        missing_since, orphaned_since
+                        missing_since, orphaned_since, probed_at
                  FROM aur_snapshot WHERE pkgbase = ?1",
                 params![pkgbase],
                 row_to_snapshot,
@@ -350,6 +353,13 @@ impl Store {
         })
     }
 
+    pub fn set_snapshot_probed(&self, pkgbase: &str, at: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute("UPDATE aur_snapshot SET probed_at = ?2 WHERE pkgbase = ?1", params![pkgbase, at])?;
+            Ok(())
+        })
+    }
+
     pub fn set_snapshot_head(&self, pkgbase: &str, head: &str) -> Result<()> {
         self.with(|c| {
             c.execute(
@@ -388,6 +398,7 @@ fn row_to_snapshot(r: &rusqlite::Row) -> rusqlite::Result<SnapshotRow> {
         first_submitted: r.get(12)?,
         missing_since: r.get(13)?,
         orphaned_since: r.get(14)?,
+        probed_at: r.get(15)?,
     })
 }
 
@@ -420,7 +431,7 @@ mod tests {
 
         s.set_package_policy("yay", &serde_json::json!({"pgp": "skip"})).unwrap();
         assert_eq!(s.get_package("yay").unwrap().unwrap().policy["pgp"], "skip");
-        let run = s.create_run().unwrap();
+        let run = s.create_run("check", &serde_json::json!({})).unwrap();
         let c = s
             .create_candidate(
                 &run.id,
@@ -463,6 +474,7 @@ mod tests {
             first_submitted: Some(50),
             missing_since: None,
             orphaned_since: None,
+            probed_at: None,
         };
         s.upsert_snapshot(&snap).unwrap();
         snap.head_commit = None;

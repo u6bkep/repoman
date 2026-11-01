@@ -1,12 +1,17 @@
-//! The update run. One run is active at a time. Each step persists its
-//! progress so the UI can show where a run is, and a run that needs the
-//! operator parks in `needs_input` until `start_or_resume` is called again.
+//! Operations. A **check** gathers information: stream databases, AUR and
+//! git polls, candidates and their assessment, the gate's decisions,
+//! upstream VCS probes, dependency resolution. It never waits for anyone
+//! and never builds. A **build** executes what is authorised: approved
+//! candidates (all, or a selection), planned per stream, built on workers,
+//! published, with flagged artifacts held for the operator. An **update**
+//! is a check followed by a build. One operation runs at a time.
 //!
 //! Gate: `update` candidates are classified and lint-checked (`crate::gate`);
 //! routine and metadata changes with a low floor risk auto-approve once they
 //! have sat on the AUR for the quarantine period and carry no negative
 //! signal. Everything else, and every `onboarding` candidate, waits for the
-//! operator. `vcs` and `dependency_rebuild` candidates are auto-approved.
+//! operator without holding anything up. `vcs` and `dependency_rebuild`
+//! candidates are auto-approved.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -21,6 +26,7 @@ use repoman_common::proto::{ImageRef, JobKind, JobResult, JobState};
 use repoman_common::proto::ArtifactInfo;
 use repoman_store::artifacts::ArtifactRow;
 use repoman_store::{CandidateRow, NewCandidate, PackageRow, SnapshotRow};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::AppState;
@@ -31,6 +37,22 @@ pub struct Engine {
     running: AtomicBool,
 }
 
+/// What the operator asked for.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OpRequest {
+    /// check | build | update
+    #[serde(default = "default_kind")]
+    pub kind: String,
+    /// For builds: only these candidates (and what they depend on). Empty
+    /// means everything authorised.
+    #[serde(default)]
+    pub candidates: Vec<String>,
+}
+
+fn default_kind() -> String {
+    "update".into()
+}
+
 impl Engine {
     pub fn new() -> Arc<Self> {
         Arc::new(Engine {
@@ -38,40 +60,45 @@ impl Engine {
         })
     }
 
-    /// Start a run, or resume the active one. Returns the run id. The run
-    /// executes in a background task.
-    pub fn start_or_resume(self: &Arc<Self>, app: AppState) -> Result<String> {
-        if self.running.swap(true, Ordering::SeqCst) {
-            if let Some(r) = app.store.active_run()? {
-                return Ok(r.id);
-            }
-            self.running.store(false, Ordering::SeqCst);
-            bail!("engine busy without an active run; retry");
+    /// Start an operation in a background task and return its id. Refuses
+    /// while one is running: the UI shows what, and the operator waits.
+    pub fn start(self: &Arc<Self>, app: AppState, req: OpRequest) -> Result<String> {
+        if !matches!(req.kind.as_str(), "check" | "build" | "update") {
+            bail!("unknown operation kind {:?}", req.kind);
         }
-        let run = match app.store.active_run()? {
-            Some(r) => r,
-            None => app.store.create_run()?,
+        if self.running.swap(true, Ordering::SeqCst) {
+            let what = app.store.active_run()?.map(|r| format!("{} {}", r.kind, r.id)).unwrap_or_else(|| "an operation".into());
+            bail!("{what} is still running");
+        }
+        let run = match app.store.create_run(&req.kind, &serde_json::to_value(&req)?) {
+            Ok(r) => r,
+            Err(e) => {
+                self.running.store(false, Ordering::SeqCst);
+                return Err(e);
+            }
         };
         let id = run.id.clone();
         let engine = self.clone();
         let task_id = id.clone();
         tokio::spawn(async move {
             let id = task_id;
-            let result = execute(&app, &id).await;
+            let only: Option<HashSet<String>> = if req.candidates.is_empty() { None } else { Some(req.candidates.iter().cloned().collect()) };
+            let result = match req.kind.as_str() {
+                "check" => check(&app, &id).await,
+                "build" => build(&app, &id, only).await,
+                _ => update(&app, &id).await,
+            };
             match result {
-                Ok(RunEnd::Done(summary)) => {
+                Ok(summary) => {
                     let _ = app.store.finish_run(&id, "done", &summary);
-                    tracing::info!(run = %id, "run finished");
-                }
-                Ok(RunEnd::NeedsInput(n)) => {
-                    let _ = app.store.set_run_step(&id, "needs_input", Some("gate"));
-                    tracing::info!(run = %id, pending = n, "run waiting for operator decisions");
+                    tracing::info!(run = %id, kind = %req.kind, "operation finished");
                 }
                 Err(e) => {
-                    tracing::error!(run = %id, error = %format!("{e:#}"), "run aborted");
+                    tracing::error!(run = %id, kind = %req.kind, error = %format!("{e:#}"), "operation aborted");
                     let _ = app.store.finish_run(&id, "aborted", &serde_json::json!({"error": format!("{e:#}")}));
                 }
             }
+            let _ = app.publisher.remove_staging(&id);
             engine.running.store(false, Ordering::SeqCst);
         });
         Ok(id)
@@ -82,11 +109,6 @@ impl Engine {
     }
 }
 
-enum RunEnd {
-    Done(serde_json::Value),
-    NeedsInput(usize),
-}
-
 async fn step(app: &AppState, run_id: &str, name: &str) -> Result<()> {
     tracing::info!(run = %run_id, step = name, "step");
     app.store.set_run_step(run_id, "running", Some(name))?;
@@ -94,125 +116,250 @@ async fn step(app: &AppState, run_id: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
-async fn execute(app: &AppState, run_id: &str) -> Result<RunEnd> {
-    // A previous attempt at this run may have died mid-build. Its jobs are
-    // stale: the plan below creates new ones.
-    for c in app.store.candidates_in_states(&["building", "built"])? {
-        app.store.set_candidate_state(&c.id, "approved")?;
+/// Stream databases, cache upkeep, and a repair for a stream whose
+/// database file went missing. Both operations start here.
+async fn refresh_streams(app: &AppState, run_id: &str) -> Result<()> {
+    step(app, run_id, "streams").await?;
+    progress(app, run_id, serde_json::json!({"phase": "streams", "detail": "refreshing stream databases"}));
+    app.streams.refresh_all().await.context("refreshing streams")?;
+    if let Err(e) = app.cache.maintain() {
+        tracing::warn!(error = %format!("{e:#}"), "cache maintenance failed");
     }
-    let cancelled = app.store.cancel_open_jobs(&["build", "image", "inspect", "probe"])?;
-    if !cancelled.is_empty() {
-        tracing::warn!(count = cancelled.len(), "cancelled stale jobs from an interrupted run");
-        app.hub.cancel_jobs(&cancelled);
-    }
-
-    let mut summary = serde_json::json!({});
-    // Discovery can add packages; loop until a pass adds nothing.
-    for pass in 0..8 {
-        step(app, run_id, "streams").await?;
-        progress(app, run_id, serde_json::json!({"phase": "streams", "detail": "refreshing stream databases"}));
-        app.streams.refresh_all().await.context("refreshing streams")?;
-        if let Err(e) = app.cache.maintain() {
-            tracing::warn!(error = %format!("{e:#}"), "cache maintenance failed");
-        }
-        // Repair: a stream with publications but no database file (first run
-        // after a rename, or manual deletion) gets its database rebuilt.
-        for s in app.config.streams_sorted() {
-            if !app.publisher.has_db(&s.name) {
-                let live: Vec<(String, String)> = app
-                    .store
-                    .live_artifacts(&s.name)?
-                    .into_iter()
-                    .map(|a| (a.sha256, a.filename))
-                    .collect();
-                if !live.is_empty() {
-                    tracing::warn!(stream = %s.name, "repo database missing; rebuilding from publications");
-                    app.publisher.rebuild(&app.blobs, &s.name, &live).await?;
-                }
+    for s in app.config.streams_sorted() {
+        if !app.publisher.has_db(&s.name) {
+            let live: Vec<(String, String)> = app
+                .store
+                .live_artifacts(&s.name)?
+                .into_iter()
+                .map(|a| (a.sha256, a.filename))
+                .collect();
+            if !live.is_empty() {
+                tracing::warn!(stream = %s.name, "repo database missing; rebuilding from publications");
+                app.publisher.rebuild(&app.blobs, &s.name, &live).await?;
             }
         }
+    }
+    Ok(())
+}
 
-        step(app, run_id, "images").await?;
-        let mut images: HashMap<String, ImageRef> = HashMap::new();
-        for s in app.config.streams_sorted() {
-            progress(app, run_id, serde_json::json!({"phase": "images", "detail": format!("checking base image for {}", s.name)}));
-            images.insert(s.name.clone(), ensure_image(app, run_id, s).await?);
-        }
-
+/// Gather information. Loops while dependency resolution discovers AUR
+/// packages we do not track yet, so their onboarding candidates exist by
+/// the time the check ends.
+async fn check(app: &AppState, run_id: &str) -> Result<serde_json::Value> {
+    refresh_streams(app, run_id).await?;
+    let before: HashSet<String> = app.store.candidates_in_states(&["pending", "approved"])?.into_iter().map(|c| c.id).collect();
+    let mut probes = Vec::new();
+    let mut discovered_total = 0usize;
+    let mut unresolved: Vec<serde_json::Value> = Vec::new();
+    for pass in 0..8 {
         step(app, run_id, "poll").await?;
         progress(app, run_id, serde_json::json!({"phase": "poll", "detail": "asking the AUR and git sources for new commits"}));
         poll_aur(app).await?;
-        ingest_lists(app).await;
+        if pass == 0 {
+            ingest_lists(app).await;
+        }
 
         step(app, run_id, "candidates").await?;
         progress(app, run_id, serde_json::json!({"phase": "candidates"}));
-        let probes = create_candidates(app, run_id, &images).await?;
+        probes = create_candidates(app, run_id).await?;
         let rebuilds = soname_rebuilds(app, run_id)?;
         if rebuilds > 0 {
             tracing::info!(count = rebuilds, "soname rebuild candidates created");
         }
 
-        // The gate runs before the upstream probes so that nothing the gate
-        // would approve sits in the queue looking like it waits on a human.
         step(app, run_id, "gate").await?;
         progress(app, run_id, serde_json::json!({"phase": "gate"}));
-        let auto = auto_approve(app)?;
-        if auto > 0 {
-            tracing::info!(count = auto, "gate approved routine candidates after quarantine");
+        let g = apply_gate(app)?;
+        if g.approved > 0 {
+            tracing::info!(count = g.approved, "gate approved routine candidates after quarantine");
         }
 
-        step(app, run_id, "probes").await?;
-        run_probes(app, run_id, probes).await?;
-
-        let pending = app.store.candidates_in_states(&["pending"])?;
-        if !pending.is_empty() {
-            return Ok(RunEnd::NeedsInput(pending.len()));
-        }
-
-        step(app, run_id, "plan").await?;
-        progress(app, run_id, serde_json::json!({"phase": "plan"}));
+        // Resolve dependencies without building: what would be planned,
+        // and which AUR packages it needs that we do not track.
+        step(app, run_id, "resolve").await?;
+        progress(app, run_id, serde_json::json!({"phase": "resolve", "detail": "resolving dependencies"}));
         let planned = plan_all(app, run_id).await?;
-        if planned.discovered > 0 {
-            tracing::info!(discovered = planned.discovered, pass, "new AUR dependencies discovered; looping");
-            continue;
+        unresolved = planned.skipped;
+        if planned.discovered == 0 {
+            break;
         }
-
-        step(app, run_id, "build").await?;
-        let built = build_all(app, run_id, &planned, &images).await?;
-
-        // Candidates whose builds all succeeded were published as they
-        // completed; this pass handles partial failures and baseline-only
-        // rebuilds that carry no candidate.
-        step(app, run_id, "publish").await?;
-        progress(app, run_id, serde_json::json!({"phase": "publish"}));
-        let scope = PublishScope {
-            only: None,
-            exclude: built.published_candidates.union(&built.held_candidates).cloned().collect(),
-        };
-        let published = built.published_count + publish_all(app, run_id, &planned, &built.results, &scope).await?;
-
-        summary = serde_json::json!({
-            "streams": planned.per_stream.keys().collect::<Vec<_>>(),
-            "builds_planned": planned.per_stream.values().map(|v| v.len()).sum::<usize>(),
-            "builds_succeeded": built.results.values().filter(|r| r.is_ok()).count(),
-            "builds_failed": built.results.values().filter(|r| r.is_err()).count(),
-            "published": published,
-            "held_for_review": built.held_candidates.len(),
-            "skipped": planned.skipped,
-        });
-        break;
+        discovered_total += planned.discovered;
+        tracing::info!(discovered = planned.discovered, pass, "new AUR dependencies discovered; polling them");
     }
+
+    step(app, run_id, "probes").await?;
+    let probe_summary = run_probes(app, run_id, probes).await?;
+    // Probes may have added vcs candidates; they are approved on creation.
+
+    let after: Vec<CandidateRow> = app.store.candidates_in_states(&["pending", "approved", "publish_review", "failed"])?;
+    let new: Vec<&CandidateRow> = after.iter().filter(|c| !before.contains(&c.id)).collect();
+    let decision = |c: &CandidateRow| c.review["decision"]["kind"].as_str().unwrap_or("").to_string();
+    let summary = serde_json::json!({
+        "new_candidates": new.len(),
+        "approved": after.iter().filter(|c| c.state == "approved").count(),
+        "needs_you": after.iter().filter(|c| c.state == "pending" && decision(c) == "needs_you").count(),
+        "quarantined": after.iter().filter(|c| c.state == "pending" && decision(c) == "quarantine").count(),
+        "held": after.iter().filter(|c| c.state == "publish_review").count(),
+        "failed": after.iter().filter(|c| c.state == "failed").count(),
+        "discovered": discovered_total,
+        "probes": probe_summary,
+        "unresolved": unresolved,
+    });
+    progress(app, run_id, serde_json::json!({"phase": "done"}));
+    Ok(summary)
+}
+
+/// Execute what is authorised: plan the approved candidates (all, or
+/// `only` plus what they depend on), build, publish. Candidates the
+/// operator has not decided are not in the plan and hold nothing up.
+async fn build(app: &AppState, run_id: &str, only: Option<HashSet<String>>) -> Result<serde_json::Value> {
+    // A previous build may have died mid-way. Its jobs are stale: the plan
+    // below creates new ones.
+    for c in app.store.candidates_in_states(&["building", "built"])? {
+        app.store.set_candidate_state(&c.id, "approved")?;
+    }
+    let cancelled = app.store.cancel_open_jobs(&["build", "image"])?;
+    if !cancelled.is_empty() {
+        tracing::warn!(count = cancelled.len(), "cancelled stale jobs from an interrupted build");
+        app.hub.cancel_jobs(&cancelled);
+    }
+
+    refresh_streams(app, run_id).await?;
+
+    step(app, run_id, "images").await?;
+    let mut images: HashMap<String, ImageRef> = HashMap::new();
+    for s in app.config.streams_sorted() {
+        progress(app, run_id, serde_json::json!({"phase": "images", "detail": format!("checking base image for {}", s.name)}));
+        images.insert(s.name.clone(), ensure_image(app, run_id, s).await?);
+    }
+
+    step(app, run_id, "plan").await?;
+    progress(app, run_id, serde_json::json!({"phase": "plan"}));
+    let mut planned = plan_all(app, run_id).await?;
+    if planned.discovered > 0 {
+        // An approval since the last check pulled in packages we do not
+        // track; poll them once so their onboarding candidates exist, then
+        // plan again. Their dependents are skipped with that reason.
+        tracing::info!(discovered = planned.discovered, "dependencies discovered during a build; polling them");
+        poll_aur(app).await?;
+        let _ = create_candidates(app, run_id).await?;
+        planned = plan_all(app, run_id).await?;
+    }
+    if let Some(only) = &only {
+        restrict(&mut planned, only);
+    }
+
+    // Held artifacts the operator cleared publish as they were reviewed.
+    let (cleared_count, cleared_candidates) = publish_cleared(app, run_id, &mut planned).await?;
+
+    step(app, run_id, "build").await?;
+    let built = build_all(app, run_id, &planned, &images).await?;
+
+    step(app, run_id, "publish").await?;
+    progress(app, run_id, serde_json::json!({"phase": "publish"}));
+    let scope = PublishScope {
+        only: None,
+        exclude: built.published_candidates.union(&built.held_candidates).cloned().collect(),
+    };
+    let published = cleared_count + built.published_count + publish_all(app, run_id, &planned, &built.results, &scope).await?;
 
     step(app, run_id, "cleanup").await?;
     progress(app, run_id, serde_json::json!({"phase": "done"}));
     let _ = app.publisher.remove_staging(run_id);
-    let held = app.store.candidates_in_states(&["publish_review"])?;
-    if !held.is_empty() {
-        // Built artifacts raised flags; the operator decides, then the next
-        // run rebuilds and publishes the cleared ones.
-        return Ok(RunEnd::NeedsInput(held.len()));
+    Ok(serde_json::json!({
+        "streams": planned.per_stream.keys().collect::<Vec<_>>(),
+        "builds_planned": planned.per_stream.values().map(|v| v.len()).sum::<usize>(),
+        "builds_succeeded": built.results.values().filter(|r| r.is_ok()).count(),
+        "builds_failed": built.results.values().filter(|r| r.is_err()).count(),
+        "published": published,
+        "published_as_reviewed": cleared_candidates.len(),
+        "held_for_review": built.held_candidates.len(),
+        "skipped": planned.skipped,
+        "selection": only.map(|o| o.len()),
+    }))
+}
+
+/// A check, then a build of everything it left authorised.
+async fn update(app: &AppState, run_id: &str) -> Result<serde_json::Value> {
+    let checked = check(app, run_id).await?;
+    let mut built = build(app, run_id, None).await?;
+    built["check"] = checked;
+    Ok(built)
+}
+
+/// Keep the selected candidates' items and, transitively, the member
+/// dependencies they build against on the same stream.
+fn restrict(planned: &mut Planned, only: &HashSet<String>) {
+    for items in planned.per_stream.values_mut() {
+        let mut keep: HashSet<String> = items.iter().filter(|i| i.candidate_id.as_ref().is_some_and(|c| only.contains(c))).map(|i| i.pkgbase.clone()).collect();
+        loop {
+            let before = keep.len();
+            for i in items.iter() {
+                if keep.contains(&i.pkgbase) {
+                    keep.extend(i.member_deps.iter().cloned());
+                }
+            }
+            if keep.len() == before {
+                break;
+            }
+        }
+        items.retain(|i| keep.contains(&i.pkgbase));
     }
-    Ok(RunEnd::Done(summary))
+    planned.per_stream.retain(|_, v| !v.is_empty());
+}
+
+/// Candidates held in `publish_review` and then approved: publish the
+/// artifacts the operator looked at, not a fresh build of the same commit.
+/// Falls back to rebuilding when any of them is gone from the blob store.
+async fn publish_cleared(app: &AppState, run_id: &str, planned: &mut Planned) -> Result<(usize, HashSet<String>)> {
+    let mut done: HashSet<String> = HashSet::new();
+    let mut published = 0usize;
+    let cleared: Vec<String> = planned
+        .per_stream
+        .values()
+        .flatten()
+        .filter_map(|i| i.candidate_id.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|cid| app.store.get_candidate(cid).ok().flatten().is_some_and(|c| c.review["publish_cleared"].as_bool() == Some(true)))
+        .collect();
+    for cid in cleared {
+        let mut sub = Planned::default();
+        let mut built: BTreeMap<BuildKey, Result<Vec<String>, String>> = BTreeMap::new();
+        let mut complete = true;
+        for (stream, items) in &planned.per_stream {
+            for item in items.iter().filter(|i| i.candidate_id.as_deref() == Some(&cid)) {
+                // The reviewed artifacts: from a finished build of this
+                // candidate, this stream, this commit.
+                let shas: Vec<String> = app
+                    .store
+                    .jobs_for_candidate(&cid)?
+                    .into_iter()
+                    .filter(|j| j.state == JobState::Done && j.stream.as_deref() == Some(stream))
+                    .filter(|j| matches!(&j.job, JobKind::Build { aur_commit, .. } if *aur_commit == item.aur_commit))
+                    .flat_map(|j| app.store.artifacts_for_job(&j.id).unwrap_or_default())
+                    .map(|a| a.sha256)
+                    .collect();
+                if shas.is_empty() || shas.iter().any(|s| !app.blobs.exists(s)) {
+                    complete = false;
+                }
+                built.insert((stream.clone(), item.pkgbase.clone()), Ok(shas));
+                sub.per_stream.entry(stream.clone()).or_default().push(item.clone());
+            }
+        }
+        if !complete {
+            tracing::warn!(candidate = %cid, "reviewed artifacts are gone; rebuilding instead");
+            continue;
+        }
+        progress(app, run_id, serde_json::json!({"phase": "publish", "detail": format!("publishing reviewed artifacts of {cid}")}));
+        published += publish_all(app, run_id, &sub, &built, &PublishScope { only: Some(HashSet::from([cid.clone()])), exclude: HashSet::new() }).await?;
+        for items in planned.per_stream.values_mut() {
+            items.retain(|i| i.candidate_id.as_deref() != Some(&cid));
+        }
+        done.insert(cid);
+    }
+    planned.per_stream.retain(|_, v| !v.is_empty());
+    Ok((published, done))
 }
 
 // ---- images -------------------------------------------------------------
@@ -329,6 +476,7 @@ async fn poll_aur(app: &AppState) -> Result<()> {
             first_submitted: None,
             missing_since: None,
             orphaned_since: None,
+            probed_at: prev.as_ref().and_then(|s| s.probed_at.clone()),
         })?;
     }
     let packages: Vec<PackageRow> = packages.into_iter().filter(|p| p.source_url.is_none()).collect();
@@ -366,6 +514,7 @@ async fn poll_aur(app: &AppState) -> Result<()> {
             first_submitted: Some(info.first_submitted),
             missing_since: None,
             orphaned_since: None,
+            probed_at: prev.as_ref().and_then(|s| s.probed_at.clone()),
         };
         if info.maintainer.is_none() {
             // Keep the first time we saw it orphaned; a package that was
@@ -569,7 +718,7 @@ fn srcinfo_hash(text: &str) -> String {
     hex::encode(Sha256::digest(text.as_bytes()))
 }
 
-async fn create_candidates(app: &AppState, run_id: &str, images: &HashMap<String, ImageRef>) -> Result<Vec<(PackageRow, String)>> {
+async fn create_candidates(app: &AppState, run_id: &str) -> Result<Vec<(PackageRow, String)>> {
     let packages = app.store.list_packages()?;
     let mut probes: Vec<(PackageRow, String)> = Vec::new();
     for p in &packages {
@@ -593,7 +742,7 @@ async fn create_candidates(app: &AppState, run_id: &str, images: &HashMap<String
                     app.store.supersede_candidates(&p.pkgbase, &head)?;
                     let mut review = serde_json::json!({"note": "no baseline; first review"});
                     let (floor_risk, llm_risk) = match srcinfo_at(app, &p.pkgbase, &head).await {
-                        Ok(si) => review_change(app, run_id, p, None, &head, &si, images, &[], false, &mut review).await?,
+                        Ok(si) => review_change(app, run_id, p, None, &head, &si, &[], false, &mut review).await?,
                         Err(e) => {
                             review["gate_error"] = serde_json::Value::String(e.to_string());
                             (None, None)
@@ -690,7 +839,7 @@ async fn create_candidates(app: &AppState, run_id: &str, images: &HashMap<String
                         review["signals"] = serde_json::to_value(&signals)?;
                     }
                     let (floor_risk, llm_risk) = match srcinfo_at(app, &p.pkgbase, &head).await {
-                        Ok(si) => review_change(app, run_id, p, Some(b), &head, &si, images, &commits, history_rewritten, &mut review).await?,
+                        Ok(si) => review_change(app, run_id, p, Some(b), &head, &si, &commits, history_rewritten, &mut review).await?,
                         Err(e) => {
                             review["gate_error"] = serde_json::Value::String(e.to_string());
                             (None, None)
@@ -721,10 +870,10 @@ async fn create_candidates(app: &AppState, run_id: &str, images: &HashMap<String
                 if p.kind == "vcs" && !open.iter().any(|c| c.kind == "vcs") {
                     let interval = p.policy.get("probe_interval_hours").and_then(|v| v.as_f64()).unwrap_or(0.0);
                     let due = interval <= 0.0
-                        || app
-                            .store
-                            .last_job_finished(&p.pkgbase, "probe")?
-                            .and_then(|t| clock::seconds_between(&t, &clock::now()))
+                        || snap
+                            .probed_at
+                            .as_deref()
+                            .and_then(|t| clock::seconds_between(t, &clock::now()))
                             .is_none_or(|age| age >= interval * 3600.0);
                     if due {
                         probes.push((p.clone(), head));
@@ -748,10 +897,14 @@ fn progress(app: &AppState, run_id: &str, p: serde_json::Value) {
     }
 }
 
-/// Probe VCS upstreams in parallel through workers and create `vcs`
-/// candidates for packages whose published build is behind.
-async fn run_probes(app: &AppState, run_id: &str, probes: Vec<(PackageRow, String)>) -> Result<()> {
-    let mut probe_jobs = Vec::new();
+/// Probe VCS upstreams from the coordinator, a few at a time, and create
+/// `vcs` candidates for packages whose published build is behind. Returns
+/// a summary for the check.
+async fn run_probes(app: &AppState, run_id: &str, probes: Vec<(PackageRow, String)>) -> Result<serde_json::Value> {
+    use futures_util::StreamExt;
+    let total = probes.len();
+    progress(app, run_id, serde_json::json!({"phase": "probes", "total": total, "done": 0}));
+    let mut jobs = Vec::new();
     for (p, head) in &probes {
         let si = match srcinfo_at(app, &p.pkgbase, head).await {
             Ok(s) => s,
@@ -761,65 +914,51 @@ async fn run_probes(app: &AppState, run_id: &str, probes: Vec<(PackageRow, Strin
             }
         };
         let sources: Vec<String> = si.base.values("source").into_iter().map(str::to_string).collect();
-        let job = app.store.create_job_for(
-            &JobKind::Probe {
-                pkgbase: p.pkgbase.clone(),
-                sources,
-            },
-            Some(&p.pkgbase),
-            None,
-            None,
-            Some(run_id),
-        )?;
-        probe_jobs.push((p.clone(), head.clone(), job.id));
+        jobs.push((p.clone(), head.clone(), si, sources));
     }
-    if !probe_jobs.is_empty() {
-        app.hub.notify();
-    }
-    let total = probe_jobs.len();
-    let waiting: Vec<String> = probe_jobs.iter().map(|(p, _, _)| p.pkgbase.clone()).collect();
+    let mut stream = futures_util::stream::iter(jobs.into_iter().map(|(p, head, si, sources)| async move {
+        let r = crate::probe::resolve(&sources).await;
+        (p, head, si, r)
+    }))
+    .buffer_unordered(6);
     let mut done = 0usize;
-    progress(app, run_id, serde_json::json!({"phase": "probes", "total": total, "done": done, "waiting": waiting}));
-    for (p, head, job_id) in probe_jobs {
-        let row = wait_job(app, &job_id).await?;
+    let mut failed = Vec::new();
+    let mut stale = Vec::new();
+    while let Some((p, head, si, result)) = stream.next().await {
         done += 1;
-        {
-            let waiting: Vec<String> = probes
-                .iter()
-                .map(|(q, _)| q.pkgbase.clone())
-                .filter(|pb| app.store.open_candidates(pb).ok().is_some_and(|_| true))
-                .collect::<Vec<_>>()
-                .into_iter()
-                .filter(|_| false)
-                .collect();
-            let _ = waiting;
-        }
-        progress(app, run_id, serde_json::json!({"phase": "probes", "total": total, "done": done, "last": p.pkgbase, "worker": row.worker}));
-        let Some(JobResult::Probe { revisions }) = row.result else {
-            tracing::warn!(pkgbase = %p.pkgbase, "probe failed: {:?}", row.error);
-            continue;
+        progress(app, run_id, serde_json::json!({"phase": "probes", "total": total, "done": done, "last": p.pkgbase}));
+        app.store.set_snapshot_probed(&p.pkgbase, &clock::now())?;
+        let revisions = match result {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(pkgbase = %p.pkgbase, error = %format!("{e:#}"), "probe failed");
+                app.store.event("probe.failed", Some(&p.pkgbase), serde_json::json!({"error": format!("{e:#}")}))?;
+                failed.push(p.pkgbase.clone());
+                continue;
+            }
         };
         let rev = revisions.iter().map(|(_, r)| r.as_str()).collect::<Vec<_>>().join("+");
         if rev.is_empty() {
             continue;
         }
         // Compare with what is published on any member stream.
-        let mut stale = false;
+        let mut behind = false;
         for m in app.store.memberships(&p.pkgbase)? {
             if !(m.wanted || m.required) {
                 continue;
             }
-            let si = srcinfo_at(app, &p.pkgbase, &head).await?;
             let published = si
                 .pkgnames()
                 .first()
                 .and_then(|n| app.store.live_artifact(&m.stream, n).ok().flatten());
             match published {
                 Some(a) if a.upstream_rev.as_deref() == Some(&rev) => {}
-                _ => stale = true,
+                _ => behind = true,
             }
         }
-        if stale {
+        app.store.event("probe.done", Some(&p.pkgbase), serde_json::json!({"rev": rev, "behind": behind}))?;
+        if behind {
+            stale.push(p.pkgbase.clone());
             app.store.create_candidate(
                 run_id,
                 &NewCandidate {
@@ -828,19 +967,18 @@ async fn run_probes(app: &AppState, run_id: &str, probes: Vec<(PackageRow, Strin
                     aur_commit: Some(&head),
                     upstream_rev: Some(&rev),
                     state: "approved",
-                    review: serde_json::json!({"upstream_rev": rev}),
+                    class: p.provenance_class.as_deref(),
+                    review: serde_json::json!({"upstream_rev": rev, "note": "upstream moved; VCS packages are approved on sight"}),
                     ..Default::default()
                 },
             )?;
         }
     }
-    Ok(())
+    Ok(serde_json::json!({"total": total, "failed": failed, "behind": stale}))
 }
 
-// ---- soname rebuilds -------------------------------------------------------------
-
-/// Arch spells a soname provide as `libfoo.so=3-64`; this turns a NEEDED
-/// entry `libfoo.so.3` into (`libfoo.so`, `3`).
+/// `libfoo.so.3` -> (`libfoo.so`, `3`); None for anything without a
+/// versioned `.so.` suffix.
 fn soname_parts(needed: &str) -> Option<(&str, &str)> {
     let i = needed.find(".so.")?;
     Some((&needed[..i + 3], &needed[i + 4..]))
@@ -915,13 +1053,12 @@ async fn review_change(
     baseline: Option<&repoman_store::BaselineRow>,
     head: &str,
     si: &Srcinfo,
-    images: &HashMap<String, ImageRef>,
     commits: &[crate::aur::CommitInfo],
     history_rewritten: bool,
     review: &mut serde_json::Value,
 ) -> Result<(Option<String>, Option<String>)> {
     progress(app, run_id, serde_json::json!({"phase": "candidates", "detail": format!("assessing {}", p.pkgbase)}));
-    let a = match crate::gate::assess(app, run_id, &p.pkgbase, baseline, head, si, images, p.source_url.is_some(), history_rewritten).await {
+    let a = match crate::gate::assess(app, &p.pkgbase, baseline, head, si, p.source_url.is_some(), history_rewritten).await {
         Ok(a) => a,
         Err(e) => {
             review["gate_error"] = serde_json::Value::String(e.to_string());
@@ -1026,72 +1163,132 @@ async fn review_change(
     Ok((Some(floor), llm_risk))
 }
 
-/// Approve pending `update` candidates the deterministic gate is satisfied
-/// with: routine (or metadata, where allowed) class, low floor risk, past
-/// quarantine by the AUR's own LastModified clock, no negative signal.
-fn auto_approve(app: &AppState) -> Result<usize> {
-    if !app.config.auto_approve {
-        return Ok(0);
+/// What the gate thinks of a pending candidate.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Decision {
+    /// The gate approves it now.
+    Approve,
+    /// Routine and clean; the gate approves it at a check after `until`.
+    Quarantine { until: i64 },
+    /// Only the operator can decide, for these reasons.
+    NeedsYou { reasons: Vec<String> },
+}
+
+/// Classify one pending candidate. Mirrors nothing: this is the rule.
+fn classify(app: &AppState, c: &CandidateRow, now: i64) -> Result<Decision> {
+    let mut reasons = Vec::new();
+    let policy = app.store.get_package(&c.pkgbase)?.map(|p| p.policy).unwrap_or_default();
+    if c.kind == "onboarding" {
+        reasons.push("first review of a new package".to_string());
+    } else if c.kind != "update" {
+        reasons.push(format!("{} candidate", c.kind));
     }
+    let gate = &c.review["gate"];
+    if gate.is_null() {
+        reasons.push(c.review["gate_error"].as_str().map(|e| format!("gate could not assess it: {e}")).unwrap_or_else(|| "not assessed".into()));
+    }
+    let class = gate["diff_class"].as_str().unwrap_or("structural");
+    if class == "structural" {
+        let kinds: Vec<&str> = gate["reasons"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|r| r["class"] == "structural")
+            .filter_map(|r| r["kind"].as_str())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        reasons.push(format!("structural change: {}", if kinds.is_empty() { "see reasons".to_string() } else { kinds.join(", ") }));
+    } else if class == "metadata" && !(app.config.auto_approve_metadata && policy.get("auto_metadata").and_then(|v| v.as_bool()).unwrap_or(true)) {
+        reasons.push("metadata change; auto-approval of metadata is off".to_string());
+    }
+    if let Some(f) = c.floor_risk.as_deref().filter(|f| *f != "low") {
+        reasons.push(format!("lint floor is {f}"));
+    }
+    if let Some(r) = c.llm_risk.as_deref().filter(|r| *r != "low") {
+        reasons.push(format!("reviewer says {r}"));
+    }
+    let mut commits: Vec<String> = c.review["commits"].as_array().into_iter().flatten().filter_map(|k| k["hash"].as_str().map(str::to_string)).collect();
+    if let Some(h) = &c.aur_commit
+        && !commits.contains(h)
+    {
+        commits.push(h.clone());
+    }
+    let mut blocking: Vec<String> = Vec::new();
+    for h in commits.iter().map(Some).chain(std::iter::once(None)) {
+        let now_s = clock::now();
+        for sig in app.store.signals_for(&c.pkgbase, h.map(String::as_str))? {
+            if sig.blocks(&now_s) && !blocking.contains(&sig.source) {
+                blocking.push(sig.source.clone());
+            }
+        }
+    }
+    if !blocking.is_empty() {
+        reasons.push(format!("blocking signal from {}", blocking.join(", ")));
+    }
+    if !app.config.auto_approve {
+        reasons.push("auto-approval is disabled".to_string());
+    }
+    if !reasons.is_empty() {
+        return Ok(Decision::NeedsYou { reasons });
+    }
+    let days = policy.get("quarantine_days").and_then(|v| v.as_u64()).unwrap_or(app.config.quarantine_days);
+    let Some(seen) = c.first_seen_last_modified else {
+        return Ok(Decision::NeedsYou { reasons: vec!["no AUR timestamp to measure quarantine by".into()] });
+    };
+    let until = seen + days as i64 * 86_400;
+    if now < until {
+        return Ok(Decision::Quarantine { until });
+    }
+    Ok(Decision::Approve)
+}
+
+pub struct GateOutcome {
+    pub approved: usize,
+    pub quarantined: usize,
+    pub needs_you: usize,
+}
+
+/// Classify every pending candidate: approve what the gate is satisfied
+/// with (routine or metadata class, low floor risk, past quarantine by the
+/// AUR's own LastModified clock, no negative signal) and record the
+/// decision on the rest so the UI can say why they wait and on whom.
+fn apply_gate(app: &AppState) -> Result<GateOutcome> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    let mut approved = 0;
+    let mut out = GateOutcome { approved: 0, quarantined: 0, needs_you: 0 };
     for c in app.store.candidates_in_states(&["pending"])? {
-        if c.kind != "update" {
-            continue;
+        let d = classify(app, &c, now)?;
+        match &d {
+            Decision::Approve => {
+                let class = c.review["gate"]["diff_class"].as_str().unwrap_or("routine");
+                let age_days = c.first_seen_last_modified.map(|s| (now - s) / 86_400).unwrap_or(0);
+                app.store.decide_candidate(
+                    &c.id,
+                    "approved",
+                    "gate",
+                    Some(&format!("auto-approved: {class} change, floor risk low, {age_days} days on the AUR")),
+                )?;
+                app.store.event("candidate.auto_approved", Some(&c.pkgbase), serde_json::json!({"id": c.id, "class": class}))?;
+                out.approved += 1;
+            }
+            Decision::Quarantine { .. } => out.quarantined += 1,
+            Decision::NeedsYou { .. } => out.needs_you += 1,
         }
-        let Some(gate) = c.review.get("gate") else {
-            continue;
-        };
-        let class = gate["diff_class"].as_str().unwrap_or("structural");
-        let policy = app.store.get_package(&c.pkgbase)?.map(|p| p.policy).unwrap_or_default();
-        let metadata_ok = app.config.auto_approve_metadata && policy.get("auto_metadata").and_then(|v| v.as_bool()).unwrap_or(true);
-        let class_ok = class == "routine" || (class == "metadata" && metadata_ok);
-        if !class_ok || c.floor_risk.as_deref() != Some("low") {
-            continue;
-        }
-        if c.llm_risk.as_deref().is_some_and(|r| r != "low") {
-            continue;
-        }
-        let days = policy.get("quarantine_days").and_then(|v| v.as_u64()).unwrap_or(app.config.quarantine_days);
-        let Some(seen) = c.first_seen_last_modified else {
-            continue;
-        };
-        let age_days = (now - seen) / 86_400;
-        if now - seen < days as i64 * 86_400 {
-            tracing::debug!(pkgbase = %c.pkgbase, age_days, days, "candidate still in quarantine");
-            continue;
-        }
-        if app.store.has_negative_signal(&c.pkgbase, c.aur_commit.as_deref())? {
-            continue;
-        }
-        let range: Vec<String> = c.review["commits"].as_array().into_iter().flatten().filter_map(|k| k["hash"].as_str().map(str::to_string)).collect();
-        let mut blocked = false;
-        for h in &range {
-            if app.store.has_negative_signal(&c.pkgbase, Some(h))? {
-                blocked = true;
-                break;
+        if !matches!(d, Decision::Approve) {
+            let mut review = c.review.clone();
+            let new = serde_json::to_value(&d)?;
+            if review["decision"] != new {
+                review["decision"] = new;
+                app.store.set_candidate_review(&c.id, None, None, None, &review)?;
             }
         }
-        if blocked {
-            tracing::info!(pkgbase = %c.pkgbase, "negative signal on an intermediate commit; not auto-approving");
-            continue;
-        }
-        app.store.decide_candidate(
-            &c.id,
-            "approved",
-            "gate",
-            Some(&format!("auto-approved: {class} change, floor risk low, {age_days} days on the AUR")),
-        )?;
-        app.store.event("candidate.auto_approved", Some(&c.pkgbase), serde_json::json!({"id": c.id, "class": class}))?;
-        approved += 1;
     }
-    Ok(approved)
+    Ok(out)
 }
-
-// ---- plan -----------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 pub struct BuildItem {
@@ -1626,7 +1823,7 @@ async fn build_all(app: &AppState, run_id: &str, planned: &Planned, images: &Has
             let row = app.store.get_job(&job_id)?.context("job vanished")?;
             let item = planned.per_stream[&key.0].iter().find(|b| b.pkgbase == key.1).unwrap();
             match (row.state, row.result) {
-                (JobState::Done, Some(JobResult::Build { artifacts, outside_writes, upstream_rev, net_attempts })) => {
+                (JobState::Done, Some(JobResult::Build { artifacts, outside_writes, upstream_rev, net_attempts, srcinfo })) => {
                     let mut shas = Vec::new();
                     if let Some(cid) = &item.candidate_id {
                         let mut f = Vec::new();
@@ -1639,6 +1836,21 @@ async fn build_all(app: &AppState, run_id: &str, planned: &Planned, images: &Has
                         }
                         if net_attempts > 0 && !item.allow_network {
                             f.push(format!("{}: {net_attempts} network attempts during the offline build", item.stream));
+                        }
+                        // The gate reviewed the committed .SRCINFO; the build
+                        // root's PKGBUILD must declare the same thing.
+                        match srcinfo.as_deref().map(Srcinfo::parse) {
+                            Some(Ok(generated)) => {
+                                if let Ok(committed) = srcinfo_at(app, &item.pkgbase, &item.aur_commit).await {
+                                    let changes = committed.diff(&generated);
+                                    if !changes.is_empty() {
+                                        let fields: Vec<String> = changes.iter().map(|c| format!("{}.{}", c.section, c.key)).collect::<BTreeSet<_>>().into_iter().take(8).collect();
+                                        f.push(format!("{}: the PKGBUILD generates a different .SRCINFO than the committed one ({})", item.stream, fields.join(", ")));
+                                    }
+                                }
+                            }
+                            Some(Err(e)) => f.push(format!("{}: regenerated .SRCINFO does not parse: {e}", item.stream)),
+                            None => f.push(format!("{}: the build could not regenerate .SRCINFO", item.stream)),
                         }
                         if !f.is_empty() {
                             flags.entry(cid.clone()).or_default().extend(f);
