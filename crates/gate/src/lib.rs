@@ -56,6 +56,12 @@ pub struct GateInput<'a> {
     pub new_files: &'a [String],
     /// Maintainer or co-maintainer set differs from the baseline snapshot.
     pub maintainer_changed: bool,
+    /// The package was orphaned and was adopted recently (inside the
+    /// adoption quarantine).
+    pub adopted_from_orphan: bool,
+    /// The baseline commit is not an ancestor of the head: the AUR
+    /// repository was deleted and resubmitted.
+    pub history_rewritten: bool,
     /// Regenerated SRCINFO (from an inspect job) differed from the committed one.
     pub srcinfo_mismatch: Option<bool>,
     /// Whether a dependency name is satisfiable from the official repos.

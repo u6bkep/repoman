@@ -22,6 +22,10 @@ pub struct AurInfo {
     pub url_path: Option<String>,
     pub last_modified: i64,
     pub first_submitted: i64,
+    /// Identity of the pkgbase row on aurweb; survives every push, changes
+    /// only when the base is deleted and resubmitted.
+    #[serde(rename = "PackageBaseID", default)]
+    pub package_base_id: Option<i64>,
     #[serde(default)]
     pub maintainer: Option<String>,
     #[serde(default)]
@@ -229,6 +233,26 @@ impl Aur {
         Ok(h)
     }
 
+    /// Is `ancestor` reachable from `descendant`? False also when either is
+    /// unknown to the mirror, which after a delete-and-resubmit is exactly
+    /// what happens to the old baseline.
+    pub async fn is_ancestor(&self, pkgbase: &str, ancestor: &str, descendant: &str) -> Result<bool> {
+        let path = self.mirror_path(pkgbase);
+        let out = Command::new("git")
+            .args(["merge-base", "--is-ancestor", ancestor, descendant])
+            .current_dir(&path)
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .context("spawning git")?;
+        match out.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            Some(128) if String::from_utf8_lossy(&out.stderr).contains("Not a valid") => Ok(false),
+            _ => bail!("git merge-base {pkgbase}: {}", String::from_utf8_lossy(&out.stderr).trim()),
+        }
+    }
+
     /// Is the mirror present and the commit known to it?
     pub async fn has_commit(&self, pkgbase: &str, commit: &str) -> bool {
         let path = self.mirror_path(pkgbase);
@@ -375,6 +399,7 @@ mod tests {
         let p = &r.results[0];
         assert_eq!(p.package_base, "yay");
         assert_eq!(p.maintainer.as_deref(), Some("jguer"));
+        assert_eq!(p.package_base_id, Some(115973));
         assert_eq!(p.make_depends, ["go>=1.26"]);
         assert!(p.out_of_date.is_none());
         assert!(p.co_maintainers.is_empty());

@@ -123,8 +123,30 @@ impl FakeAur {
         self.git(&wd, &["checkout", "-q", "master"]);
     }
 
+    /// The AUR deleted the base and someone pushed a new one under the same
+    /// name: the bare repository and its history are replaced wholesale.
+    fn resubmit(&self, pkgbase: &str, pkgver: &str) {
+        std::fs::remove_dir_all(self.dir.join(format!("{pkgbase}.git"))).unwrap();
+        std::fs::remove_dir_all(self.work.join(pkgbase)).unwrap();
+        self.publish(pkgbase, pkgver, &["glibc"], &[]);
+    }
+
     fn git_url(&self) -> String {
         format!("file://{}", self.dir.display())
+    }
+}
+
+/// Per-package RPC fields the tests move around: maintainer and identity.
+#[derive(Clone)]
+struct AurMeta {
+    maintainer: Option<String>,
+    base_id: i64,
+    first_submitted: i64,
+}
+
+impl Default for AurMeta {
+    fn default() -> Self {
+        AurMeta { maintainer: Some("maint".into()), base_id: 1, first_submitted: 1_600_000_000 }
     }
 }
 
@@ -142,6 +164,7 @@ struct StubState {
     mirror_requests: Arc<Mutex<Vec<String>>>,
     /// Package bases the fake aur-security service calls dangerous.
     dangerous: Arc<Mutex<Vec<String>>>,
+    meta: Arc<Mutex<HashMap<String, AurMeta>>>,
 }
 
 async fn aursec_lookup(State(st): State<StubState>, axum::Json(body): axum::Json<Value>) -> axum::Json<Value> {
@@ -174,15 +197,17 @@ async fn aursec_lookup(State(st): State<StubState>, axum::Json(body): axum::Json
 async fn rpc_info(State(st): State<StubState>, Query(q): Query<Vec<(String, String)>>) -> axum::Json<Value> {
     let stamps = st.stamps.lock().unwrap();
     let versions = st.versions.lock().unwrap();
+    let meta = st.meta.lock().unwrap();
     let results: Vec<Value> = q
         .iter()
         .filter(|(k, _)| k == "arg[]")
         .filter_map(|(_, name)| {
             let lm = stamps.get(name)?;
+            let m = meta.get(name).cloned().unwrap_or_default();
             Some(json!({
                 "Name": name, "PackageBase": name, "Version": versions.get(name).cloned().unwrap_or_default(),
-                "LastModified": lm, "FirstSubmitted": 1_600_000_000, "Maintainer": "maint",
-                "NumVotes": 1, "Popularity": 0.5, "ID": 1, "PackageBaseID": 1,
+                "LastModified": lm, "FirstSubmitted": m.first_submitted, "Maintainer": m.maintainer,
+                "NumVotes": 1, "Popularity": 0.5, "ID": m.base_id, "PackageBaseID": m.base_id,
             }))
         })
         .collect();
@@ -353,6 +378,7 @@ struct Harness {
     base: String,
     mirror_requests: Arc<Mutex<Vec<String>>>,
     dangerous: Arc<Mutex<Vec<String>>>,
+    meta: Arc<Mutex<HashMap<String, AurMeta>>>,
     core_db: Arc<Mutex<(Vec<u8>, String)>>,
     specs: Arc<Mutex<Vec<JobSpec>>>,
     aur: FakeAur,
@@ -390,6 +416,7 @@ async fn start_with(tweak: impl FnOnce(&mut CoordinatorConfig)) -> Harness {
     let core_db = Arc::new(Mutex::new((core_db, "Fri, 31 Oct 2026 00:00:00 GMT".to_string())));
     let mirror_requests = Arc::new(Mutex::new(Vec::new()));
     let dangerous: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let meta: Arc<Mutex<HashMap<String, AurMeta>>> = Arc::new(Mutex::new(HashMap::new()));
     let stub = start_stub(StubState {
         stamps: aur.stamps.clone(),
         versions: versions.clone(),
@@ -397,6 +424,7 @@ async fn start_with(tweak: impl FnOnce(&mut CoordinatorConfig)) -> Harness {
         files: Arc::new(Mutex::new(files)),
         mirror_requests: mirror_requests.clone(),
         dangerous: dangerous.clone(),
+        meta: meta.clone(),
     })
     .await;
 
@@ -453,6 +481,7 @@ async fn start_with(tweak: impl FnOnce(&mut CoordinatorConfig)) -> Harness {
         base: format!("http://{addr}"),
         mirror_requests,
         dangerous,
+        meta,
         core_db,
         specs,
         aur,
@@ -488,6 +517,20 @@ impl Harness {
 
     async fn post_status(&self, path: &str, body: Value) -> u16 {
         reqwest::Client::new().post(format!("{}{path}", self.base)).json(&body).send().await.unwrap().status().as_u16()
+    }
+
+    fn set_maintainer(&self, pkgbase: &str, m: Option<&str>) {
+        self.meta.lock().unwrap().entry(pkgbase.to_string()).or_default().maintainer = m.map(str::to_string);
+    }
+
+    /// Onboard `foo`, approve it, publish 1.0: the common starting point.
+    async fn seed_foo(&self) {
+        self.post("/api/packages", json!({"pkgbase": "foo", "streams": ["s1"], "class": "upstream-source"})).await;
+        self.publish_pkg("foo", "1.0", &["glibc"], &[]);
+        assert_eq!(self.run().await["state"], "needs_input");
+        let c = self.get("/api/candidates").await.as_array().unwrap()[0].clone();
+        self.post(&format!("/api/candidates/{}/decide", c["id"].as_str().unwrap()), json!({"decision": "approve"})).await;
+        assert_eq!(self.run().await["state"], "done");
     }
 
     fn publish_pkg(&self, pkgbase: &str, ver: &str, depends: &[&str], makedepends: &[&str]) {
@@ -970,4 +1013,112 @@ async fn soname_bump_in_stream_rebuilds_dependents() {
     assert_eq!(again["state"], "done", "{again}");
     let open: Vec<Value> = h.get("/api/candidates?state=approved").await.as_array().unwrap().clone();
     assert!(open.is_empty(), "no dangling approved candidates: {open:?}");
+}
+
+#[tokio::test]
+async fn adoption_from_orphan_blocks_until_cleared() {
+    let h = start_with(|c| {
+        c.auto_approve = true;
+        c.adoption_quarantine_days = 30;
+    })
+    .await;
+    h.seed_foo().await;
+
+    // The maintainer disowns it. Nothing to build, but the state is kept.
+    h.set_maintainer("foo", None);
+    assert_eq!(h.run().await["state"], "done");
+    let p = h.get("/api/packages/foo").await;
+    assert!(p["snapshot"]["maintainer"].is_null(), "{}", p["snapshot"]);
+    assert!(p["snapshot"]["orphaned_since"].is_string(), "{}", p["snapshot"]);
+    assert!(p["signals"].as_array().unwrap().is_empty(), "orphaning alone is not a signal");
+
+    // Someone adopts it and ships a bump that the AUR has shown for a month.
+    h.set_maintainer("foo", Some("mallory"));
+    h.publish_pkg("foo", "1.1", &["glibc"], &[]);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    h.aur.stamps.lock().unwrap().insert("foo".into(), now - 30 * 86_400);
+    let r = h.run().await;
+    assert_eq!(r["state"], "needs_input", "{r}");
+    let c = h.get("/api/candidates").await.as_array().unwrap()[0].clone();
+    let c = h.get(&format!("/api/candidates/{}", c["id"].as_str().unwrap())).await;
+    assert_eq!(c["review"]["gate"]["diff_class"], "structural", "{}", c["review"]["gate"]);
+    assert_eq!(c["floor_risk"], "high");
+    let reasons: Vec<&str> = c["review"]["gate"]["reasons"].as_array().unwrap().iter().map(|r| r["kind"].as_str().unwrap()).collect();
+    assert!(reasons.contains(&"adopted_from_orphan"), "{reasons:?}");
+    let sig = c["signals"].as_array().unwrap().iter().find(|s| s["payload"]["kind"] == "adopted").expect("adopted signal").clone();
+    assert_eq!(sig["severity"], "medium");
+    assert_eq!(sig["payload"]["by"], "mallory");
+    assert!(sig["expires_at"].is_string(), "{sig}");
+    assert!(sig["cleared_at"].is_null());
+    let blocking = h.get("/api/signals").await;
+    assert_eq!(blocking.as_array().unwrap().len(), 1, "{blocking}");
+
+    // The operator vouches for mallory and approves the bump.
+    let cleared = h.post(&format!("/api/signals/{}/clear", sig["id"].as_str().unwrap()), json!({"by": "ben"})).await;
+    assert_eq!(cleared["cleared_by"], "ben", "{cleared}");
+    assert!(h.get("/api/signals").await.as_array().unwrap().is_empty());
+    h.post(&format!("/api/candidates/{}/decide", c["id"].as_str().unwrap()), json!({"decision": "approve"})).await;
+    assert_eq!(h.run().await["state"], "done");
+
+    // With the signal cleared and mallory on the baseline, the next bump is
+    // routine again and goes through on its own.
+    // (A different LastModified than 1.1 carried, or the poll sees no change.)
+    h.publish_pkg("foo", "1.2", &["glibc"], &[]);
+    h.aur.stamps.lock().unwrap().insert("foo".into(), now - 29 * 86_400);
+    let r = h.run().await;
+    assert_eq!(r["state"], "done", "{r}");
+    assert_eq!(h.repo_db().iter().find(|p| p.name == "foo").unwrap().version, "1.2-1");
+    let pkg = h.get("/api/packages/foo").await;
+    let kinds: Vec<&str> = pkg["signals"].as_array().unwrap().iter().filter_map(|s| s["payload"]["kind"].as_str()).collect();
+    assert_eq!(kinds, ["adopted"], "history keeps the cleared signal");
+}
+
+#[tokio::test]
+async fn deleted_then_resubmitted_base_is_flagged() {
+    let h = start_with(|c| c.auto_approve = true).await;
+    h.seed_foo().await;
+
+    // The RPC stops listing it. First miss: noted. Second: a signal.
+    h.aur.stamps.lock().unwrap().remove("foo");
+    assert_eq!(h.run().await["state"], "done");
+    let p = h.get("/api/packages/foo").await;
+    assert!(p["snapshot"]["missing_since"].is_string(), "{}", p["snapshot"]);
+    assert!(p["signals"].as_array().unwrap().is_empty(), "one miss is not a signal: {}", p["signals"]);
+    assert_eq!(h.run().await["state"], "done");
+    let p = h.get("/api/packages/foo").await;
+    let sig = &p["signals"].as_array().unwrap()[0];
+    assert_eq!(sig["payload"]["kind"], "deleted", "{sig}");
+    assert_eq!(sig["severity"], "medium");
+    assert_eq!(sig["payload"]["git_gone"], false, "the fake keeps the repository");
+    assert_eq!(h.run().await["state"], "done", "no duplicate signal per poll");
+    assert_eq!(h.get("/api/packages/foo").await["signals"].as_array().unwrap().len(), 1);
+
+    // Someone resubmits the name with a fresh history and a new base id.
+    {
+        let mut meta = h.meta.lock().unwrap();
+        let m = meta.entry("foo".into()).or_default();
+        m.base_id = 2;
+        m.first_submitted = 1_900_000_000;
+        m.maintainer = Some("mallory".into());
+    }
+    h.aur.resubmit("foo", "2.0");
+    h.versions.lock().unwrap().insert("foo".into(), "2.0-1".into());
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    h.aur.stamps.lock().unwrap().insert("foo".into(), now - 30 * 86_400);
+    let r = h.run().await;
+    assert_eq!(r["state"], "needs_input", "{r}");
+    let c = h.get("/api/candidates").await.as_array().unwrap()[0].clone();
+    let c = h.get(&format!("/api/candidates/{}", c["id"].as_str().unwrap())).await;
+    assert_eq!(c["review"]["gate"]["diff_class"], "structural", "{}", c["review"]["gate"]);
+    assert_eq!(c["floor_risk"], "high");
+    let reasons: Vec<&str> = c["review"]["gate"]["reasons"].as_array().unwrap().iter().map(|r| r["kind"].as_str().unwrap()).collect();
+    assert!(reasons.contains(&"history_rewritten"), "{reasons:?}");
+    let mut kinds: Vec<&str> = c["signals"].as_array().unwrap().iter().filter_map(|s| s["payload"]["kind"].as_str()).collect();
+    kinds.sort();
+    assert_eq!(kinds, ["deleted", "history_rewritten", "resubmitted"], "{}", c["signals"]);
+    let resub = c["signals"].as_array().unwrap().iter().find(|s| s["payload"]["kind"] == "resubmitted").unwrap();
+    assert_eq!(resub["severity"], "high");
+    assert_eq!(resub["payload"]["old_id"], 1);
+    assert_eq!(resub["payload"]["new_id"], 2);
+    assert!(h.get("/api/packages/foo").await["snapshot"]["missing_since"].is_null(), "back on the AUR");
 }

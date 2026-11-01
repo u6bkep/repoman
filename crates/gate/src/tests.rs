@@ -16,6 +16,8 @@ struct Case {
     old_files: Vec<String>,
     new_files: Vec<String>,
     maintainer_changed: bool,
+    adopted_from_orphan: bool,
+    history_rewritten: bool,
     srcinfo_mismatch: Option<bool>,
     official: Vec<&'static str>,
 }
@@ -49,6 +51,8 @@ impl Case {
             old_files: vec![".SRCINFO".into(), "PKGBUILD".into()],
             new_files: vec![".SRCINFO".into(), "PKGBUILD".into()],
             maintainer_changed: false,
+            adopted_from_orphan: false,
+            history_rewritten: false,
             srcinfo_mismatch: None,
             official: vec!["glibc", "python", "jq", "git"],
         }
@@ -69,6 +73,8 @@ impl Case {
             old_files: &self.old_files,
             new_files: &self.new_files,
             maintainer_changed: self.maintainer_changed,
+            adopted_from_orphan: self.adopted_from_orphan,
+            history_rewritten: self.history_rewritten,
             srcinfo_mismatch: self.srcinfo_mismatch,
             is_official: &is_official,
         })
@@ -267,10 +273,29 @@ fn onboarding_without_baseline_lints_the_head_only() {
         old_files: &[],
         new_files: &[],
         maintainer_changed: false,
+        adopted_from_orphan: false,
+        history_rewritten: false,
         srcinfo_mismatch: None,
         is_official: &|_| true,
     });
     assert_eq!(v.diff_class, DiffClass::Routine);
     assert_eq!(v.floor_risk, Risk::High);
     assert_eq!(rules(&v), ["network_tool"]);
+}
+
+#[test]
+fn adoption_and_rewritten_history_are_structural_high() {
+    let mut c = Case::bump("1.0", "1.1");
+    c.adopted_from_orphan = true;
+    let v = c.run();
+    assert_eq!(v.diff_class, DiffClass::Structural);
+    assert_eq!(v.floor_risk, Risk::High);
+    assert!(v.reasons.iter().any(|r| r.kind == "adopted_from_orphan"), "{:?}", v.reasons);
+
+    let mut c = Case::bump("1.0", "1.1");
+    c.history_rewritten = true;
+    let v = c.run();
+    assert_eq!(v.diff_class, DiffClass::Structural);
+    assert_eq!(v.floor_risk, Risk::High);
+    assert!(v.reasons.iter().any(|r| r.kind == "history_rewritten"), "{:?}", v.reasons);
 }

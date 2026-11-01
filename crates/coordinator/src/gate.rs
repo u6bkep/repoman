@@ -150,6 +150,7 @@ pub async fn assess(
     head_si: &Srcinfo,
     images: &HashMap<String, ImageRef>,
     self_hosted: bool,
+    history_rewritten: bool,
 ) -> Result<Assessment> {
     let old_si = match baseline {
         Some(b) => {
@@ -186,6 +187,10 @@ pub async fn assess(
         Some(b) if !b.maintainers.is_empty() => maintainer_set(snap.as_ref()) != b.maintainers,
         _ => false,
     };
+    // The poll records an adoption as a signal that expires with the
+    // adoption quarantine; while it stands, every change is a new
+    // maintainer's change.
+    let adopted_from_orphan = app.store.active_signal(pkgbase, "aur", "adopted")?.is_some();
     let srcinfo_mismatch = match baseline {
         Some(_) => srcinfo_matches(app, pkgbase, head, head_si, images).await.map(|ok| !ok),
         None => None,
@@ -206,6 +211,8 @@ pub async fn assess(
         old_files: &old_files,
         new_files: &new_files,
         maintainer_changed,
+        adopted_from_orphan,
+        history_rewritten,
         srcinfo_mismatch,
         is_official: &is_official,
     });

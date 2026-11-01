@@ -30,6 +30,11 @@ build_memory_headroom = 1.5
 # dangerous or suspicious verdict blocks auto-approval. Unset to disable.
 aur_security_url = "https://aur-security.cretezy.com"
 
+# When an orphaned package gets a maintainer, nothing of theirs is
+# auto-approved for this many days (an `adopted` signal that expires).
+# Deleted/resubmitted bases and replaced git histories block until cleared.
+adoption_quarantine_days = 30
+
 # Pull-through cache for upstream packages at /cache (pacman CacheServer).
 # Build roots use it automatically; clients add a CacheServer line.
 cache_enabled = true

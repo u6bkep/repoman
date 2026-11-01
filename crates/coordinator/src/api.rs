@@ -10,7 +10,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use repoman_common::proto::{JobKind, LogLine};
-use repoman_store::{BaselineRow, CandidateRow, JobRow, MembershipRow, PackageRow, SnapshotRow, StageRow, WorkerRow};
+use repoman_store::{BaselineRow, CandidateRow, JobRow, MembershipRow, PackageRow, SnapshotRow, StageRow, WorkerRow, signals::SignalRow};
 use repoman_store::artifacts::ArtifactPublication;
 use serde::{Deserialize, Serialize};
 use tower_http::services::ServeDir;
@@ -40,6 +40,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/candidates/{id}/decide", post(decide_candidate))
         .route("/api/candidates/{id}/diff", get(candidate_diff))
         .route("/api/events", get(list_events))
+        .route("/api/signals", get(list_signals))
+        .route("/api/signals/{id}/clear", post(clear_signal))
         .route("/api/cache", get(cache_view))
         .route("/cache/{filename}", get(cache_file))
         .route("/api/images", get(list_images))
@@ -271,6 +273,9 @@ pub struct PackageView {
     pub baseline: Option<BaselineRow>,
     pub snapshot: Option<SnapshotRow>,
     pub open_candidates: Vec<CandidateRow>,
+    /// Every signal ever recorded about the package, newest first, with
+    /// cleared and expired ones included so the history reads whole.
+    pub signals: Vec<SignalRow>,
 }
 
 fn package_view(st: &AppState, row: PackageRow) -> Result<PackageView, ApiError> {
@@ -279,8 +284,43 @@ fn package_view(st: &AppState, row: PackageRow) -> Result<PackageView, ApiError>
         baseline: st.store.get_baseline(&row.pkgbase).map_err(internal)?,
         snapshot: st.store.get_snapshot(&row.pkgbase).map_err(internal)?,
         open_candidates: st.store.open_candidates(&row.pkgbase).map_err(internal)?,
+        signals: st.store.signals_of(&row.pkgbase).map_err(internal)?,
         row,
     })
+}
+
+// ---- signals ----------------------------------------------------------------
+
+/// `GET /api/signals`: everything currently blocking auto-approval.
+async fn list_signals(State(st): State<AppState>) -> Result<axum::Json<Vec<SignalRow>>, ApiError> {
+    Ok(axum::Json(st.store.blocking_signals().map_err(internal)?))
+}
+
+#[derive(Deserialize)]
+pub struct ClearSignal {
+    #[serde(default)]
+    pub by: Option<String>,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// `POST /api/signals/{id}/clear`: the operator looked and it does not
+/// apply. Recorded as an event so the decision is auditable.
+async fn clear_signal(State(st): State<AppState>, Path(id): Path<String>, axum::Json(d): axum::Json<ClearSignal>) -> Result<axum::Json<SignalRow>, ApiError> {
+    let sig = st.store.get_signal(&id).map_err(internal)?.ok_or(not_found("no such signal"))?;
+    if sig.cleared_at.is_some() {
+        return Err((StatusCode::CONFLICT, "already cleared".into()));
+    }
+    let by = d.by.as_deref().unwrap_or("operator");
+    st.store.clear_signal(&id, by).map_err(internal)?;
+    st.store
+        .event(
+            "signal.cleared",
+            Some(&sig.pkgbase),
+            serde_json::json!({"id": id, "source": sig.source, "kind": sig.kind(), "by": by, "note": d.note}),
+        )
+        .map_err(internal)?;
+    Ok(axum::Json(st.store.get_signal(&id).map_err(internal)?.ok_or(not_found("no such signal"))?))
 }
 
 async fn list_packages(State(st): State<AppState>) -> Result<axum::Json<Vec<PackageView>>, ApiError> {
@@ -447,8 +487,45 @@ async fn list_candidates(State(st): State<AppState>, Query(q): Query<CandidatesQ
     Ok(axum::Json(st.store.candidates_in_states(&states).map_err(internal)?))
 }
 
-async fn get_candidate(State(st): State<AppState>, Path(id): Path<String>) -> Result<axum::Json<CandidateRow>, ApiError> {
-    Ok(axum::Json(st.store.get_candidate(&id).map_err(internal)?.ok_or(not_found("no such candidate"))?))
+#[derive(Serialize)]
+pub struct CandidateView {
+    #[serde(flatten)]
+    pub row: CandidateRow,
+    /// Live signals about the candidate's commit range and its package, as
+    /// opposed to `review.signals`, which is what stood at creation.
+    pub signals: Vec<SignalRow>,
+}
+
+fn candidate_signals(st: &AppState, c: &CandidateRow) -> Result<Vec<SignalRow>, ApiError> {
+    let mut hashes: Vec<String> = c.review["commits"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|k| k["hash"].as_str().map(str::to_string))
+        .collect();
+    if let Some(h) = &c.aur_commit
+        && !hashes.contains(h)
+    {
+        hashes.push(h.clone());
+    }
+    let mut out: Vec<SignalRow> = Vec::new();
+    if hashes.is_empty() {
+        out = st.store.signals_for(&c.pkgbase, None).map_err(internal)?;
+    }
+    for h in &hashes {
+        for s in st.store.signals_for(&c.pkgbase, Some(h)).map_err(internal)? {
+            if !out.iter().any(|x| x.id == s.id) {
+                out.push(s);
+            }
+        }
+    }
+    Ok(out)
+}
+
+async fn get_candidate(State(st): State<AppState>, Path(id): Path<String>) -> Result<axum::Json<CandidateView>, ApiError> {
+    let row = st.store.get_candidate(&id).map_err(internal)?.ok_or(not_found("no such candidate"))?;
+    let signals = candidate_signals(&st, &row)?;
+    Ok(axum::Json(CandidateView { row, signals }))
 }
 
 #[derive(Serialize)]

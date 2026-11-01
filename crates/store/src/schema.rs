@@ -206,6 +206,16 @@ pub const MIGRATIONS: &[&str] = &[
      CREATE INDEX cache_file_lru_idx ON cache_file(unreferenced_since, last_served_at);",
     // 7: live progress of the active run, for the UI
     "ALTER TABLE run ADD COLUMN progress TEXT NOT NULL DEFAULT '{}';",
+    // 8: AUR state. The base id and first-submitted date expose a delete-and-
+    // resubmit; missing_since and orphaned_since time the two states that
+    // matter. Signals gain an expiry (adoption windows) and an operator clear.
+    "ALTER TABLE aur_snapshot ADD COLUMN package_base_id INTEGER;
+     ALTER TABLE aur_snapshot ADD COLUMN first_submitted INTEGER;
+     ALTER TABLE aur_snapshot ADD COLUMN missing_since TEXT;
+     ALTER TABLE aur_snapshot ADD COLUMN orphaned_since TEXT;
+     ALTER TABLE signal ADD COLUMN expires_at TEXT;
+     ALTER TABLE signal ADD COLUMN cleared_at TEXT;
+     ALTER TABLE signal ADD COLUMN cleared_by TEXT;",
 ];
 
 pub fn migrate(conn: &Connection) -> Result<()> {

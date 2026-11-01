@@ -296,6 +296,22 @@ pub fn classify_change(input: &GateInput<'_>) -> Vec<Reason> {
             Risk::Medium,
         ));
     }
+    if input.adopted_from_orphan {
+        out.push(reason(
+            "adopted_from_orphan",
+            "the package was orphaned and has a new maintainer; this is the first window in which a takeover ships",
+            DiffClass::Structural,
+            Risk::High,
+        ));
+    }
+    if input.history_rewritten {
+        out.push(reason(
+            "history_rewritten",
+            "the published baseline is not an ancestor of this head: the AUR repository was deleted and resubmitted",
+            DiffClass::Structural,
+            Risk::High,
+        ));
+    }
     if input.srcinfo_mismatch == Some(true) {
         out.push(reason(
             "srcinfo_mismatch",

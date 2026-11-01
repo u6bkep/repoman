@@ -93,6 +93,14 @@ pub struct CoordinatorConfig {
     /// aur-security (cretezy) lookup service; unset disables the signal.
     #[serde(default = "default_aur_security_url")]
     pub aur_security_url: Option<String>,
+    /// Days after an orphan is adopted during which nothing from the new
+    /// maintainer is auto-approved.
+    #[serde(default = "default_adoption_quarantine_days")]
+    pub adoption_quarantine_days: u64,
+}
+
+fn default_adoption_quarantine_days() -> u64 {
+    30
 }
 
 fn default_build_memory() -> u64 {
@@ -218,6 +226,7 @@ impl Default for CoordinatorConfig {
             default_build_memory_bytes: default_build_memory(),
             build_memory_headroom: default_memory_headroom(),
             aur_security_url: default_aur_security_url(),
+            adoption_quarantine_days: default_adoption_quarantine_days(),
         }
     }
 }

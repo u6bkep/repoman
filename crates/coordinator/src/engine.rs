@@ -322,6 +322,10 @@ async fn poll_aur(app: &AppState) -> Result<()> {
             votes: None,
             popularity: None,
             head_commit: Some(head),
+            package_base_id: None,
+            first_submitted: None,
+            missing_since: None,
+            orphaned_since: None,
         })?;
     }
     let packages: Vec<PackageRow> = packages.into_iter().filter(|p| p.source_url.is_none()).collect();
@@ -336,16 +340,16 @@ async fn poll_aur(app: &AppState) -> Result<()> {
         by_base.entry(i.package_base.clone()).or_insert(i);
     }
     for p in &packages {
+        let prev = app.store.get_snapshot(&p.pkgbase)?;
         let Some(info) = by_base.get(&p.pkgbase) else {
-            tracing::warn!(pkgbase = %p.pkgbase, "not found on the AUR");
-            app.store.event("aur.missing", Some(&p.pkgbase), serde_json::json!({}))?;
+            missing_from_aur(app, p, prev).await?;
             continue;
         };
-        let prev = app.store.get_snapshot(&p.pkgbase)?;
+        let now = clock::now();
         let changed = prev.as_ref().map(|s| s.last_modified != info.last_modified).unwrap_or(true);
         let mut snap = SnapshotRow {
             pkgbase: p.pkgbase.clone(),
-            fetched_at: clock::now(),
+            fetched_at: now.clone(),
             version: Some(info.version.clone()),
             last_modified: info.last_modified,
             maintainer: info.maintainer.clone(),
@@ -355,7 +359,16 @@ async fn poll_aur(app: &AppState) -> Result<()> {
             votes: Some(info.num_votes),
             popularity: Some(info.popularity),
             head_commit: None,
+            package_base_id: info.package_base_id,
+            first_submitted: Some(info.first_submitted),
+            missing_since: None,
+            orphaned_since: None,
         };
+        if info.maintainer.is_none() {
+            // Keep the first time we saw it orphaned; a package that was
+            // already orphaned when added is "orphaned since at least" then.
+            snap.orphaned_since = prev.as_ref().and_then(|s| s.orphaned_since.clone()).or(Some(now.clone()));
+        }
         let need_sync = changed || !app.aur.mirror_path(&p.pkgbase).join("HEAD").exists();
         if need_sync {
             match app.aur.sync(&p.pkgbase).await {
@@ -364,15 +377,87 @@ async fn poll_aur(app: &AppState) -> Result<()> {
             }
         }
         if let Some(prev) = &prev {
-            if prev.maintainer != info.maintainer {
-                app.store.event(
-                    "aur.maintainer_changed",
-                    Some(&p.pkgbase),
-                    serde_json::json!({"from": prev.maintainer, "to": info.maintainer}),
-                )?;
-            }
+            aur_transitions(app, p, prev, info, &now)?;
         }
         app.store.upsert_snapshot(&snap)?;
+    }
+    Ok(())
+}
+
+/// The RPC did not list a package we track. The first miss is noted on the
+/// snapshot; the second consecutive one becomes a `deleted` signal, with a
+/// probe of the git repository (aurweb removes it with the base) as
+/// corroboration. Blocking until the operator clears it is deliberate: a
+/// base that comes back under the same name is the resubmission case.
+async fn missing_from_aur(app: &AppState, p: &PackageRow, prev: Option<SnapshotRow>) -> Result<()> {
+    tracing::warn!(pkgbase = %p.pkgbase, "not found on the AUR");
+    let Some(mut snap) = prev else {
+        app.store.event("aur.missing", Some(&p.pkgbase), serde_json::json!({"first_poll": true}))?;
+        return Ok(());
+    };
+    let now = clock::now();
+    if snap.missing_since.is_none() {
+        snap.missing_since = Some(now.clone());
+        snap.fetched_at = now;
+        app.store.upsert_snapshot(&snap)?;
+        app.store.event("aur.missing", Some(&p.pkgbase), serde_json::json!({}))?;
+        return Ok(());
+    }
+    if app.store.active_signal(&p.pkgbase, "aur", "deleted")?.is_none() {
+        let git_gone = app.aur.sync(&p.pkgbase).await.is_err();
+        let payload = serde_json::json!({
+            "kind": "deleted",
+            "missing_since": snap.missing_since,
+            "git_gone": git_gone,
+            "last_maintainer": snap.maintainer,
+            "last_version": snap.version,
+        });
+        app.store.add_signal(&p.pkgbase, None, "aur", "medium", &payload)?;
+        app.store.event("aur.deleted", Some(&p.pkgbase), payload)?;
+    }
+    Ok(())
+}
+
+/// What changed on the AUR between two polls, as events and signals.
+fn aur_transitions(app: &AppState, p: &PackageRow, prev: &SnapshotRow, info: &crate::aur::AurInfo, now: &str) -> Result<()> {
+    let id_changed = matches!((prev.package_base_id, info.package_base_id), (Some(a), Some(b)) if a != b);
+    let submitted_changed = matches!(prev.first_submitted, Some(a) if a != info.first_submitted);
+    if id_changed || submitted_changed {
+        let payload = serde_json::json!({
+            "kind": "resubmitted",
+            "old_id": prev.package_base_id, "new_id": info.package_base_id,
+            "old_first_submitted": prev.first_submitted, "new_first_submitted": info.first_submitted,
+            "missing_since": prev.missing_since,
+            "old_maintainer": prev.maintainer, "new_maintainer": info.maintainer,
+        });
+        if app.store.active_signal(&p.pkgbase, "aur", "resubmitted")?.is_none() {
+            app.store.add_signal(&p.pkgbase, None, "aur", "high", &payload)?;
+        }
+        app.store.event("aur.resubmitted", Some(&p.pkgbase), payload)?;
+    } else if let Some(since) = &prev.missing_since {
+        app.store.event("aur.reappeared", Some(&p.pkgbase), serde_json::json!({"missing_since": since}))?;
+    }
+    match (&prev.maintainer, &info.maintainer) {
+        (None, Some(by)) => {
+            let payload = serde_json::json!({
+                "kind": "adopted",
+                "by": by,
+                "orphaned_since": prev.orphaned_since,
+                "quarantine_days": app.config.adoption_quarantine_days,
+            });
+            if app.store.active_signal(&p.pkgbase, "aur", "adopted")?.is_none() {
+                let expires = time::OffsetDateTime::now_utc() + time::Duration::days(app.config.adoption_quarantine_days as i64);
+                app.store.add_signal_expiring(&p.pkgbase, None, "aur", "medium", &payload, Some(&clock::format(expires)))?;
+            }
+            app.store.event("aur.adopted", Some(&p.pkgbase), payload)?;
+        }
+        (Some(from), None) => {
+            app.store.event("aur.orphaned", Some(&p.pkgbase), serde_json::json!({"from": from, "at": now}))?;
+        }
+        (Some(from), Some(to)) if from != to => {
+            app.store.event("aur.maintainer_changed", Some(&p.pkgbase), serde_json::json!({"from": from, "to": to}))?;
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -416,7 +501,7 @@ async fn create_candidates(app: &AppState, run_id: &str, images: &HashMap<String
                     app.store.supersede_candidates(&p.pkgbase, &head)?;
                     let mut review = serde_json::json!({"note": "no baseline; first review"});
                     let (floor_risk, llm_risk) = match srcinfo_at(app, &p.pkgbase, &head).await {
-                        Ok(si) => review_change(app, run_id, p, None, &head, &si, images, &[], &mut review).await?,
+                        Ok(si) => review_change(app, run_id, p, None, &head, &si, images, &[], false, &mut review).await?,
                         Err(e) => {
                             review["gate_error"] = serde_json::Value::String(e.to_string());
                             (None, None)
@@ -468,11 +553,22 @@ async fn create_candidates(app: &AppState, run_id: &str, images: &HashMap<String
                         .unwrap_or_default();
                     let mut review = review;
                     review["commits"] = serde_json::to_value(&commits)?;
-                    if let Some(sec) = &app.aursec {
-                        let mut hashes: Vec<String> = commits.iter().map(|c| c.hash.clone()).collect();
-                        if !hashes.contains(&head) {
-                            hashes.push(head.clone());
+                    // AUR refuses non-fast-forward pushes, so a head that does
+                    // not descend from the published baseline means the
+                    // repository itself was replaced.
+                    let history_rewritten = !app.aur.is_ancestor(&p.pkgbase, &b.aur_commit, &head).await.unwrap_or(true);
+                    if history_rewritten {
+                        let payload = serde_json::json!({"kind": "history_rewritten", "baseline": b.aur_commit, "head": head});
+                        if app.store.active_signal(&p.pkgbase, "aur", "history_rewritten")?.is_none() {
+                            app.store.add_signal(&p.pkgbase, None, "aur", "high", &payload)?;
                         }
+                        app.store.event("aur.history_rewritten", Some(&p.pkgbase), payload)?;
+                    }
+                    let mut hashes: Vec<String> = commits.iter().map(|c| c.hash.clone()).collect();
+                    if !hashes.contains(&head) {
+                        hashes.push(head.clone());
+                    }
+                    if let Some(sec) = &app.aursec {
                         match sec.lookup(&p.pkgbase, &hashes).await {
                             Ok(found) => {
                                 for a in found.into_iter().filter(|a| a.assessment.is_some()) {
@@ -486,20 +582,23 @@ async fn create_candidates(app: &AppState, run_id: &str, images: &HashMap<String
                             }
                             Err(e) => tracing::warn!(pkgbase = %p.pkgbase, error = %format!("{e:#}"), "aur-security lookup failed"),
                         }
-                        let mut signals = Vec::new();
-                        for h in &hashes {
-                            for s in app.store.signals_for(&p.pkgbase, Some(h))? {
-                                if !signals.iter().any(|x: &repoman_store::signals::SignalRow| x.id == s.id) {
-                                    signals.push(s);
-                                }
+                    }
+                    // Commit-pinned and package-level signals, as they stood
+                    // when the candidate was created; the API serves the live
+                    // list.
+                    let mut signals = Vec::new();
+                    for h in &hashes {
+                        for s in app.store.signals_for(&p.pkgbase, Some(h))? {
+                            if !signals.iter().any(|x: &repoman_store::signals::SignalRow| x.id == s.id) {
+                                signals.push(s);
                             }
                         }
-                        if !signals.is_empty() {
-                            review["signals"] = serde_json::to_value(&signals)?;
-                        }
+                    }
+                    if !signals.is_empty() {
+                        review["signals"] = serde_json::to_value(&signals)?;
                     }
                     let (floor_risk, llm_risk) = match srcinfo_at(app, &p.pkgbase, &head).await {
-                        Ok(si) => review_change(app, run_id, p, Some(b), &head, &si, images, &commits, &mut review).await?,
+                        Ok(si) => review_change(app, run_id, p, Some(b), &head, &si, images, &commits, history_rewritten, &mut review).await?,
                         Err(e) => {
                             review["gate_error"] = serde_json::Value::String(e.to_string());
                             (None, None)
@@ -724,10 +823,11 @@ async fn review_change(
     si: &Srcinfo,
     images: &HashMap<String, ImageRef>,
     commits: &[crate::aur::CommitInfo],
+    history_rewritten: bool,
     review: &mut serde_json::Value,
 ) -> Result<(Option<String>, Option<String>)> {
     progress(app, run_id, serde_json::json!({"phase": "candidates", "detail": format!("assessing {}", p.pkgbase)}));
-    let a = match crate::gate::assess(app, &p.pkgbase, baseline, head, si, images, p.source_url.is_some()).await {
+    let a = match crate::gate::assess(app, &p.pkgbase, baseline, head, si, images, p.source_url.is_some(), history_rewritten).await {
         Ok(a) => a,
         Err(e) => {
             review["gate_error"] = serde_json::Value::String(e.to_string());

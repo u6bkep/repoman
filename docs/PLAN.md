@@ -437,11 +437,29 @@ candidates have no quarantine.
 ### 10.5 Signals
 
 - aur-security lookup API by pkgbase and commit list.
-- AUR state: package deleted, orphaned, out-of-date flag, maintainer change.
+- AUR state (implemented 2026-11-01, migration 8). The poll keeps
+  `PackageBaseID`, `FirstSubmitted`, `missing_since` and `orphaned_since` on
+  the snapshot and turns transitions into signals from source `aur`:
+  - `adopted` (medium, expires after `adoption_quarantine_days`, default 30):
+    maintainer went from none to someone. While active the gate adds
+    `adopted_from_orphan` (structural, high) to every change.
+  - `deleted` (medium, until cleared): the RPC omitted the package on two
+    consecutive polls; payload records whether the git repository is gone.
+  - `resubmitted` (high, until cleared): same name, new base id or
+    first-submitted date.
+  - `history_rewritten` (high, until cleared): the published baseline is not
+    an ancestor of the new head (AUR refuses non-fast-forward pushes, so
+    this only happens when the repository was replaced). Also a gate reason.
+  Orphaned and out-of-date are states, not transitions: shown as pills from
+  the snapshot, never stored as signals. Maintainer handovers between two
+  people stay an event; the gate's `maintainer_changed` already covers them.
 - Future: aur-general or aur-requests mailbox ingestion.
 
-Signals are stored with the commit they concern and shown on the candidate.
-They raise risk; they never approve.
+Signals are stored with the commit they concern (or the package, when
+`aur_commit` is null) and shown on the candidate, the package page and the
+System page. They raise risk; they never approve. A signal above `info`
+blocks auto-approval until it expires (`expires_at`) or the operator clears
+it (`POST /api/signals/{id}/clear`, recorded as a `signal.cleared` event).
 
 ### 10.6 LLM reviewer
 

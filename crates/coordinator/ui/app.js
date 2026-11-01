@@ -34,6 +34,65 @@ function ago(ts) {
   return `${Math.floor(s / 86400)}d ago`;
 }
 function agoEpoch(secs) { return secs ? ago(new Date(secs * 1000).toISOString()) : "-"; }
+function inFuture(ts) {
+  const s = Math.max(0, (Date.parse(ts) - Date.now()) / 1000);
+  if (s < 3600) return `${Math.ceil(s / 60)}m`;
+  if (s < 86400) return `${Math.ceil(s / 3600)}h`;
+  return `${Math.ceil(s / 86400)}d`;
+}
+
+// ---- signals -----------------------------------------------------------------------
+// One row per signal, wherever they appear (candidate, package, system).
+
+function sigActive(s) { return !s.cleared_at && !(s.expires_at && s.expires_at <= new Date().toISOString()); }
+function sigLabel(s) {
+  const p = s.payload || {};
+  if (s.source === "aur-security") return p.verdict || "";
+  return { adopted: `adopted by ${p.by}`, deleted: "deleted from the AUR", resubmitted: "deleted and resubmitted under the same name", history_rewritten: "git history replaced" }[p.kind] || p.kind || "";
+}
+function sigDetail(s) {
+  const p = s.payload || {};
+  if (s.source === "aur-security") return p.explanation || "";
+  switch (p.kind) {
+    case "adopted": return `orphaned since ${p.orphaned_since ? ago(p.orphaned_since) : "before we watched"}; nothing auto-approves for ${p.quarantine_days} days`;
+    case "deleted": return `missing since ${ago(p.missing_since)}; git repository ${p.git_gone ? "gone too" : "still answers"}; last ${p.last_version || "?"} by ${p.last_maintainer || "nobody"}`;
+    case "resubmitted": return `base id ${p.old_id} → ${p.new_id}, first submitted ${agoEpoch(p.old_first_submitted)} → ${agoEpoch(p.new_first_submitted)}${p.missing_since ? `, missing since ${ago(p.missing_since)}` : ""}`;
+    case "history_rewritten": return `baseline ${short(p.baseline)} is not an ancestor of ${short(p.head)}`;
+    default: return JSON.stringify(p);
+  }
+}
+function sigState(s) {
+  if (s.cleared_at) return `<span class="pill">cleared by ${esc(s.cleared_by)} ${ago(s.cleared_at)}</span>`;
+  if (s.expires_at && s.expires_at <= new Date().toISOString()) return `<span class="pill">expired ${ago(s.expires_at)}</span>`;
+  if (s.expires_at) return `<span class="muted">expires in ${inFuture(s.expires_at)}</span>`;
+  return "";
+}
+function signalsList(list, { withPackage = false } = {}) {
+  if (!list || !list.length) return "";
+  return `<ul class="findings">${list.map((s) => {
+    const active = sigActive(s);
+    return `<li class="${active ? "" : "muted"}">${pill(s.severity)} ${withPackage ? `<a href="#/packages/${esc(s.pkgbase)}"><b>${esc(s.pkgbase)}</b></a> ` : ""}<b>${esc(s.source)}</b> ${esc(sigLabel(s))} ${s.aur_commit ? `<span class="mono">${short(s.aur_commit)}</span>` : '<span class="muted">whole package</span>'} <span class="muted">${esc(sigDetail(s))}</span> ${sigState(s)} <span class="muted">${ago(s.observed_at)}</span>${active && s.severity !== "info" ? ` <button data-clear-signal="${esc(s.id)}">Clear</button>` : ""}</li>`;
+  }).join("")}</ul>`;
+}
+function wireSignalClears() {
+  document.querySelectorAll("[data-clear-signal]").forEach((b) => b.onclick = async () => {
+    b.disabled = true;
+    try { await post(`/api/signals/${b.dataset.clearSignal}/clear`, { by: "ui" }); toast("signal cleared"); route(); }
+    catch (e) { toast(e.message, true); b.disabled = false; }
+  });
+}
+// What the AUR currently says about a package, as pills.
+function aurStatePills(p) {
+  const s = p.snapshot;
+  if (!s || p.source_url) return "";
+  const out = [];
+  if (s.missing_since) out.push(`<span class="pill high" title="missing since ${esc(s.missing_since)}">gone from AUR ${ago(s.missing_since)}</span>`);
+  if (!s.maintainer && !s.missing_since) out.push(`<span class="pill medium" title="orphaned since ${esc(s.orphaned_since || "?")}">orphan${s.orphaned_since ? ` ${ago(s.orphaned_since)}` : ""}</span>`);
+  if (s.out_of_date) out.push(`<span class="pill medium" title="flagged ${esc(new Date(s.out_of_date * 1000).toISOString())}">out of date ${agoEpoch(s.out_of_date)}</span>`);
+  const blocking = (p.signals || []).filter((x) => sigActive(x) && x.severity !== "info");
+  if (blocking.length) out.push(`<span class="pill high">${blocking.length} blocking signal${blocking.length > 1 ? "s" : ""}</span>`);
+  return out.join(" ");
+}
 function dur(a, b) {
   if (!a) return "-";
   const s = Math.max(0, (Date.parse(b || new Date().toISOString()) - Date.parse(a)) / 1000);
@@ -260,7 +319,7 @@ async function viewCandidate(id) {
       ${r.note ? `<dt>note</dt><dd>${esc(r.note)}</dd>` : ""}
     </dl></div>
     ${publishFlags ? `<h2>Built artifacts raised flags</h2><div class="panel"><p class="muted">The build succeeded but the artifacts differ from what the stream serves in ways that matter on the installing system. Approve to rebuild and publish; reject to drop this commit.</p><ul class="findings">${publishFlags}</ul></div>` : ""}
-    ${(r.signals || []).length ? `<h2>External signals</h2><ul class="findings">${r.signals.map((s) => `<li>${pill(s.severity === "high" ? "high" : s.severity === "medium" ? "medium" : "low")} <b>${esc(s.source)}</b> <span class="mono">${short(s.aur_commit)}</span> ${esc(s.payload?.verdict || "")} <span class="muted">${esc(s.payload?.explanation || JSON.stringify(s.payload))}</span></li>`).join("")}</ul>` : ""}
+    ${(c.signals || []).length ? `<h2>External signals</h2><p class="muted">Anything above <i>info</i> that is not cleared or expired blocks auto-approval of this package. Clear a signal only after you have looked at what it points to.</p>${signalsList(c.signals)}` : ""}
     ${reasons ? `<h2>Reasons</h2><ul class="findings">${reasons}</ul>` : ""}
     ${findings ? `<h2>Lint findings</h2><ul class="findings">${findings}</ul>` : ""}
     ${llmHtml}
@@ -270,6 +329,7 @@ async function viewCandidate(id) {
     ${commits ? `<h2>Commits</h2><table><tbody>${commits}</tbody></table>` : ""}
     ${jobs.length ? `<h2>Builds</h2>${jobsTable(jobs)}` : ""}
   `;
+  wireSignalClears();
   document.querySelectorAll("#decide button").forEach((b) => b.onclick = async () => {
     const decision = b.dataset.decision;
     const body = { decision, note: document.getElementById("note").value || null };
@@ -373,12 +433,12 @@ async function viewPackages() {
   const render = () => {
     const q2 = (document.getElementById("filter")?.value || "").toLowerCase();
     const rows2 = pkgs.filter((p) => !q2 || p.pkgbase.includes(q2) || (p.provenance_class || "").includes(q2) || p.streams.some((s) => s.stream.includes(q2)));
-    document.getElementById("pkg-table").innerHTML = table(["package", "kind", "class", "streams", "AUR version", "maintainer", "votes", "baseline", "open", "policy"], rows2, {
+    document.getElementById("pkg-table").innerHTML = table(["package", "kind", "class", "streams", "AUR version", "maintainer", "AUR state", "votes", "baseline", "open", "policy"], rows2, {
       href: (p) => `#/packages/${p.pkgbase}`,
       cells: (p) => [
         esc(p.pkgbase), esc(p.kind), dash(p.provenance_class),
         p.streams.map((s) => `<span class="pill">${esc(s.stream.replace("manjaro-", ""))}${s.required && !s.wanted ? " (dep)" : ""}</span>`).join(" "),
-        dash(p.snapshot?.version), dash(p.snapshot?.maintainer), dash(p.snapshot?.votes),
+        dash(p.snapshot?.version), dash(p.snapshot?.maintainer), aurStatePills(p), dash(p.snapshot?.votes),
         p.baseline ? `<span class="mono">${short(p.baseline.aur_commit, 8)}</span> <span class="muted">${ago(p.baseline.published_at)}</span>` : '<span class="muted">none</span>',
         p.open_candidates.length ? `<a href="#/candidates/${p.open_candidates[0].id}">${pill(p.open_candidates[0].state)}</a>` : "",
         Object.keys(p.policy || {}).length ? `<code>${esc(JSON.stringify(p.policy))}</code>` : "",
@@ -431,7 +491,8 @@ async function viewPackage(pkgbase) {
     <div class="panel"><dl class="kv">
       <dt>streams</dt><dd>${p.streams.map((m) => `<span class="pill">${esc(m.stream)}${m.required && !m.wanted ? " (dependency)" : ""}</span>`).join(" ") || "-"}</dd>
       <dt>AUR version</dt><dd>${dash(s.version)} <span class="muted">modified ${agoEpoch(s.last_modified)}, fetched ${ago(s.fetched_at)}</span></dd>
-      <dt>maintainer</dt><dd>${dash(s.maintainer)}${(s.comaintainers || []).length ? ` <span class="muted">+ ${esc(s.comaintainers.join(", "))}</span>` : ""}${s.out_of_date ? ` <span class="pill high">flagged out of date</span>` : ""}</dd>
+      <dt>maintainer</dt><dd>${s.maintainer ? esc(s.maintainer) : '<span class="muted">nobody</span>'}${(s.comaintainers || []).length ? ` <span class="muted">+ ${esc(s.comaintainers.join(", "))}</span>` : ""}${s.submitter && s.submitter !== s.maintainer ? ` <span class="muted">submitted by ${esc(s.submitter)}</span>` : ""}</dd>
+      ${aurStatePills(p) ? `<dt>AUR state</dt><dd>${aurStatePills(p)}</dd>` : ""}
       <dt>votes</dt><dd>${dash(s.votes)} <span class="muted">popularity ${s.popularity != null ? s.popularity.toFixed(2) : "-"}</span></dd>
       <dt>baseline</dt><dd>${p.baseline ? `<span class="mono">${short(p.baseline.aur_commit)}</span> published ${ago(p.baseline.published_at)}${p.baseline.maintainers?.length ? ` by ${esc(p.baseline.maintainers.join(", "))}` : ""}` : '<span class="muted">none yet</span>'}</dd>
       ${p.source_url ? `<dt>source</dt><dd class="mono">${esc(p.source_url)}</dd>` : ""}
@@ -445,8 +506,10 @@ async function viewPackage(pkgbase) {
         <span class="muted">keys: pgp="skip", allow_network_build, build_once, provider_choices, extra_depends, quarantine_days, auto_metadata</span>
       </div>
     </div>
+    ${(p.signals || []).length ? `<h2>Signals</h2>${signalsList(p.signals)}` : ""}
     <h2>Candidates</h2>${cands}
     <h2>Publications</h2>${pubs}`;
+  wireSignalClears();
   document.getElementById("save-policy").onclick = async () => {
     try {
       const policy = JSON.parse(document.getElementById("policy").value);
@@ -465,7 +528,12 @@ async function viewPackage(pkgbase) {
 // ---- system ----------------------------------------------------------------------
 
 async function viewSystem() {
-  const [workers, images, events, health, cache] = await Promise.all([api("/api/workers"), api("/api/images"), api("/api/events?limit=60"), api("/api/health"), api("/api/cache")]);
+  const [workers, images, events, health, cache, signals, pkgs] = await Promise.all([api("/api/workers"), api("/api/images"), api("/api/events?limit=60"), api("/api/health"), api("/api/cache"), api("/api/signals"), api("/api/packages")]);
+  const aur = pkgs.filter((p) => !p.source_url && p.snapshot);
+  const orphans = aur.filter((p) => !p.snapshot.maintainer && !p.snapshot.missing_since);
+  const ood = aur.filter((p) => p.snapshot.out_of_date);
+  const gone = aur.filter((p) => p.snapshot.missing_since);
+  const names = (l) => l.slice(0, 12).map((p) => `<a href="#/packages/${esc(p.pkgbase)}">${esc(p.pkgbase)}</a>`).join(", ") + (l.length > 12 ? ` <span class="muted">+${l.length - 12}</span>` : "");
   $main.innerHTML = `
     <h1>System <span class="muted">repoman ${esc(health.version)}</span></h1>
     <h2>Workers</h2>
@@ -478,6 +546,14 @@ async function viewSystem() {
       cells: (i) => [esc(i.stream), `<span class="mono">${short(i.sha256, 12)}</span>`, bytes(i.size), dash(i.packages?.length), pill(i.state), `<span class="muted">${ago(i.created_at)}</span>`],
       empty: "no images yet",
     })}
+    <h2>AUR state</h2>
+    <div class="cards">
+      <div class="card"><div class="label">orphaned</div><div class="big">${orphans.length}</div><div class="muted">${names(orphans) || "none"}</div></div>
+      <div class="card"><div class="label">flagged out of date</div><div class="big">${ood.length}</div><div class="muted">${names(ood) || "none"}</div></div>
+      <div class="card"><div class="label">gone from the AUR</div><div class="big">${gone.length}</div><div class="muted">${names(gone) || "none"}</div></div>
+      <div class="card"><div class="label">blocking signals</div><div class="big">${signals.length}</div><div class="muted">${signals.length ? "auto-approval is off for these packages until cleared or expired" : "nothing blocks auto-approval"}</div></div>
+    </div>
+    ${signals.length ? signalsList(signals, { withPackage: true }) : ""}
     <h2>Package cache</h2>
     <div class="cards">
       <div class="card"><div class="label">state</div><div class="big">${cache.enabled ? "on" : "off"}</div><div class="muted mono">${esc(cache.url)}</div></div>
@@ -497,7 +573,8 @@ SigLevel = Required DatabaseRequired
 Server = ${esc(location.origin)}/repos/manjaro-stable/$arch</pre>
     <p>Optionally let the distribution repos fetch through this host's cache by adding one line to each of <code>[core]</code>, <code>[extra]</code>, and <code>[multilib]</code>, above their <code>Include</code>:</p>
     <pre>CacheServer = ${esc(location.origin)}/cache</pre>
-    <p>Import the signing key once: <code>curl -s ${esc(location.origin)}/repos/repoman.asc | sudo pacman-key --add - &amp;&amp; sudo pacman-key --lsign-key &lt;fingerprint&gt;</code></p></div>`;
+    <p>Import the signing key once (<code>pacman-key --add</code> does not read stdin): <code>curl -s ${esc(location.origin)}/repos/repoman.asc -o /tmp/repoman.asc &amp;&amp; sudo pacman-key --add /tmp/repoman.asc &amp;&amp; sudo pacman-key --lsign-key &lt;fingerprint&gt;</code></p></div>`;
+  wireSignalClears();
 }
 viewSystem.refresh = 10000;
 

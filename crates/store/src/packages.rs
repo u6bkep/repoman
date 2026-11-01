@@ -50,6 +50,19 @@ pub struct SnapshotRow {
     pub votes: Option<i64>,
     pub popularity: Option<f64>,
     pub head_commit: Option<String>,
+    /// aurweb's PackageBaseID; a change under the same name means the base
+    /// was deleted and resubmitted.
+    #[serde(default)]
+    pub package_base_id: Option<i64>,
+    #[serde(default)]
+    pub first_submitted: Option<i64>,
+    /// Set on the first poll the RPC did not return the package; cleared when
+    /// it reappears.
+    #[serde(default)]
+    pub missing_since: Option<String>,
+    /// When we first saw the package without a maintainer.
+    #[serde(default)]
+    pub orphaned_since: Option<String>,
 }
 
 impl Store {
@@ -290,7 +303,8 @@ impl Store {
         self.with(|c| {
             Ok(c.query_row(
                 "SELECT pkgbase, fetched_at, version, last_modified, maintainer, submitter, comaintainers,
-                        out_of_date, votes, popularity, head_commit
+                        out_of_date, votes, popularity, head_commit, package_base_id, first_submitted,
+                        missing_since, orphaned_since
                  FROM aur_snapshot WHERE pkgbase = ?1",
                 params![pkgbase],
                 row_to_snapshot,
@@ -303,14 +317,17 @@ impl Store {
         self.with(|c| {
             c.execute(
                 "INSERT INTO aur_snapshot (pkgbase, fetched_at, version, last_modified, maintainer, submitter,
-                                           comaintainers, out_of_date, votes, popularity, head_commit)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                                           comaintainers, out_of_date, votes, popularity, head_commit,
+                                           package_base_id, first_submitted, missing_since, orphaned_since)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
                  ON CONFLICT(pkgbase) DO UPDATE SET fetched_at = excluded.fetched_at, version = excluded.version,
                     last_modified = excluded.last_modified, maintainer = excluded.maintainer,
                     submitter = excluded.submitter, comaintainers = excluded.comaintainers,
                     out_of_date = excluded.out_of_date, votes = excluded.votes,
                     popularity = excluded.popularity,
-                    head_commit = COALESCE(excluded.head_commit, aur_snapshot.head_commit)",
+                    head_commit = COALESCE(excluded.head_commit, aur_snapshot.head_commit),
+                    package_base_id = excluded.package_base_id, first_submitted = excluded.first_submitted,
+                    missing_since = excluded.missing_since, orphaned_since = excluded.orphaned_since",
                 params![
                     s.pkgbase,
                     s.fetched_at,
@@ -323,6 +340,10 @@ impl Store {
                     s.votes,
                     s.popularity,
                     s.head_commit,
+                    s.package_base_id,
+                    s.first_submitted,
+                    s.missing_since,
+                    s.orphaned_since,
                 ],
             )?;
             Ok(())
@@ -363,6 +384,10 @@ fn row_to_snapshot(r: &rusqlite::Row) -> rusqlite::Result<SnapshotRow> {
         votes: r.get(8)?,
         popularity: r.get(9)?,
         head_commit: r.get(10)?,
+        package_base_id: r.get(11)?,
+        first_submitted: r.get(12)?,
+        missing_since: r.get(13)?,
+        orphaned_since: r.get(14)?,
     })
 }
 
@@ -434,6 +459,10 @@ mod tests {
             votes: Some(3),
             popularity: Some(1.5),
             head_commit: Some("h1".into()),
+            package_base_id: Some(7),
+            first_submitted: Some(50),
+            missing_since: None,
+            orphaned_since: None,
         };
         s.upsert_snapshot(&snap).unwrap();
         snap.head_commit = None;
