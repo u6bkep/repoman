@@ -83,20 +83,76 @@ function listOrNone(items, max = 8) {
   return items.length > max ? `${shown} <span class="muted">+${items.length - max} more</span>` : shown;
 }
 
-// Replace the page but keep where the reader was: window scroll, every
-// scrollable element's offset (by id) and which <details> were open.
-function swap(html) {
-  const y = window.scrollY;
-  const scrolls = {};
-  $main.querySelectorAll("[id]").forEach((el) => { if (el.scrollTop) scrolls[el.id] = { top: el.scrollTop, atBottom: el.scrollHeight - el.scrollTop - el.clientHeight < 4 }; });
-  const open = new Set([...$main.querySelectorAll("details[open]")].map((d) => d.dataset.key || d.querySelector("summary")?.textContent));
-  $main.innerHTML = html;
-  $main.querySelectorAll("details").forEach((d) => { if (open.has(d.dataset.key || d.querySelector("summary")?.textContent)) d.open = true; });
-  for (const [id, s] of Object.entries(scrolls)) {
-    const el = document.getElementById(id);
-    if (el) el.scrollTop = s.atBottom ? el.scrollHeight : s.top;
+// ---- rendering ---------------------------------------------------------------------
+// Views produce the whole page as a string. Applying it by morphing the
+// live DOM, instead of replacing it, keeps every node that is still
+// there, and with it everything the browser holds on the reader's behalf:
+// scroll offsets, open <details>, focus, selection, half-typed input.
+// Nodes match by id, then data-key, then tag at the same position.
+
+// Attributes the browser or the reader owns; never written by a morph.
+const OWNED_ATTRS = new Set(["open", "value", "checked", "selected"]);
+
+function morphAttrs(from, to) {
+  for (const a of [...from.attributes]) {
+    if (!OWNED_ATTRS.has(a.name) && !to.hasAttribute(a.name)) from.removeAttribute(a.name);
   }
-  window.scrollTo(0, y);
+  for (const a of to.attributes) {
+    if (!OWNED_ATTRS.has(a.name) && from.getAttribute(a.name) !== a.value) from.setAttribute(a.name, a.value);
+  }
+}
+function keyOf(n) { return n.nodeType === 1 ? (n.id || n.dataset?.key || null) : null; }
+function same(a, b) { return a.nodeType === b.nodeType && (a.nodeType !== 1 || a.tagName === b.tagName); }
+function morphNode(from, to) {
+  if (!same(from, to)) { from.replaceWith(to.cloneNode(true)); return; }
+  if (from.nodeType === 3 || from.nodeType === 8) { if (from.data !== to.data) from.data = to.data; return; }
+  if (from === document.activeElement && /^(INPUT|TEXTAREA|SELECT)$/.test(from.tagName)) return;
+  morphAttrs(from, to);
+  // An element the view fills by other means (the log) keeps its children.
+  if (from.hasAttribute("data-morph-skip")) return;
+  morphChildren(from, to);
+}
+function morphChildren(from, to) {
+  const olds = [...from.childNodes];
+  const used = new Set();
+  let placed = null; // last node settled into position; the next goes after it
+  let cursor = 0;    // olds index after the last positional match
+  for (const want of to.childNodes) {
+    const key = keyOf(want);
+    let idx = -1;
+    if (key) {
+      idx = olds.findIndex((o, i) => !used.has(i) && keyOf(o) === key);
+    } else {
+      // The next unconsumed old node, if it is unkeyed and of the same kind.
+      let i = cursor;
+      while (i < olds.length && used.has(i)) i++;
+      if (i < olds.length && !keyOf(olds[i]) && same(olds[i], want)) idx = i;
+    }
+    const slot = placed ? placed.nextSibling : from.firstChild;
+    let node;
+    if (idx >= 0) {
+      node = olds[idx];
+      used.add(idx);
+      cursor = idx + 1;
+      // Moving a node that is already in place would drop its focus and
+      // scroll state, so only move when something else occupies the slot.
+      if (node !== slot) from.insertBefore(node, slot);
+      morphNode(node, want);
+    } else {
+      node = want.cloneNode(true);
+      from.insertBefore(node, slot);
+    }
+    placed = node;
+  }
+  for (let i = 0; i < olds.length; i++) if (!used.has(i) && olds[i].parentNode === from) from.removeChild(olds[i]);
+}
+let lastHtml = null;
+function swap(html) {
+  if (html === lastHtml) return;
+  const tpl = document.createElement("template");
+  tpl.innerHTML = html;
+  morphChildren($main, tpl.content);
+  lastHtml = html;
 }
 
 // One line describing what an active run is doing right now.
@@ -280,6 +336,7 @@ async function route() {
     if (m) {
       document.querySelectorAll("nav a").forEach((a) => a.classList.toggle("active", hash.startsWith(`#/${a.dataset.nav}`) || (a.dataset.nav === "queue" && hash.startsWith("#/candidates")) || (a.dataset.nav === "runs" && hash.startsWith("#/jobs"))));
       $main.dataset.view = "";
+      lastHtml = null;
       const render = async () => {
         try {
           await view(...m.slice(1).map(decodeURIComponent));
@@ -630,8 +687,8 @@ function jobResultPanel(j) {
 
 const logState = { id: null, lastSeq: -1, count: 0 };
 async function viewJob(id) {
-  const same = $main.dataset.view === `job:${id}` && document.getElementById("log");
-  const after = same ? logState.lastSeq : -1;
+  const again = $main.dataset.view === `job:${id}` && document.getElementById("log");
+  const after = again ? logState.lastSeq : -1;
   const [j, log] = await Promise.all([api(`/api/jobs/${id}`), api(`/api/jobs/${id}/log${after >= 0 ? `?after=${after}` : ""}`)]);
   if (location.hash !== `#/jobs/${id}`) return;
   const live = ["queued", "assigned", "running"].includes(j.state);
@@ -650,30 +707,26 @@ async function viewJob(id) {
     <h2>Spec</h2><div class="panel">${jobSpecPanel(j) || '<span class="muted">nothing to show</span>'}</div>
     ${j.result ? `<h2>Result</h2><div class="panel">${jobResultPanel(j)}</div>` : ""}
     ${stages ? `<h2>Stages</h2><table><tbody>${stages}</tbody></table>` : ""}`;
-  if (same) {
-    // Patch in place: header and stages, then append the new log lines.
-    document.getElementById("job-head").innerHTML = head;
-    const pre = document.getElementById("log");
-    const atBottom = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 4;
-    if (log.length) {
-      if (logState.count === 0) pre.innerHTML = "";
-      pre.insertAdjacentHTML("beforeend", log.map(logLineHtml).join(""));
-      logState.count += log.length;
-      logState.lastSeq = log[log.length - 1].seq;
-      if (atBottom) pre.scrollTop = pre.scrollHeight;
-    }
-    document.getElementById("log-count").textContent = `${logState.count} lines`;
-    document.getElementById("log-live").innerHTML = live ? '<span class="pill running">live</span>' : "";
-    return;
-  }
-  logState.id = id; logState.lastSeq = log.length ? log[log.length - 1].seq : -1; logState.count = log.length;
+  // The log is the one thing not rendered from scratch: the <pre> keeps
+  // its lines across morphs (data-morph-skip) and only new ones are
+  // appended, following the tail when the reader is at it.
+  if (!again) { logState.id = id; logState.count = 0; logState.lastSeq = -1; }
+  const count = logState.count + log.length;
   swap(`
     <div id="job-head">${head}</div>
-    <h2>Log <span id="log-count" class="muted">${log.length} lines</span>${netLines ? ` <span class="pill medium">${netLines} net</span>` : ""} <span id="log-live">${live ? '<span class="pill running">live</span>' : ""}</span></h2>
-    <pre class="log" id="log">${log.map(logLineHtml).join("") || '<span class="muted">no output yet</span>'}</pre>`);
-  $main.dataset.view = `job:${id}`;
+    <h2>Log <span id="log-count" class="muted">${count} lines</span>${netLines ? ` <span class="pill medium">${netLines} net</span>` : ""} <span id="log-live">${live ? '<span class="pill running">live</span>' : ""}</span></h2>
+    <pre class="log" id="log" data-morph-skip>${again ? "" : '<span class="muted">no output yet</span>'}</pre>`);
   const pre = document.getElementById("log");
-  pre.scrollTop = live ? pre.scrollHeight : 0;
+  if (log.length) {
+    const atBottom = again && pre.scrollHeight - pre.scrollTop - pre.clientHeight < 4;
+    if (logState.count === 0) pre.innerHTML = "";
+    pre.insertAdjacentHTML("beforeend", log.map(logLineHtml).join(""));
+    logState.count = count;
+    logState.lastSeq = log[log.length - 1].seq;
+    if (!again) pre.scrollTop = live ? pre.scrollHeight : 0;
+    else if (atBottom) pre.scrollTop = pre.scrollHeight;
+  }
+  $main.dataset.view = `job:${id}`;
 }
 viewJob.refresh = 3000;
 

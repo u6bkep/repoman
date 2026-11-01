@@ -475,9 +475,14 @@ it (`POST /api/signals/{id}/clear`, recorded as a `signal.cleared` event).
 
 ### 10.5a Operator UI (notes, 2026-11-01)
 
-Plain JS over the JSON API, compiled into the binary at `/ui/`. Refreshes
-swap the page but keep window and element scroll offsets and open
-`<details>`; the job view patches in place and fetches only new log lines
+Plain JS over the JSON API, compiled into the binary at `/ui/`. Views are
+pure functions from fetched data to one HTML string; the string is applied
+by morphing the live DOM (nodes matched by id, then `data-key`, then tag at
+position; `open`, `value`, `checked`, `selected` are never written; a
+focused input is left alone; an unchanged string is not applied at all).
+Surviving nodes keep scroll, focus, selection and open state, so no view
+has to preserve anything by hand. The job log is the one `data-morph-skip`
+element: it keeps its lines and the view appends only new ones
 (`GET /api/jobs/{id}/log?after=seq`), following the tail only when the
 reader is already at the bottom. The queue splits "needs you" from
 "waiting on the clock" by mirroring `auto_approve` (class, floor, LLM
