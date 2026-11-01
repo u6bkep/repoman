@@ -475,6 +475,13 @@ it (`POST /api/signals/{id}/clear`, recorded as a `signal.cleared` event).
 Implemented in M2 as `coordinator::reviewer` (raw HTTP; no official Rust
 SDK). Runs for structural or elevated-floor candidates when
 `[reviewer] enabled`, and for routine ones only when `routine_model` is set.
+Since 2026-11-01 the prompt also carries a `<signals>` section (every active
+signal on the package, one line each) and a `<comments>` section with the
+AUR package comments posted since the baseline (pinned ones always; the
+latest ten for a first review), read by `coordinator::aurweb` once per
+review. The user turn is stored on the candidate as `review.llm.prompt` and
+shown on the candidate page; `GET /api/reviews` lists reviews and total
+spend for the System page.
 Direct `POST /v1/messages` with:
 
 - Model `claude-opus-5-5` for structural candidates, `claude-sonnet-5-5` for

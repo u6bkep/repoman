@@ -291,6 +291,8 @@ async function viewCandidate(id) {
       ${v ? `<p>${pill(v.risk)} ${esc(v.summary)}</p>
         <ul class="findings">${(v.findings || []).map((f) => `<li>${pill(f.severity)} <b>${esc(f.kind)}</b> ${esc(f.evidence)}</li>`).join("")}</ul>
         ${(v.questions_for_human || []).length ? `<p><b>For you to check:</b></p><ul>${v.questions_for_human.map((q) => `<li>${esc(q)}</li>`).join("")}</ul>` : ""}` : ""}
+      ${r.comments ? `<p class="muted">${r.comments.error ? `AUR comments unavailable: ${esc(r.comments.error)}` : `${r.comments.shown} AUR comment${r.comments.shown === 1 ? "" : "s"} shown to the model`}${r.comments.url ? ` · <a href="${esc(r.comments.url)}" target="_blank" rel="noopener">package page</a>` : ""}</p>` : ""}
+      ${llm.prompt ? `<details><summary class="muted">what the model saw (${bytes(llm.prompt.length)} of prompt, sha256 ${esc(short(llm.prompt_sha256, 12))})</summary><pre class="diff">${esc(llm.prompt)}</pre></details>` : ""}
     </div>`;
   }
   const commits = (r.commits || []).map((k) => `<tr><td class="mono">${esc(short(k.hash))}</td><td class="muted">${esc(k.date)}</td><td>${esc(k.author)}</td><td>${esc(k.subject)}</td></tr>`).join("");
@@ -530,7 +532,7 @@ async function viewPackage(pkgbase) {
 // ---- system ----------------------------------------------------------------------
 
 async function viewSystem() {
-  const [workers, images, events, health, cache, signals, pkgs] = await Promise.all([api("/api/workers"), api("/api/images"), api("/api/events?limit=60"), api("/api/health"), api("/api/cache"), api("/api/signals"), api("/api/packages")]);
+  const [workers, images, events, health, cache, signals, pkgs, reviews] = await Promise.all([api("/api/workers"), api("/api/images"), api("/api/events?limit=60"), api("/api/health"), api("/api/cache"), api("/api/signals"), api("/api/packages"), api("/api/reviews")]);
   const aur = pkgs.filter((p) => !p.source_url && p.snapshot);
   const orphans = aur.filter((p) => !p.snapshot.maintainer && !p.snapshot.missing_since);
   const ood = aur.filter((p) => p.snapshot.out_of_date);
@@ -556,6 +558,16 @@ async function viewSystem() {
       <div class="card"><div class="label">blocking signals</div><div class="big">${signals.length}</div><div class="muted">${signals.length ? "auto-approval is off for these packages until cleared or expired" : "nothing blocks auto-approval"}</div></div>
     </div>
     ${signals.length ? signalsList(signals, { withPackage: true }) : ""}
+    <h2>LLM reviews</h2>
+    <div class="cards">
+      <div class="card"><div class="label">reviews</div><div class="big">${reviews.count}</div><div class="muted">$${reviews.cost_usd.toFixed(2)} spent in total</div></div>
+      <div class="card"><div class="label">verdicts</div><div class="big">${["low", "medium", "high"].map((k) => `${reviews.recent.filter((c) => c.review?.llm?.verdict?.risk === k).length} ${k}`).join(" · ")}</div><div class="muted">of the last ${reviews.recent.length}; ${reviews.recent.filter((c) => c.review?.llm && !c.review.llm.verdict).length} without a verdict</div></div>
+    </div>
+    ${table(["when", "package", "kind", "model", "risk", "cost", "summary"], reviews.recent, {
+      href: (c) => `#/candidates/${c.id}`,
+      cells: (c) => [`<span class="muted">${ago(c.review.llm.reviewed_at)}</span>`, esc(c.pkgbase), esc(c.kind), `<span class="muted">${esc(c.review.llm.served_by || c.review.llm.model)}</span>`, c.review.llm.verdict ? pill(c.review.llm.verdict.risk) : `<span class="pill">${esc(c.review.llm.refused ? "refused" : "error")}</span>`, `$${(c.review.llm.cost_usd || 0).toFixed(4)}`, `<span class="ellipsis">${esc(c.review.llm.verdict?.summary || c.review.llm.error || c.review.llm.refused || "")}</span>`],
+      empty: "no reviews yet: nothing structural has reached the model",
+    })}
     <h2>Package cache</h2>
     <div class="cards">
       <div class="card"><div class="label">state</div><div class="big">${cache.enabled ? "on" : "off"}</div><div class="muted mono">${esc(cache.url)}</div></div>

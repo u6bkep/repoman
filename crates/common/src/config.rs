@@ -32,6 +32,9 @@ pub struct CoordinatorConfig {
     pub aur_rpc_url: String,
     #[serde(default = "default_aur_git")]
     pub aur_git_url: String,
+    /// The AUR website, for package comments shown to the reviewer.
+    #[serde(default = "default_aur_web")]
+    pub aur_web_url: String,
     /// Target architecture for builds.
     #[serde(default = "default_arch")]
     pub arch: String,
@@ -113,6 +116,10 @@ fn default_aur_requests_url() -> Option<String> {
 
 fn default_aur_requests_poll_secs() -> u64 {
     1800
+}
+
+fn default_aur_web() -> String {
+    "https://aur.archlinux.org".into()
 }
 
 fn default_adoption_quarantine_days() -> u64 {
@@ -225,6 +232,7 @@ impl Default for CoordinatorConfig {
             streams: Vec::new(),
             aur_rpc_url: default_aur_rpc(),
             aur_git_url: default_aur_git(),
+            aur_web_url: default_aur_web(),
             arch: default_arch(),
             image_packages: default_image_packages(),
             image_max_age_secs: default_image_max_age(),

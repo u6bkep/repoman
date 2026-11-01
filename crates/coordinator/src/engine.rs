@@ -890,6 +890,54 @@ async fn review_change(
         return Ok((Some(floor), None));
     };
     let version_from = review["version_from"].as_str().map(str::to_string);
+    // Context beyond the diff: what we already know, and what AUR users said.
+    let now = clock::now();
+    let signal_lines: Vec<String> = app
+        .store
+        .signals_of(&p.pkgbase)?
+        .iter()
+        .filter(|s| s.is_active(&now))
+        .map(|s| {
+            let what = match s.source.as_str() {
+                "aur-requests" => format!(
+                    "{} request #{}{} by {}: {}",
+                    s.payload["request"].as_str().unwrap_or("?"),
+                    s.payload["prq"],
+                    s.payload["outcome"].as_str().map(|o| format!(" {o}")).unwrap_or_default(),
+                    s.payload["who"].as_str().unwrap_or("?"),
+                    s.payload["body"].as_str().unwrap_or("").lines().skip(2).collect::<Vec<_>>().join(" ")
+                ),
+                "aur-security" => format!("{}: {}", s.payload["verdict"].as_str().unwrap_or("?"), s.payload["explanation"].as_str().unwrap_or("")),
+                _ => s.payload.to_string(),
+            };
+            format!("{} [{}]{} {}", s.source, s.severity, s.aur_commit.as_deref().map(|c| format!(" commit {}", &c[..c.len().min(10)])).unwrap_or_default(), what)
+        })
+        .collect();
+    let comments: Vec<crate::aurweb::Comment> = if p.source_url.is_some() {
+        Vec::new()
+    } else {
+        progress(app, run_id, serde_json::json!({"phase": "candidates", "detail": format!("reading AUR comments on {}", p.pkgbase)}));
+        match app.aurweb.comments(&p.pkgbase).await {
+            Ok(all) => {
+                let since = baseline.map(|b| b.published_at.clone());
+                let mut keep: Vec<_> = all
+                    .into_iter()
+                    .filter(|c| c.pinned || since.as_deref().is_none_or(|s| c.sort_key().as_str() > &s[..s.len().min(16)]))
+                    .collect();
+                if since.is_none() {
+                    keep.truncate(10);
+                }
+                keep.sort_by_key(|c| (!c.pinned, c.sort_key()));
+                review["comments"] = serde_json::json!({"shown": keep.len(), "url": app.aurweb.page_url(&p.pkgbase)});
+                keep
+            }
+            Err(e) => {
+                tracing::warn!(pkgbase = %p.pkgbase, error = %format!("{e:#}"), "AUR comments unavailable");
+                review["comments"] = serde_json::json!({"error": format!("{e:#}")});
+                Vec::new()
+            }
+        }
+    };
     progress(app, run_id, serde_json::json!({"phase": "candidates", "detail": format!("LLM review of {} ({model})", p.pkgbase)}));
     let outcome = app
         .reviewer
@@ -910,6 +958,8 @@ async fn review_change(
                 new_scripts: &a.new_scripts,
                 commits,
                 gate: &a.verdict,
+                signals: &signal_lines,
+                comments: &comments,
             },
         )
         .await;

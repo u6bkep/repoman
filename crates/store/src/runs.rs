@@ -260,6 +260,28 @@ impl Store {
         })
     }
 
+    /// Candidates that carry an LLM review, newest review first.
+    pub fn reviewed_candidates(&self, limit: usize) -> Result<Vec<CandidateRow>> {
+        self.with(|c| {
+            let mut st = c.prepare(&format!(
+                "SELECT {CAND_COLS} FROM candidate WHERE json_type(review, '$.llm') = 'object'
+                 ORDER BY json_extract(review, '$.llm.reviewed_at') DESC LIMIT ?1"
+            ))?;
+            Ok(st.query_map(params![limit as i64], row_to_candidate)?.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+    }
+
+    /// (reviews, total cost in USD) over every candidate ever reviewed.
+    pub fn review_totals(&self) -> Result<(u64, f64)> {
+        self.with(|c| {
+            Ok(c.query_row(
+                "SELECT COUNT(*), COALESCE(SUM(json_extract(review, '$.llm.cost_usd')), 0.0) FROM candidate WHERE json_type(review, '$.llm') = 'object'",
+                [],
+                |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, f64>(1)?)),
+            )?)
+        })
+    }
+
     pub fn candidates_for_run(&self, run_id: &str) -> Result<Vec<CandidateRow>> {
         self.with(|c| {
             let mut st = c.prepare(&format!(

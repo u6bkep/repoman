@@ -42,6 +42,9 @@ adoption_quarantine_days = 30
 aur_requests_url = "https://lists.archlinux.org/archives/list/aur-requests@lists.archlinux.org/feed/"
 aur_requests_poll_secs = 1800
 
+# The AUR website, read once per LLM review for the package's comments.
+aur_web_url = "https://aur.archlinux.org"
+
 # Pull-through cache for upstream packages at /cache (pacman CacheServer).
 # Build roots use it automatically; clients add a CacheServer line.
 cache_enabled = true

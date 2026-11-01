@@ -167,6 +167,25 @@ struct StubState {
     meta: Arc<Mutex<HashMap<String, AurMeta>>>,
     /// Body of the fake aur-requests RSS feed.
     feed: Arc<Mutex<String>>,
+    /// Comments on the fake AUR package pages, by pkgbase: (author, date, text).
+    comments: Arc<Mutex<HashMap<String, Vec<(String, String, String)>>>>,
+}
+
+async fn package_page(State(st): State<StubState>, AxPath(pkgbase): AxPath<String>) -> axum::response::Html<String> {
+    let comments = st.comments.lock().unwrap();
+    let items = comments.get(&pkgbase).cloned().unwrap_or_default();
+    let body: String = items
+        .iter()
+        .enumerate()
+        .map(|(i, (who, date, text))| {
+            format!(
+                "<h4 id=\"comment-{i}\" class=\"comment-header\">{who} commented on <a href=\"#comment-{i}\" class=\"date\">{date} (UTC)</a></h4>\n<div id=\"comment-{i}-content\" class=\"article-content\"><div><p>{text}</p></div></div>\n"
+            )
+        })
+        .collect();
+    axum::response::Html(format!(
+        "<html><body><div class=\"comments package-comments\"><h3><span class=\"text\">Latest Comments</span></h3>{body}</div></body></html>"
+    ))
 }
 
 async fn requests_feed(State(st): State<StubState>) -> axum::response::Response {
@@ -263,6 +282,7 @@ async fn start_stub(st: StubState) -> String {
         .route("/mirror/{repo}/{arch}/{file}", get(mirror_db))
         .route("/api/v1/checks/lookup", axum::routing::post(aursec_lookup))
         .route("/feed/", get(requests_feed))
+        .route("/pkgbase/{pkgbase}", get(package_page))
         .with_state(st);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -406,6 +426,7 @@ struct Harness {
     dangerous: Arc<Mutex<Vec<String>>>,
     meta: Arc<Mutex<HashMap<String, AurMeta>>>,
     feed: Arc<Mutex<String>>,
+    comments: Arc<Mutex<HashMap<String, Vec<(String, String, String)>>>>,
     core_db: Arc<Mutex<(Vec<u8>, String)>>,
     specs: Arc<Mutex<Vec<JobSpec>>>,
     aur: FakeAur,
@@ -445,6 +466,7 @@ async fn start_with(tweak: impl FnOnce(&mut CoordinatorConfig)) -> Harness {
     let dangerous: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let meta: Arc<Mutex<HashMap<String, AurMeta>>> = Arc::new(Mutex::new(HashMap::new()));
     let feed = Arc::new(Mutex::new(feed_xml(&[])));
+    let comments = Arc::new(Mutex::new(HashMap::new()));
     let stub = start_stub(StubState {
         stamps: aur.stamps.clone(),
         versions: versions.clone(),
@@ -454,6 +476,7 @@ async fn start_with(tweak: impl FnOnce(&mut CoordinatorConfig)) -> Harness {
         dangerous: dangerous.clone(),
         meta: meta.clone(),
         feed: feed.clone(),
+        comments: comments.clone(),
     })
     .await;
 
@@ -482,6 +505,7 @@ async fn start_with(tweak: impl FnOnce(&mut CoordinatorConfig)) -> Harness {
         forge_checks: false,
         aur_security_url: Some(stub.clone()),
         aur_requests_url: Some(format!("{stub}/feed/")),
+        aur_web_url: stub.clone(),
         ..Default::default()
     };
     let mut config = config;
@@ -513,6 +537,7 @@ async fn start_with(tweak: impl FnOnce(&mut CoordinatorConfig)) -> Harness {
         dangerous,
         meta,
         feed,
+        comments,
         core_db,
         specs,
         aur,
@@ -873,7 +898,16 @@ async fn structural_update_is_sent_to_the_reviewer() {
     assert_eq!(h.run().await["state"], "done");
 
     // A structural change goes to the model; its verdict lands on the
-    // candidate and the operator sees it in the queue.
+    // candidate and the operator sees it in the queue. The model also sees
+    // comments posted since the baseline and what the service knows.
+    h.comments.lock().unwrap().insert(
+        "foo".into(),
+        vec![
+            ("bob".into(), "2099-01-01 10:00".into(), "1.1 phones home, see strace &amp; be careful".into()),
+            ("old".into(), "2000-01-01 10:00".into(), "ancient build note".into()),
+        ],
+    );
+    *h.feed.lock().unwrap() = feed_xml(&[feed_item(100, "Deletion", "foo", None, "mallory", "Upstream is dead.")]);
     h.publish_pkg("foo", "1.1", &["glibc", "libnotinrepos"], &[]);
     let r2 = h.run().await;
     assert_eq!(r2["state"], "needs_input", "{r2}");
@@ -895,6 +929,16 @@ async fn structural_update_is_sent_to_the_reviewer() {
     assert!(prompt.contains("libnotinrepos"), "prompt shows the diff");
     assert!(prompt.contains("new_aur_dependency"), "prompt shows the gate reasons");
     assert!(prompt.contains("version: 1.0-1 -> 1.1-1"), "{prompt}");
+    assert!(prompt.contains("--- bob on 2099-01-01 10:00\n1.1 phones home, see strace & be careful"), "{prompt}");
+    assert!(!prompt.contains("ancient build note"), "comments older than the baseline are left out: {prompt}");
+    assert!(prompt.contains("aur-requests [medium] deletion request #100 by mallory"), "{prompt}");
+    assert_eq!(c["review"]["comments"]["shown"], 1, "{}", c["review"]["comments"]);
+    let full = h.get(&format!("/api/candidates/{}", c["id"].as_str().unwrap())).await;
+    assert_eq!(full["review"]["llm"]["prompt"].as_str().unwrap(), prompt, "the prompt is stored for the UI");
+    let reviews = h.get("/api/reviews").await;
+    assert_eq!(reviews["count"], 1, "{reviews}");
+    assert!(reviews["recent"][0]["review"]["llm"]["prompt"].is_null(), "list omits the prompt");
+    assert!(reviews["cost_usd"].as_f64().unwrap() > 0.0);
 }
 
 #[tokio::test]

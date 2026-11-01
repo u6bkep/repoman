@@ -40,6 +40,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/candidates/{id}/decide", post(decide_candidate))
         .route("/api/candidates/{id}/diff", get(candidate_diff))
         .route("/api/events", get(list_events))
+        .route("/api/reviews", get(list_reviews))
         .route("/api/signals", get(list_signals))
         .route("/api/signals/{id}/clear", post(clear_signal))
         .route("/api/cache", get(cache_view))
@@ -287,6 +288,29 @@ fn package_view(st: &AppState, row: PackageRow) -> Result<PackageView, ApiError>
         signals: st.store.signals_of(&row.pkgbase).map_err(internal)?,
         row,
     })
+}
+
+// ---- reviews ----------------------------------------------------------------
+
+#[derive(Serialize)]
+pub struct ReviewsView {
+    pub count: u64,
+    pub cost_usd: f64,
+    /// Newest first; each row's `review.llm` holds the verdict.
+    pub recent: Vec<CandidateRow>,
+}
+
+/// `GET /api/reviews`: every LLM review spent so far and the latest ones.
+async fn list_reviews(State(st): State<AppState>) -> Result<axum::Json<ReviewsView>, ApiError> {
+    let (count, cost_usd) = st.store.review_totals().map_err(internal)?;
+    let mut recent = st.store.reviewed_candidates(25).map_err(internal)?;
+    // The stored prompt is for the candidate page; the list stays light.
+    for c in &mut recent {
+        if let Some(l) = c.review.get_mut("llm").and_then(|l| l.as_object_mut()) {
+            l.remove("prompt");
+        }
+    }
+    Ok(axum::Json(ReviewsView { count, cost_usd, recent }))
 }
 
 // ---- signals ----------------------------------------------------------------

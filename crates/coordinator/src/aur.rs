@@ -1,5 +1,5 @@
 //! AUR access: the RPC for metadata and bare git mirrors for content. The
-//! website itself sits behind bot protection, so nothing here scrapes HTML.
+//! website is read only for comments, in `aurweb`.
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -350,7 +350,7 @@ pub fn split_source_fragment(url: &str) -> Result<(String, Option<String>)> {
     Ok((base.to_string(), Some(branch.to_string())))
 }
 
-fn validate_pkgbase(s: &str) -> Result<()> {
+pub fn validate_pkgbase(s: &str) -> Result<()> {
     let ok = !s.is_empty()
         && s.len() <= 255
         && !s.starts_with('-')
