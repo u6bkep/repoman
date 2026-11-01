@@ -26,6 +26,7 @@ pub async fn pump<R: AsyncRead + Unpin>(reader: R, fd: Fd, tx: mpsc::UnboundedSe
                         ts: clock::now(),
                         fd,
                         line,
+                        seq: 0,
                     })
                     .is_err()
                 {
@@ -38,6 +39,7 @@ pub async fn pump<R: AsyncRead + Unpin>(reader: R, fd: Fd, tx: mpsc::UnboundedSe
                     ts: clock::now(),
                     fd: Fd::System,
                     line: format!("log read error on {}: {e}", fd.as_str()),
+                    seq: 0,
                 });
                 return;
             }

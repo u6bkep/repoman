@@ -11,7 +11,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use repoman_common::proto::{JobKind, LogLine};
 use repoman_store::{BaselineRow, CandidateRow, JobRow, MembershipRow, PackageRow, SnapshotRow, StageRow, WorkerRow, signals::SignalRow};
-use repoman_store::artifacts::ArtifactPublication;
+use repoman_store::artifacts::{ArtifactPublication, LiveVersion};
 use serde::{Deserialize, Serialize};
 use tower_http::services::ServeDir;
 
@@ -41,6 +41,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/candidates/{id}/diff", get(candidate_diff))
         .route("/api/events", get(list_events))
         .route("/api/reviews", get(list_reviews))
+        .route("/api/config", get(config_view))
         .route("/api/signals", get(list_signals))
         .route("/api/signals/{id}/clear", post(clear_signal))
         .route("/api/cache", get(cache_view))
@@ -92,6 +93,37 @@ async fn health(State(st): State<AppState>) -> impl IntoResponse {
         ok: true,
         version: repoman_common::VERSION,
         run_active: st.engine.is_running(),
+    })
+}
+
+/// The policy knobs the UI needs to explain what will happen on its own.
+#[derive(Serialize)]
+struct ConfigView {
+    quarantine_days: u64,
+    adoption_quarantine_days: u64,
+    auto_approve: bool,
+    auto_approve_metadata: bool,
+    reviewer_enabled: bool,
+    reviewer_model: String,
+    reviewer_routine_model: Option<String>,
+    streams: Vec<String>,
+    image_max_age_secs: u64,
+    cache_enabled: bool,
+}
+
+async fn config_view(State(st): State<AppState>) -> axum::Json<ConfigView> {
+    let c = &st.config;
+    axum::Json(ConfigView {
+        quarantine_days: c.quarantine_days,
+        adoption_quarantine_days: c.adoption_quarantine_days,
+        auto_approve: c.auto_approve,
+        auto_approve_metadata: c.auto_approve_metadata,
+        reviewer_enabled: c.reviewer.enabled,
+        reviewer_model: c.reviewer.model.clone(),
+        reviewer_routine_model: c.reviewer.routine_model.clone(),
+        streams: c.streams_sorted().into_iter().map(|s| s.name.clone()).collect(),
+        image_max_age_secs: c.image_max_age_secs,
+        cache_enabled: c.cache_enabled,
     })
 }
 
@@ -148,10 +180,13 @@ async fn list_jobs(State(st): State<AppState>, Query(q): Query<ListJobsQuery>) -
 struct EventsQuery {
     #[serde(default = "default_limit")]
     limit: u32,
+    /// A package, run or candidate id.
+    #[serde(default)]
+    subject: Option<String>,
 }
 
 async fn list_events(State(st): State<AppState>, Query(q): Query<EventsQuery>) -> Result<axum::Json<Vec<repoman_store::EventRow>>, ApiError> {
-    Ok(axum::Json(st.store.recent_events(q.limit.min(1000)).map_err(internal)?))
+    Ok(axum::Json(st.store.events_for(q.subject.as_deref(), q.limit.min(1000)).map_err(internal)?))
 }
 
 async fn cache_view(State(st): State<AppState>) -> Result<axum::Json<crate::cache::CacheView>, ApiError> {
@@ -200,11 +235,18 @@ async fn get_job(State(st): State<AppState>, Path(id): Path<String>) -> Result<a
     Ok(axum::Json(JobView { row, stages }))
 }
 
-async fn get_job_log(State(st): State<AppState>, Path(id): Path<String>) -> Result<axum::Json<Vec<LogLine>>, ApiError> {
+#[derive(Deserialize)]
+struct LogQuery {
+    /// Only lines after this seq, for a reader that follows a live log.
+    #[serde(default)]
+    after: Option<i64>,
+}
+
+async fn get_job_log(State(st): State<AppState>, Path(id): Path<String>, Query(q): Query<LogQuery>) -> Result<axum::Json<Vec<LogLine>>, ApiError> {
     if st.store.get_job(&id).map_err(internal)?.is_none() {
         return Err(not_found("no such job"));
     }
-    Ok(axum::Json(st.store.job_log(&id).map_err(internal)?))
+    Ok(axum::Json(st.store.job_log_after(&id, q.after.unwrap_or(-1)).map_err(internal)?))
 }
 
 async fn worker_ws(ws: WebSocketUpgrade, State(st): State<AppState>) -> impl IntoResponse {
@@ -277,15 +319,23 @@ pub struct PackageView {
     /// Every signal ever recorded about the package, newest first, with
     /// cleared and expired ones included so the history reads whole.
     pub signals: Vec<SignalRow>,
+    /// What each repo serves right now.
+    pub live: Vec<LiveVersion>,
 }
 
 fn package_view(st: &AppState, row: PackageRow) -> Result<PackageView, ApiError> {
+    let live = st.store.live_versions_all().map_err(internal)?.into_iter().filter(|v| v.pkgbase == row.pkgbase).collect();
+    package_view_with(st, row, live)
+}
+
+fn package_view_with(st: &AppState, row: PackageRow, live: Vec<LiveVersion>) -> Result<PackageView, ApiError> {
     Ok(PackageView {
         streams: st.store.memberships(&row.pkgbase).map_err(internal)?,
         baseline: st.store.get_baseline(&row.pkgbase).map_err(internal)?,
         snapshot: st.store.get_snapshot(&row.pkgbase).map_err(internal)?,
         open_candidates: st.store.open_candidates(&row.pkgbase).map_err(internal)?,
         signals: st.store.signals_of(&row.pkgbase).map_err(internal)?,
+        live,
         row,
     })
 }
@@ -349,7 +399,17 @@ async fn clear_signal(State(st): State<AppState>, Path(id): Path<String>, axum::
 
 async fn list_packages(State(st): State<AppState>) -> Result<axum::Json<Vec<PackageView>>, ApiError> {
     let rows = st.store.list_packages().map_err(internal)?;
-    rows.into_iter().map(|r| package_view(&st, r)).collect::<Result<Vec<_>, _>>().map(axum::Json)
+    let mut live: std::collections::HashMap<String, Vec<LiveVersion>> = std::collections::HashMap::new();
+    for v in st.store.live_versions_all().map_err(internal)? {
+        live.entry(v.pkgbase.clone()).or_default().push(v);
+    }
+    rows.into_iter()
+        .map(|r| {
+            let l = live.remove(&r.pkgbase).unwrap_or_default();
+            package_view_with(&st, r, l)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(axum::Json)
 }
 
 #[derive(Deserialize)]
@@ -479,20 +539,22 @@ pub struct RunView {
     #[serde(flatten)]
     pub row: repoman_store::RunRow,
     pub candidates: Vec<CandidateRow>,
-    pub jobs: Vec<JobRow>,
+    pub jobs: Vec<JobRow>,    pub events: Vec<repoman_store::EventRow>,
 }
 
 async fn get_run(State(st): State<AppState>, Path(id): Path<String>) -> Result<axum::Json<RunView>, ApiError> {
     let row = st.store.get_run(&id).map_err(internal)?.ok_or(not_found("no such run"))?;
     let candidates = st.store.candidates_for_run(&id).map_err(internal)?;
-    let jobs = st
-        .store
-        .list_jobs(1000)
-        .map_err(internal)?
-        .into_iter()
-        .filter(|j| candidates.iter().any(|c| Some(&c.id) == j.candidate_id.as_ref()))
-        .collect();
-    Ok(axum::Json(RunView { row, candidates, jobs }))
+    // Jobs the run queued, plus (for runs before run_id existed) the
+    // builds its candidates own.
+    let mut jobs = st.store.jobs_for_run(&id).map_err(internal)?;
+    for j in st.store.list_jobs(1000).map_err(internal)? {
+        if j.run_id.is_none() && candidates.iter().any(|c| Some(&c.id) == j.candidate_id.as_ref()) && !jobs.iter().any(|x| x.id == j.id) {
+            jobs.push(j);
+        }
+    }
+    let events = st.store.events_for(Some(&id), 200).map_err(internal)?;
+    Ok(axum::Json(RunView { row, candidates, jobs, events }))
 }
 
 #[derive(Deserialize)]
@@ -684,7 +746,7 @@ async fn decide_candidate(State(st): State<AppState>, Path(id): Path<String>, ax
         .decide_candidate(&id, state, d.by.as_deref().unwrap_or("cli"), d.note.as_deref())
         .map_err(internal)?;
     st.store
-        .event("candidate.decided", Some(&id), serde_json::json!({"pkgbase": c.pkgbase, "state": state}))
+        .event("candidate.decided", Some(&c.pkgbase), serde_json::json!({"id": id, "state": state, "by": d.by.as_deref().unwrap_or("operator"), "note": d.note}))
         .map_err(internal)?;
     Ok(axum::Json(st.store.get_candidate(&id).map_err(internal)?.unwrap()))
 }

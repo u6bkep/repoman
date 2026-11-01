@@ -208,6 +208,14 @@ pub struct LogLine {
     pub ts: String,
     pub fd: Fd,
     pub line: String,
+    /// Position in the stored log, so a reader can ask for what follows.
+    /// Zero on the wire from the worker; the store assigns it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub seq: i64,
+}
+
+fn is_zero(v: &i64) -> bool {
+    *v == 0
 }
 
 /// Resource peaks measured by the worker's cgroup and scratch accounting.

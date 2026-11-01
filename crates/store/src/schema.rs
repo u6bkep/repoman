@@ -216,6 +216,10 @@ pub const MIGRATIONS: &[&str] = &[
      ALTER TABLE signal ADD COLUMN expires_at TEXT;
      ALTER TABLE signal ADD COLUMN cleared_at TEXT;
      ALTER TABLE signal ADD COLUMN cleared_by TEXT;",
+    // 9: which run queued a job, so a run page can list its probes and
+    // image builds, not only the builds its candidates own
+    "ALTER TABLE job ADD COLUMN run_id TEXT;
+     CREATE INDEX job_run_idx ON job(run_id) WHERE run_id IS NOT NULL;",
 ];
 
 pub fn migrate(conn: &Connection) -> Result<()> {

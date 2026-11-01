@@ -91,6 +91,7 @@ impl JobCtx {
                 ts: clock::now(),
                 fd,
                 line: line.into(),
+                seq: 0,
             }],
         });
     }

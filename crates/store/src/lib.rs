@@ -60,6 +60,7 @@ pub struct JobRow {
     pub attempts: u32,
     pub candidate_id: Option<String>,
     pub result: Option<repoman_common::proto::JobResult>,
+    pub run_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -92,7 +93,7 @@ pub struct Reconciled {
 
 pub(crate) const JOB_COLS: &str = "id, spec, pkgbase, stream, state, worker, queued_at, assigned_at, \
                         started_at, finished_at, orphaned_at, exit_code, error, \
-                        peak_rss_bytes, peak_scratch_bytes, cpu_seconds, attempts, candidate_id, result";
+                        peak_rss_bytes, peak_scratch_bytes, cpu_seconds, attempts, candidate_id, result, run_id";
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
@@ -127,10 +128,17 @@ impl Store {
 
     /// Newest events first.
     pub fn recent_events(&self, limit: u32) -> Result<Vec<EventRow>> {
+        self.events_for(None, limit)
+    }
+
+    /// Newest first; `subject` narrows to one package, run or candidate.
+    pub fn events_for(&self, subject: Option<&str>, limit: u32) -> Result<Vec<EventRow>> {
         self.with(|c| {
-            let mut st = c.prepare("SELECT seq, ts, kind, subject, payload FROM event ORDER BY seq DESC LIMIT ?1")?;
+            let mut st = c.prepare(
+                "SELECT seq, ts, kind, subject, payload FROM event WHERE (?1 IS NULL OR subject = ?1) ORDER BY seq DESC LIMIT ?2",
+            )?;
             Ok(st
-                .query_map(params![limit], |r| {
+                .query_map(params![subject, limit], |r| {
                     let payload: Option<String> = r.get(4)?;
                     Ok(EventRow {
                         seq: r.get(0)?,
@@ -220,7 +228,7 @@ impl Store {
         pkgbase: Option<&str>,
         stream: Option<&str>,
     ) -> Result<JobRow> {
-        self.create_job_for(job, pkgbase, stream, None)
+        self.create_job_for(job, pkgbase, stream, None, None)
     }
 
     pub fn create_job_for(
@@ -229,12 +237,13 @@ impl Store {
         pkgbase: Option<&str>,
         stream: Option<&str>,
         candidate_id: Option<&str>,
+        run_id: Option<&str>,
     ) -> Result<JobRow> {
         let id = repoman_common::new_id();
         self.with(|c| {
             c.execute(
-                "INSERT INTO job (id, kind, spec, pkgbase, stream, state, queued_at, candidate_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7)",
+                "INSERT INTO job (id, kind, spec, pkgbase, stream, state, queued_at, candidate_id, run_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, ?8)",
                 params![
                     id,
                     job.name(),
@@ -242,12 +251,21 @@ impl Store {
                     pkgbase,
                     stream,
                     clock::now(),
-                    candidate_id
+                    candidate_id,
+                    run_id
                 ],
             )?;
             Ok(())
         })?;
         self.get_job(&id)?.context("job vanished after insert")
+    }
+
+    /// Every job a run queued, oldest first.
+    pub fn jobs_for_run(&self, run_id: &str) -> Result<Vec<JobRow>> {
+        self.with(|c| {
+            let mut st = c.prepare(&format!("SELECT {JOB_COLS} FROM job WHERE run_id = ?1 ORDER BY queued_at, id"))?;
+            Ok(st.query_map(params![run_id], row_to_job)?.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
     }
 
     pub fn get_job(&self, id: &str) -> Result<Option<JobRow>> {
@@ -568,17 +586,23 @@ impl Store {
     }
 
     pub fn job_log(&self, job: &str) -> Result<Vec<LogLine>> {
+        self.job_log_after(job, -1)
+    }
+
+    /// Log lines with a seq greater than `after` (-1 for everything).
+    pub fn job_log_after(&self, job: &str, after: i64) -> Result<Vec<LogLine>> {
         self.with(|c| {
             let mut st = c.prepare(
-                "SELECT ts, fd, line FROM job_log WHERE job_id = ?1 ORDER BY seq",
+                "SELECT ts, fd, line, seq FROM job_log WHERE job_id = ?1 AND seq > ?2 ORDER BY seq",
             )?;
             Ok(st
-                .query_map(params![job], |r| {
+                .query_map(params![job, after], |r| {
                     let fd: String = r.get(1)?;
                     Ok(LogLine {
                         ts: r.get(0)?,
                         fd: Fd::parse(&fd).unwrap_or(Fd::System),
                         line: r.get(2)?,
+                        seq: r.get(3)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?)
@@ -623,6 +647,7 @@ pub(crate) fn row_to_job(r: &Row) -> rusqlite::Result<JobRow> {
         result: r
             .get::<_, Option<String>>(18)?
             .and_then(|s| serde_json::from_str(&s).ok()),
+        run_id: r.get(19)?,
     })
 }
 
@@ -655,6 +680,7 @@ mod tests {
                 ts: "2026-01-01T00:00:00.500Z".into(),
                 fd: Fd::Stdout,
                 line: "hi".into(),
+                seq: 0,
             }],
         )
         .unwrap();
@@ -664,6 +690,7 @@ mod tests {
                 ts: "2026-01-01T00:00:00.600Z".into(),
                 fd: Fd::Stderr,
                 line: "warn".into(),
+                seq: 0,
             }],
         )
         .unwrap();

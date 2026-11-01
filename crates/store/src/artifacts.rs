@@ -42,6 +42,15 @@ pub struct PublicationRow {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct LiveVersion {
+    pub pkgbase: String,
+    pub repo: String,
+    pub pkgname: String,
+    pub pkgver: String,
+    pub published_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ArtifactPublication {
     pub artifact: ArtifactRow,
     pub repo: String,
@@ -238,6 +247,23 @@ impl Store {
             ))?;
             Ok(st
                 .query_map(params![repo], row_to_artifact)?
+                .collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+    }
+
+    /// What each repo serves right now, for every pkgbase: (pkgbase, repo,
+    /// pkgver, published_at), one row per live pkgname.
+    pub fn live_versions_all(&self) -> Result<Vec<LiveVersion>> {
+        self.with(|c| {
+            let mut st = c.prepare(
+                "SELECT a.pkgbase, p.repo, a.pkgname, a.pkgver, p.published_at
+                 FROM artifact a JOIN publication p ON p.artifact_sha = a.sha256
+                 WHERE p.retired_at IS NULL ORDER BY a.pkgbase, p.repo, a.pkgname",
+            )?;
+            Ok(st
+                .query_map([], |r| {
+                    Ok(LiveVersion { pkgbase: r.get(0)?, repo: r.get(1)?, pkgname: r.get(2)?, pkgver: r.get(3)?, published_at: r.get(4)? })
+                })?
                 .collect::<rusqlite::Result<Vec<_>>>()?)
         })
     }

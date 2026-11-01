@@ -99,3 +99,22 @@ dl.kv dd { margin: 0; }
 .card .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; }
 details > summary { cursor: pointer; color: var(--muted); }
 .ellipsis { max-width: 520px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.small { font-size: 12px; }
+.wrap { white-space: normal; word-break: break-word; }
+.nowrap { white-space: nowrap; }
+.high { color: var(--high); }
+.medium { color: var(--medium); }
+.log .net { color: var(--medium); }
+.pill.info { color: var(--muted); }
+.panel.callout { border-left: 3px solid var(--medium); }
+.panel.callout.low { border-left-color: var(--low); }
+.timeline { margin: 8px 0; color: var(--fg); }
+.timeline .step { display: inline-block; padding: 2px 8px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); font-size: 12px; }
+.timeline .step.live { border-color: var(--accent); }
+table.compact th, table.compact td { padding: 4px 8px; }
+dl.kv dd details { display: inline; }
+dl.kv dd details[open] { display: block; }
+td details > div, dd details > div { margin-top: 4px; max-height: 240px; overflow: auto; }
+.diff .add, .diff .del { display: block; }
+.wrap .add { background: var(--add); padding: 0 3px; border-radius: 3px; }
+.wrap .del { background: var(--del); padding: 0 3px; border-radius: 3px; }

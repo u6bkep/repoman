@@ -86,7 +86,7 @@ pub fn packaging_files(si: &Srcinfo, files: &[String]) -> Vec<String> {
 
 /// Regenerate the SRCINFO at `head` in a sandbox and compare it with the
 /// committed one. `None` when no inspection could run.
-async fn srcinfo_matches(app: &AppState, pkgbase: &str, head: &str, committed: &Srcinfo, images: &HashMap<String, ImageRef>) -> Option<bool> {
+async fn srcinfo_matches(app: &AppState, run_id: &str, pkgbase: &str, head: &str, committed: &Srcinfo, images: &HashMap<String, ImageRef>) -> Option<bool> {
     let image = app
         .config
         .streams_sorted()
@@ -94,7 +94,7 @@ async fn srcinfo_matches(app: &AppState, pkgbase: &str, head: &str, committed: &
         .find_map(|s| images.get(&s.name).cloned())?;
     let job = app
         .store
-        .create_job(
+        .create_job_for(
             &JobKind::Inspect {
                 pkgbase: pkgbase.to_string(),
                 aur_commit: head.to_string(),
@@ -103,6 +103,8 @@ async fn srcinfo_matches(app: &AppState, pkgbase: &str, head: &str, committed: &
             },
             Some(pkgbase),
             None,
+            None,
+            Some(run_id),
         )
         .ok()?;
     app.hub.notify();
@@ -144,6 +146,7 @@ pub struct Assessment {
 /// `head_si` is the committed SRCINFO at `head`.
 pub async fn assess(
     app: &AppState,
+    run_id: &str,
     pkgbase: &str,
     baseline: Option<&BaselineRow>,
     head: &str,
@@ -192,7 +195,7 @@ pub async fn assess(
     // maintainer's change.
     let adopted_from_orphan = app.store.active_signal(pkgbase, "aur", "adopted")?.is_some();
     let srcinfo_mismatch = match baseline {
-        Some(_) => srcinfo_matches(app, pkgbase, head, head_si, images).await.map(|ok| !ok),
+        Some(_) => srcinfo_matches(app, run_id, pkgbase, head, head_si, images).await.map(|ok| !ok),
         None => None,
     };
     let streams = &app.streams;

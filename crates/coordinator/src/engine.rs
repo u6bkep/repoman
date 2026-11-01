@@ -136,7 +136,7 @@ async fn execute(app: &AppState, run_id: &str) -> Result<RunEnd> {
         let mut images: HashMap<String, ImageRef> = HashMap::new();
         for s in app.config.streams_sorted() {
             progress(app, run_id, serde_json::json!({"phase": "images", "detail": format!("checking base image for {}", s.name)}));
-            images.insert(s.name.clone(), ensure_image(app, s).await?);
+            images.insert(s.name.clone(), ensure_image(app, run_id, s).await?);
         }
 
         step(app, run_id, "poll").await?;
@@ -217,7 +217,7 @@ async fn execute(app: &AppState, run_id: &str) -> Result<RunEnd> {
 
 // ---- images -------------------------------------------------------------
 
-async fn ensure_image(app: &AppState, stream: &StreamConfig) -> Result<ImageRef> {
+async fn ensure_image(app: &AppState, run_id: &str, stream: &StreamConfig) -> Result<ImageRef> {
     let idx = app
         .streams
         .get(&stream.name)
@@ -231,7 +231,7 @@ async fn ensure_image(app: &AppState, stream: &StreamConfig) -> Result<ImageRef>
         }
     }
     tracing::info!(stream = %stream.name, "building base image");
-    let job = app.store.create_job(
+    let job = app.store.create_job_for(
         &JobKind::Image {
             stream: stream.name.clone(),
             pacman_conf: app.streams.pacman_conf(stream, &[], &app.cache.servers()).render(),
@@ -242,6 +242,8 @@ async fn ensure_image(app: &AppState, stream: &StreamConfig) -> Result<ImageRef>
         },
         None,
         Some(&stream.name),
+        None,
+        Some(run_id),
     )?;
     app.hub.notify();
     let row = wait_job(app, &job.id).await?;
@@ -759,13 +761,15 @@ async fn run_probes(app: &AppState, run_id: &str, probes: Vec<(PackageRow, Strin
             }
         };
         let sources: Vec<String> = si.base.values("source").into_iter().map(str::to_string).collect();
-        let job = app.store.create_job(
+        let job = app.store.create_job_for(
             &JobKind::Probe {
                 pkgbase: p.pkgbase.clone(),
                 sources,
             },
             Some(&p.pkgbase),
             None,
+            None,
+            Some(run_id),
         )?;
         probe_jobs.push((p.clone(), head.clone(), job.id));
     }
@@ -917,7 +921,7 @@ async fn review_change(
     review: &mut serde_json::Value,
 ) -> Result<(Option<String>, Option<String>)> {
     progress(app, run_id, serde_json::json!({"phase": "candidates", "detail": format!("assessing {}", p.pkgbase)}));
-    let a = match crate::gate::assess(app, &p.pkgbase, baseline, head, si, images, p.source_url.is_some(), history_rewritten).await {
+    let a = match crate::gate::assess(app, run_id, &p.pkgbase, baseline, head, si, images, p.source_url.is_some(), history_rewritten).await {
         Ok(a) => a,
         Err(e) => {
             review["gate_error"] = serde_json::Value::String(e.to_string());
@@ -1795,6 +1799,7 @@ async fn submit_build(app: &AppState, run_id: &str, item: &BuildItem, images: &H
         Some(&item.pkgbase),
         Some(&item.stream),
         item.candidate_id.as_deref(),
+        Some(run_id),
     )?;
     app.hub.notify();
     Ok(job.id)
