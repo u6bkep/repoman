@@ -35,6 +35,7 @@ const ALLOWED_WRITE_PREFIXES: &[&str] = &[
     "root/.gnupg/",
     "root/.cache/",
     "etc/resolv.conf",
+    "etc/hosts",
     "etc/pacman.conf",
     "etc/makepkg.conf.d/",
     "etc/ld.so.cache",

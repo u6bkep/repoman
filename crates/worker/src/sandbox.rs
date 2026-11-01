@@ -94,6 +94,9 @@ if [ "${REPOMAN_NET:-0}" = 1 ]; then
 else
   ip link set lo up 2>/dev/null || true
   : > "$ROOT/etc/resolv.conf"
+  # Resolving the sandbox's own hostname must not look like a network
+  # attempt: several build tools do it once (A and AAAA).
+  printf '127.0.0.1 localhost\n::1 localhost\n127.0.1.1 %s\n' "${REPOMAN_HOSTNAME:-repoman}" > "$ROOT/etc/hosts"
   # Count attempts: a sink interface takes the default route, nftables
   # counts and rejects what reaches it (reject, not drop, so connect()
   # fails at once instead of waiting out TCP retries), and a fake
