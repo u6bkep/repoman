@@ -99,7 +99,7 @@ else
   # fails at once instead of waiting out TCP retries), and a fake
   # nameserver gives DNS lookups somewhere to go.
   if [ -n "${REPOMAN_NETLOG:-}" ] && command -v nft >/dev/null 2>&1 && ip link add repoman0 type dummy 2>/dev/null; then
-    ip addr add 10.255.255.1/32 dev repoman0 && ip link set repoman0 up       && ip route add default dev repoman0       && { ip -6 route add default dev repoman0 2>/dev/null || true; }       && printf 'table inet repoman {\n counter attempts {}\n chain out { type filter hook output priority 0; policy accept; oifname "repoman0" counter name "attempts" reject }\n}\n' | nft -f -       && printf 'nameserver 10.255.255.254\noptions timeout:1 attempts:1\n' > "$ROOT/etc/resolv.conf"       && NETCOUNT=1
+    ip addr add 10.255.255.1/32 dev repoman0 && ip link set repoman0 up       && ip route add default dev repoman0       && { ip -6 route add default dev repoman0 2>/dev/null || true; }       && printf 'table inet repoman {\n  counter attempts {\n  }\n  chain out {\n    type filter hook output priority 0; policy accept;\n    oifname "repoman0" counter name "attempts" reject\n  }\n}\n' | nft -f -       && printf 'nameserver 10.255.255.254\noptions timeout:1 attempts:1\n' > "$ROOT/etc/resolv.conf"       && NETCOUNT=1
   fi
 fi
 if [ "${REPOMAN_CHROOT:-1}" = 1 ]; then
