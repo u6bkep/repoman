@@ -275,7 +275,12 @@ pub async fn run_build(ctx: &JobCtx, p: BuildParams<'_>) -> Result<JobResult> {
     ctx.set_scratch_peak(scratch);
     // makepkg extracts into BUILDDIR (/build/work/<pkgbase>/src), not next to
     // the PKGBUILD.
-    let upstream_rev = read_vcs_rev(&build_dir.join("work").join(p.pkgbase));
+    let srcinfo_sources: Vec<String> = std::fs::read_to_string(build_dir.join(p.pkgbase).join(".SRCINFO"))
+        .ok()
+        .and_then(|t| repoman_alpm::srcinfo::Srcinfo::parse(&t).ok())
+        .map(|si| si.base.values("source").into_iter().map(str::to_string).collect())
+        .unwrap_or_default();
+    let upstream_rev = read_vcs_rev(&build_dir.join("work").join(p.pkgbase), &srcinfo_sources);
     ctx.stage_done("collect");
 
     Ok(JobResult::Build {
@@ -436,22 +441,55 @@ fn dir_size(path: &Path) -> Result<u64> {
 
 /// For VCS packages makepkg leaves the checkout under `<builddir>/src/`;
 /// record the HEAD of the first git checkout found there.
-fn read_vcs_rev(builddir: &Path) -> Option<String> {
+/// The directory makepkg checks a git source out to under `src/`: the
+/// `name::` prefix if given, else the URL's last path component without
+/// `.git`.
+pub fn vcs_checkout_dir(source: &str) -> Option<String> {
+    let vcs = crate::probe::VcsSource::parse(source)?;
+    if let Some((name, _)) = source.split_once("::") {
+        return Some(name.to_string());
+    }
+    let url = vcs.url.trim_end_matches('/');
+    let base = url.rsplit('/').next().unwrap_or(url);
+    Some(base.strip_suffix(".git").unwrap_or(base).to_string())
+}
+
+fn git_head(dir: &Path) -> Option<String> {
+    // The checkout belongs to the build uid; git refuses to read
+    // repositories owned by another user unless told otherwise.
+    let out = std::process::Command::new("git")
+        .args(["-c", "safe.directory=*", "rev-parse", "HEAD"])
+        .current_dir(dir)
+        .output()
+        .ok()?;
+    if out.status.success() {
+        Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        None
+    }
+}
+
+/// The revisions of every git source's checkout, in `source=` order, joined
+/// with `+`: the same shape the probe job reports, so the coordinator can
+/// tell a published VCS build from a stale one by string equality.
+fn read_vcs_rev(builddir: &Path, sources: &[String]) -> Option<String> {
     let src = builddir.join("src");
-    let entries = std::fs::read_dir(src).ok()?;
-    for e in entries.flatten() {
-        let p = e.path();
-        if p.join(".git").exists() {
-            // The checkout belongs to the build uid; git refuses to read
-            // repositories owned by another user unless told otherwise.
-            let out = std::process::Command::new("git")
-                .args(["-c", "safe.directory=*", "rev-parse", "HEAD"])
-                .current_dir(&p)
-                .output()
-                .ok()?;
-            if out.status.success() {
-                return Some(String::from_utf8_lossy(&out.stdout).trim().to_string());
-            }
+    let mut revs = Vec::new();
+    for s in sources {
+        let Some(dir) = vcs_checkout_dir(s) else {
+            continue;
+        };
+        revs.push(git_head(&src.join(dir))?);
+    }
+    if !revs.is_empty() {
+        return Some(revs.join("+"));
+    }
+    // No SRCINFO to go by: fall back to any checkout present.
+    for e in std::fs::read_dir(src).ok()?.flatten() {
+        if e.path().join(".git").exists()
+            && let Some(h) = git_head(&e.path())
+        {
+            return Some(h);
         }
     }
     None
@@ -459,6 +497,14 @@ fn read_vcs_rev(builddir: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn checkout_dirs_match_makepkg() {
+        assert_eq!(vcs_checkout_dir("git+https://github.com/o/openocd.git").as_deref(), Some("openocd"));
+        assert_eq!(vcs_checkout_dir("jimtcl::git+https://github.com/msteveb/jimtcl#tag=0.83").as_deref(), Some("jimtcl"));
+        assert_eq!(vcs_checkout_dir("git://host/x/repo/").as_deref(), Some("repo"));
+        assert_eq!(vcs_checkout_dir("https://example.org/x-1.0.tar.gz"), None);
+    }
+
     #[test]
     fn netlog_counts_packets() {
         let d = tempfile::tempdir().unwrap();
