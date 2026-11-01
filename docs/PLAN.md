@@ -165,8 +165,7 @@ aur_snapshot   (pkgbase, fetched_at, last_modified, maintainer, submitter,
                 comaintainers JSON, out_of_date, votes, popularity,
                 head_commit)
 run            (id PK, started_at, finished_at, state, summary JSON)
-                -- state: running | needs_input | building | publishing |
-                --        done | aborted
+                -- state: running | done | aborted; kind: check | build | update
 candidate      (id PK, run_id, pkgbase, kind, aur_commit, upstream_rev,
                 first_seen_last_modified, first_seen_at, class, floor_risk,
                 llm_risk, state, decided_at, decided_by, review JSON)

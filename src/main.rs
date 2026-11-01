@@ -87,9 +87,24 @@ enum Cmd {
     Package { pkgbase: String },
     /// Set a package's policy JSON (replaces the whole object).
     Policy { pkgbase: String, policy: String },
-    /// Start or resume an update run.
+    /// Gather information: poll the AUR and git sources, assess changes,
+    /// probe VCS upstreams, resolve dependencies. Builds nothing.
+    Check {
+        /// Block until the check finishes.
+        #[arg(long)]
+        wait: bool,
+    },
+    /// Build and publish approved candidates (all, or the ids given).
+    Build {
+        /// Candidate ids to build; empty means every approved candidate.
+        candidates: Vec<String>,
+        /// Block until the build finishes.
+        #[arg(long)]
+        wait: bool,
+    },
+    /// A check followed by a build of everything it leaves approved.
     Update {
-        /// Block until the run finishes or needs input.
+        /// Block until both finish.
         #[arg(long)]
         wait: bool,
     },
@@ -246,24 +261,12 @@ async fn main() -> Result<()> {
             println!("policy set");
             Ok(())
         }
-        Cmd::Update { wait } => {
-            let v = api.post("/api/runs", &json!({})).await?;
-            let id = s(&v["id"]);
-            if !wait {
-                return api.emit(&v, || println!("run {id}"));
-            }
-            let v = api
-                .poll(
-                    &format!("/api/runs/{id}"),
-                    |v| v["finished_at"].is_string() || s(&v["state"]) == "needs_input",
-                    6 * 3600,
-                )
-                .await?;
-            api.emit(&v, || print_run(&v))
-        }
+        Cmd::Check { wait } => start_op(&api, json!({"kind": "check"}), wait).await,
+        Cmd::Build { candidates, wait } => start_op(&api, json!({"kind": "build", "candidates": candidates}), wait).await,
+        Cmd::Update { wait } => start_op(&api, json!({"kind": "update"}), wait).await,
         Cmd::Runs => {
             let v = api.get("/api/runs").await?;
-            api.table(&v, &["id", "state", "step", "started_at", "finished_at"])
+            api.table(&v, &["id", "kind", "state", "step", "started_at", "finished_at"])
         }
         Cmd::Run { id } => {
             let v = api.get(&format!("/api/runs/{id}")).await?;
@@ -480,6 +483,16 @@ fn print_job(j: &Value) {
             println!("  stage {:<12} {}", s(&st["stage"]), dur);
         }
     }
+}
+
+async fn start_op(api: &Api, body: Value, wait: bool) -> Result<()> {
+    let v = api.post("/api/runs", &body).await?;
+    let id = s(&v["id"]);
+    if !wait {
+        return api.emit(&v, || println!("{} {id}", s(&body["kind"])));
+    }
+    let v = api.poll(&format!("/api/runs/{id}"), |v| v["finished_at"].is_string(), 6 * 3600).await?;
+    api.emit(&v, || print_run(&v))
 }
 
 fn print_run(r: &Value) {
