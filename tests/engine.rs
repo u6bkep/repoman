@@ -165,6 +165,31 @@ struct StubState {
     /// Package bases the fake aur-security service calls dangerous.
     dangerous: Arc<Mutex<Vec<String>>>,
     meta: Arc<Mutex<HashMap<String, AurMeta>>>,
+    /// Body of the fake aur-requests RSS feed.
+    feed: Arc<Mutex<String>>,
+}
+
+async fn requests_feed(State(st): State<StubState>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    ([(axum::http::header::CONTENT_TYPE, "application/rss+xml")], st.feed.lock().unwrap().clone()).into_response()
+}
+
+/// One aur-requests list message as the archive's feed renders it.
+fn feed_item(prq: u64, kind: &str, pkgbase: &str, outcome: Option<&str>, who: &str, text: &str) -> String {
+    let title = match outcome {
+        Some(o) => format!("[PRQ#{prq}] {kind} Request for {pkgbase} {o}"),
+        None => format!("[PRQ#{prq}] {kind} Request for {pkgbase}"),
+    };
+    let desc = match outcome {
+        Some(o) => format!("Request #{prq} has been {o} by {who} [1].\n\n[1] https://aur.archlinux.org/account/{who}/"),
+        None => format!("{who} [1] filed a {} request for {pkgbase} [2]:\n\n{text}\n\n[1] https://aur.archlinux.org/account/{who}/\n[2] https://aur.archlinux.org/pkgbase/{pkgbase}/", kind.to_ascii_lowercase()),
+    };
+    let guid = format!("https://lists.example/message/{prq}-{}/", outcome.unwrap_or("filed"));
+    format!("<item><title>{title}</title><link>{guid}</link><description>{desc}</description><pubDate>Sun, 01 Nov 2026 20:21:53 +0000</pubDate><guid>{guid}</guid></item>")
+}
+
+fn feed_xml(items: &[String]) -> String {
+    format!("<?xml version=\"1.0\" encoding=\"utf-8\"?><rss version=\"2.0\"><channel><title>Aur-requests</title>{}</channel></rss>", items.join(""))
 }
 
 async fn aursec_lookup(State(st): State<StubState>, axum::Json(body): axum::Json<Value>) -> axum::Json<Value> {
@@ -237,6 +262,7 @@ async fn start_stub(st: StubState) -> String {
         .route("/rpc/v5/search/{name}", get(rpc_search))
         .route("/mirror/{repo}/{arch}/{file}", get(mirror_db))
         .route("/api/v1/checks/lookup", axum::routing::post(aursec_lookup))
+        .route("/feed/", get(requests_feed))
         .with_state(st);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -379,6 +405,7 @@ struct Harness {
     mirror_requests: Arc<Mutex<Vec<String>>>,
     dangerous: Arc<Mutex<Vec<String>>>,
     meta: Arc<Mutex<HashMap<String, AurMeta>>>,
+    feed: Arc<Mutex<String>>,
     core_db: Arc<Mutex<(Vec<u8>, String)>>,
     specs: Arc<Mutex<Vec<JobSpec>>>,
     aur: FakeAur,
@@ -417,6 +444,7 @@ async fn start_with(tweak: impl FnOnce(&mut CoordinatorConfig)) -> Harness {
     let mirror_requests = Arc::new(Mutex::new(Vec::new()));
     let dangerous: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let meta: Arc<Mutex<HashMap<String, AurMeta>>> = Arc::new(Mutex::new(HashMap::new()));
+    let feed = Arc::new(Mutex::new(feed_xml(&[])));
     let stub = start_stub(StubState {
         stamps: aur.stamps.clone(),
         versions: versions.clone(),
@@ -425,6 +453,7 @@ async fn start_with(tweak: impl FnOnce(&mut CoordinatorConfig)) -> Harness {
         mirror_requests: mirror_requests.clone(),
         dangerous: dangerous.clone(),
         meta: meta.clone(),
+        feed: feed.clone(),
     })
     .await;
 
@@ -452,6 +481,7 @@ async fn start_with(tweak: impl FnOnce(&mut CoordinatorConfig)) -> Harness {
         auto_approve: false,
         forge_checks: false,
         aur_security_url: Some(stub.clone()),
+        aur_requests_url: Some(format!("{stub}/feed/")),
         ..Default::default()
     };
     let mut config = config;
@@ -482,6 +512,7 @@ async fn start_with(tweak: impl FnOnce(&mut CoordinatorConfig)) -> Harness {
         mirror_requests,
         dangerous,
         meta,
+        feed,
         core_db,
         specs,
         aur,
@@ -1121,4 +1152,55 @@ async fn deleted_then_resubmitted_base_is_flagged() {
     assert_eq!(resub["payload"]["old_id"], 1);
     assert_eq!(resub["payload"]["new_id"], 2);
     assert!(h.get("/api/packages/foo").await["snapshot"]["missing_since"].is_null(), "back on the AUR");
+}
+
+#[tokio::test]
+async fn aur_requests_against_tracked_packages_become_signals() {
+    let h = start_with(|c| c.auto_approve = true).await;
+    h.seed_foo().await;
+
+    // Someone asks for foo to be deleted; a request for a package we do not
+    // track is ignored.
+    *h.feed.lock().unwrap() = feed_xml(&[
+        feed_item(101, "Adoption", "bar", None, "alice", "I use it"),
+        feed_item(100, "Deletion", "foo", None, "mallory", "Upstream is dead, use foo-ng instead."),
+    ]);
+    assert_eq!(h.run().await["state"], "done");
+    let p = h.get("/api/packages/foo").await;
+    let sigs = p["signals"].as_array().unwrap();
+    assert_eq!(sigs.len(), 1, "{sigs:?}");
+    assert_eq!(sigs[0]["source"], "aur-requests");
+    assert_eq!(sigs[0]["severity"], "medium");
+    assert_eq!(sigs[0]["payload"]["request"], "deletion");
+    assert_eq!(sigs[0]["payload"]["who"], "mallory");
+    assert!(sigs[0]["payload"]["body"].as_str().unwrap().contains("Upstream is dead"), "{}", sigs[0]["payload"]);
+    assert_eq!(h.get("/api/signals").await.as_array().unwrap().len(), 1);
+
+    // A routine bump meanwhile is not auto-approved.
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    h.publish_pkg("foo", "1.1", &["glibc"], &[]);
+    h.aur.stamps.lock().unwrap().insert("foo".into(), now - 30 * 86_400);
+    let r = h.run().await;
+    assert_eq!(r["state"], "needs_input", "{r}");
+    assert_eq!(h.get("/api/packages/foo").await["signals"].as_array().unwrap().len(), 1, "same message is not recorded twice");
+
+    // A Package Maintainer rejects the request: the filing clears itself
+    // and the next run auto-approves.
+    *h.feed.lock().unwrap() = feed_xml(&[
+        feed_item(100, "Deletion", "foo", Some("Rejected"), "pm", ""),
+        feed_item(101, "Adoption", "bar", None, "alice", "I use it"),
+        feed_item(100, "Deletion", "foo", None, "mallory", "Upstream is dead, use foo-ng instead."),
+    ]);
+    let r = h.run().await;
+    assert_eq!(r["state"], "done", "{r}");
+    assert_eq!(h.repo_db().iter().find(|p| p.name == "foo").unwrap().version, "1.1-1");
+    let p = h.get("/api/packages/foo").await;
+    let sigs = p["signals"].as_array().unwrap();
+    assert_eq!(sigs.len(), 2, "{sigs:?}");
+    let filing = sigs.iter().find(|s| s["payload"]["kind"] == "request").unwrap();
+    assert_eq!(filing["cleared_by"], "aur-requests", "{filing}");
+    let outcome = sigs.iter().find(|s| s["payload"]["kind"] == "request_outcome").unwrap();
+    assert_eq!(outcome["severity"], "info");
+    assert_eq!(outcome["payload"]["outcome"], "rejected");
+    assert!(h.get("/api/signals").await.as_array().unwrap().is_empty());
 }

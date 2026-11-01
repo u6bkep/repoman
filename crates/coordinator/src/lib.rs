@@ -8,6 +8,7 @@ use repoman_store::Store;
 use tokio::net::TcpListener;
 
 pub mod api;
+pub mod aurreq;
 pub mod aursec;
 pub mod aur;
 pub mod blobs;
@@ -36,6 +37,7 @@ pub struct AppState {
     pub forge: Arc<forge::ForgeClient>,
     pub cache: Arc<cache::Cache>,
     pub aursec: Option<Arc<aursec::AurSecurity>>,
+    pub aurreq: Option<Arc<aurreq::AurRequests>>,
     pub engine: Arc<engine::Engine>,
 }
 
@@ -54,6 +56,7 @@ impl AppState {
         let forge = Arc::new(forge::ForgeClient::new(std::env::var(&config.github_token_env).ok().filter(|t| !t.is_empty())));
         let cache = Arc::new(cache::Cache::new(config.clone(), streams.clone(), store.clone())?);
         let aursec = config.aur_security_url.as_deref().filter(|u| !u.is_empty()).map(|u| Arc::new(aursec::AurSecurity::new(u)));
+        let aurreq = config.aur_requests_url.as_deref().filter(|u| !u.is_empty()).map(|u| Arc::new(aurreq::AurRequests::new(u)));
         if reviewer.enabled() && !reviewer.is_configured() {
             tracing::warn!(env = %config.reviewer.api_key_env, "reviewer enabled but no API key in the environment; candidates will record no verdict");
         }
@@ -70,6 +73,7 @@ impl AppState {
             forge,
             cache,
             aursec,
+            aurreq,
             engine: engine::Engine::new(),
         })
     }
@@ -102,6 +106,22 @@ pub async fn serve(config: CoordinatorConfig, store: Arc<Store>, listener: TcpLi
             }
         }
     });
+    // aur-requests between runs: a request against one of our packages is
+    // worth knowing about before the next run, and the feed is short.
+    if state.aurreq.is_some() {
+        let st = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(st.config.aur_requests_poll_secs.max(60)));
+            loop {
+                tick.tick().await;
+                match engine::ingest_aur_requests(&st).await {
+                    Ok(n) if n > 0 => tracing::info!(new_signals = n, "aur-requests"),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %format!("{e:#}"), "aur-requests feed"),
+                }
+            }
+        });
+    }
     axum::serve(listener, api::router(state)).await?;
     Ok(())
 }

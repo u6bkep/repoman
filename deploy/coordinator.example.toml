@@ -35,6 +35,13 @@ aur_security_url = "https://aur-security.cretezy.com"
 # Deleted/resubmitted bases and replaced git histories block until cleared.
 adoption_quarantine_days = 30
 
+# The aur-requests mailing list (RSS of the archive). Deletion and merge
+# requests against tracked packages block auto-approval until a Package
+# Maintainer rejects them or you clear them; orphan and adoption requests are
+# recorded as context. Read at every run and every aur_requests_poll_secs.
+aur_requests_url = "https://lists.archlinux.org/archives/list/aur-requests@lists.archlinux.org/feed/"
+aur_requests_poll_secs = 1800
+
 # Pull-through cache for upstream packages at /cache (pacman CacheServer).
 # Build roots use it automatically; clients add a CacheServer line.
 cache_enabled = true

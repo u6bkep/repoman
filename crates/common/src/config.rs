@@ -97,6 +97,22 @@ pub struct CoordinatorConfig {
     /// maintainer is auto-approved.
     #[serde(default = "default_adoption_quarantine_days")]
     pub adoption_quarantine_days: u64,
+    /// RSS feed of the aur-requests mailing list; requests against tracked
+    /// packages become signals. Unset or empty disables it.
+    #[serde(default = "default_aur_requests_url")]
+    pub aur_requests_url: Option<String>,
+    /// How often to read the feed between runs (it holds 30 items and the
+    /// list moves at a few an hour).
+    #[serde(default = "default_aur_requests_poll_secs")]
+    pub aur_requests_poll_secs: u64,
+}
+
+fn default_aur_requests_url() -> Option<String> {
+    Some("https://lists.archlinux.org/archives/list/aur-requests@lists.archlinux.org/feed/".into())
+}
+
+fn default_aur_requests_poll_secs() -> u64 {
+    1800
 }
 
 fn default_adoption_quarantine_days() -> u64 {
@@ -227,6 +243,8 @@ impl Default for CoordinatorConfig {
             build_memory_headroom: default_memory_headroom(),
             aur_security_url: default_aur_security_url(),
             adoption_quarantine_days: default_adoption_quarantine_days(),
+            aur_requests_url: default_aur_requests_url(),
+            aur_requests_poll_secs: default_aur_requests_poll_secs(),
         }
     }
 }

@@ -142,6 +142,9 @@ async fn execute(app: &AppState, run_id: &str) -> Result<RunEnd> {
         step(app, run_id, "poll").await?;
         progress(app, run_id, serde_json::json!({"phase": "poll", "detail": "asking the AUR and git sources for new commits"}));
         poll_aur(app).await?;
+        if let Err(e) = ingest_aur_requests(app).await {
+            tracing::warn!(error = %format!("{e:#}"), "aur-requests feed");
+        }
 
         step(app, run_id, "candidates").await?;
         progress(app, run_id, serde_json::json!({"phase": "candidates"}));
@@ -416,6 +419,50 @@ async fn missing_from_aur(app: &AppState, p: &PackageRow, prev: Option<SnapshotR
         app.store.event("aur.deleted", Some(&p.pkgbase), payload)?;
     }
     Ok(())
+}
+
+/// Read the aur-requests feed and record requests against tracked packages
+/// as `aur-requests` signals, one per list message (deduplicated by guid).
+/// A rejected or closed request clears the signal its filing raised, with
+/// the list as the clearing party. Returns how many signals were added.
+pub async fn ingest_aur_requests(app: &AppState) -> Result<usize> {
+    let Some(feed) = &app.aurreq else { return Ok(0) };
+    let items = feed.fetch().await?;
+    let mut added = 0;
+    // Oldest first so a filing precedes its outcome within one batch.
+    for item in items.iter().rev() {
+        let Some(_) = app.store.get_package(&item.pkgbase)? else { continue };
+        let existing = app.store.signals_of(&item.pkgbase)?;
+        if existing.iter().any(|s| s.source == "aur-requests" && s.payload["guid"] == item.guid) {
+            continue;
+        }
+        let kind = match &item.outcome {
+            Some(_) => "request_outcome",
+            None => "request",
+        };
+        let payload = serde_json::json!({
+            "kind": kind,
+            "request": item.kind,
+            "prq": item.prq,
+            "outcome": item.outcome,
+            "who": item.who,
+            "body": item.body,
+            "link": item.link,
+            "guid": item.guid,
+            "published": item.published,
+        });
+        app.store.add_signal(&item.pkgbase, None, "aur-requests", crate::aurreq::severity(item), &payload)?;
+        app.store.event("aur_requests.seen", Some(&item.pkgbase), payload)?;
+        added += 1;
+        if matches!(item.outcome.as_deref(), Some("rejected" | "closed")) {
+            for s in existing.iter().filter(|s| {
+                s.source == "aur-requests" && s.kind() == Some("request") && s.payload["prq"] == item.prq && s.cleared_at.is_none()
+            }) {
+                app.store.clear_signal(&s.id, "aur-requests")?;
+            }
+        }
+    }
+    Ok(added)
 }
 
 /// What changed on the AUR between two polls, as events and signals.

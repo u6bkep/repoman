@@ -453,7 +453,16 @@ candidates have no quarantine.
   Orphaned and out-of-date are states, not transitions: shown as pills from
   the snapshot, never stored as signals. Maintainer handovers between two
   people stay an event; the gate's `maintainer_changed` already covers them.
-- Future: aur-general or aur-requests mailbox ingestion.
+- aur-requests (implemented 2026-11-01, `coordinator::aurreq`): the list's
+  RSS feed (the mbox export is closed to anonymous readers and the HyperKitty
+  API does not answer) read at every run and every `aur_requests_poll_secs`.
+  Each message about a tracked package is one `aur-requests` signal, keyed by
+  the message guid: a deletion or merge filing is `medium` until a Package
+  Maintainer rejects it (the rejection clears it, `cleared_by =
+  aur-requests`) or the operator does; orphan and adoption filings and all
+  outcomes are `info`. The feed holds 30 items, so a request older than the
+  feed's horizon at first poll is never seen.
+- Future: aur-general ingestion (keyword match on tracked pkgbases).
 
 Signals are stored with the commit they concern (or the package, when
 `aur_commit` is null) and shown on the candidate, the package page and the

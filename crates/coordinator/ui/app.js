@@ -48,11 +48,13 @@ function sigActive(s) { return !s.cleared_at && !(s.expires_at && s.expires_at <
 function sigLabel(s) {
   const p = s.payload || {};
   if (s.source === "aur-security") return p.verdict || "";
+  if (s.source === "aur-requests") return p.kind === "request_outcome" ? `${p.request} request #${p.prq} ${p.outcome}` : `${p.request} request #${p.prq}`;
   return { adopted: `adopted by ${p.by}`, deleted: "deleted from the AUR", resubmitted: "deleted and resubmitted under the same name", history_rewritten: "git history replaced" }[p.kind] || p.kind || "";
 }
 function sigDetail(s) {
   const p = s.payload || {};
   if (s.source === "aur-security") return p.explanation || "";
+  if (s.source === "aur-requests") return p.kind === "request_outcome" ? `by ${p.who || "?"}` : (p.body || "").split("\n").filter(Boolean).slice(1).join(" ").slice(0, 300);
   switch (p.kind) {
     case "adopted": return `orphaned since ${p.orphaned_since ? ago(p.orphaned_since) : "before we watched"}; nothing auto-approves for ${p.quarantine_days} days`;
     case "deleted": return `missing since ${ago(p.missing_since)}; git repository ${p.git_gone ? "gone too" : "still answers"}; last ${p.last_version || "?"} by ${p.last_maintainer || "nobody"}`;
@@ -71,7 +73,7 @@ function signalsList(list, { withPackage = false } = {}) {
   if (!list || !list.length) return "";
   return `<ul class="findings">${list.map((s) => {
     const active = sigActive(s);
-    return `<li class="${active ? "" : "muted"}">${pill(s.severity)} ${withPackage ? `<a href="#/packages/${esc(s.pkgbase)}"><b>${esc(s.pkgbase)}</b></a> ` : ""}<b>${esc(s.source)}</b> ${esc(sigLabel(s))} ${s.aur_commit ? `<span class="mono">${short(s.aur_commit)}</span>` : '<span class="muted">whole package</span>'} <span class="muted">${esc(sigDetail(s))}</span> ${sigState(s)} <span class="muted">${ago(s.observed_at)}</span>${active && s.severity !== "info" ? ` <button data-clear-signal="${esc(s.id)}">Clear</button>` : ""}</li>`;
+    return `<li class="${active ? "" : "muted"}">${pill(s.severity)} ${withPackage ? `<a href="#/packages/${esc(s.pkgbase)}"><b>${esc(s.pkgbase)}</b></a> ` : ""}<b>${esc(s.source)}</b> ${esc(sigLabel(s))} ${s.aur_commit ? `<span class="mono">${short(s.aur_commit)}</span>` : '<span class="muted">whole package</span>'} <span class="muted">${esc(sigDetail(s))}</span>${s.payload?.link ? ` <a href="${esc(s.payload.link)}" target="_blank" rel="noopener">message</a>` : ""} ${sigState(s)} <span class="muted">${ago(s.observed_at)}</span>${active && s.severity !== "info" ? ` <button data-clear-signal="${esc(s.id)}">Clear</button>` : ""}</li>`;
   }).join("")}</ul>`;
 }
 function wireSignalClears() {
