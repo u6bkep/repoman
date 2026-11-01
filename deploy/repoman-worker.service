@@ -18,8 +18,9 @@ Delegate=yes
 DelegateSubgroup=supervisor
 
 # Filesystem: read-only system, writable scratch and config only.
+# StateDirectory creates /var/lib/repoman-worker and makes it writable.
 ProtectSystem=strict
-ReadWritePaths=/var/lib/repoman-worker
+StateDirectory=repoman-worker
 ReadOnlyPaths=/etc/repoman
 PrivateTmp=yes
 ProtectHome=read-only
