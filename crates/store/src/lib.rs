@@ -61,6 +61,15 @@ pub struct JobRow {
     pub result: Option<repoman_common::proto::JobResult>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EventRow {
+    pub seq: i64,
+    pub ts: String,
+    pub kind: String,
+    pub subject: Option<String>,
+    pub payload: serde_json::Value,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct StageRow {
     pub stage: String,
@@ -114,6 +123,25 @@ impl Store {
     }
 
     // ---- events -----------------------------------------------------------
+
+    /// Newest events first.
+    pub fn recent_events(&self, limit: u32) -> Result<Vec<EventRow>> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT seq, ts, kind, subject, payload FROM event ORDER BY seq DESC LIMIT ?1")?;
+            Ok(st
+                .query_map(params![limit], |r| {
+                    let payload: Option<String> = r.get(4)?;
+                    Ok(EventRow {
+                        seq: r.get(0)?,
+                        ts: r.get(1)?,
+                        kind: r.get(2)?,
+                        subject: r.get(3)?,
+                        payload: payload.and_then(|p| serde_json::from_str(&p).ok()).unwrap_or(serde_json::Value::Null),
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+    }
 
     pub fn event(&self, kind: &str, subject: Option<&str>, payload: serde_json::Value) -> Result<()> {
         self.with(|c| {

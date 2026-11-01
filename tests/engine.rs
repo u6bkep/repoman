@@ -563,6 +563,17 @@ async fn onboarding_build_publish_update_cycle() {
     let kinds: Vec<&str> = c["review"]["gate"]["reasons"].as_array().unwrap().iter().map(|r| r["kind"].as_str().unwrap()).collect();
     assert!(kinds.contains(&"version_bump") && !kinds.contains(&"srcinfo_mismatch"), "{kinds:?}");
     assert!(h.specs.lock().unwrap().iter().any(|s| matches!(s.job, JobKind::Inspect { .. })), "inspect job ran");
+    // The UI's supporting endpoints: on-demand packaging diff, package history, static files.
+    let diff = h.get(&format!("/api/candidates/{}/diff", c["id"].as_str().unwrap())).await;
+    assert!(diff["pkgbuild"].as_str().unwrap().contains("-pkgver=1.0\n+pkgver=1.1"), "{}", diff["pkgbuild"]);
+    assert_eq!(diff["from"], c["review"]["from"]);
+    let hist = h.get("/api/packages/foo/history").await;
+    assert!(hist["candidates"].as_array().unwrap().len() >= 2, "{hist}");
+    assert!(hist["publications"].as_array().unwrap().iter().any(|p| p["artifact"]["pkgname"] == "foo" && p["retired_at"].is_null()), "{hist}");
+    let ui = reqwest::get(format!("{}/ui/", h.base)).await.unwrap();
+    assert_eq!(ui.status(), 200);
+    assert!(ui.text().await.unwrap().contains("<title>repoman</title>"));
+    assert_eq!(reqwest::get(format!("{}/", h.base)).await.unwrap().url().path(), "/ui/", "root redirects to the UI");
     h.post(&format!("/api/candidates/{}/decide", c["id"].as_str().unwrap()), json!({"decision": "approve"})).await;
 
     let r5 = h.run().await;

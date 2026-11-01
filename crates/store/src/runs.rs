@@ -321,6 +321,16 @@ impl Store {
         })
     }
 
+    /// Every candidate of a package, newest first.
+    pub fn candidates_of(&self, pkgbase: &str) -> Result<Vec<CandidateRow>> {
+        self.with(|c| {
+            let mut st = c.prepare(&format!(
+                "SELECT {CAND_COLS} FROM candidate WHERE pkgbase = ?1 ORDER BY first_seen_at DESC, id DESC"
+            ))?;
+            Ok(st.query_map(params![pkgbase], row_to_candidate)?.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+    }
+
     pub fn jobs_for_candidate(&self, candidate_id: &str) -> Result<Vec<crate::JobRow>> {
         self.with(|c| {
             let mut st = c.prepare(&format!(

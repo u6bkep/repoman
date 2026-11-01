@@ -40,6 +40,14 @@ pub struct PublicationRow {
     pub retired_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ArtifactPublication {
+    pub artifact: ArtifactRow,
+    pub repo: String,
+    pub published_at: String,
+    pub retired_at: Option<String>,
+}
+
 const COLS: &str = "sha256, job_id, pkgbase, pkgname, pkgver, arch, stream, filename, size, sig_sha256, \
                     aur_commit, upstream_rev, depends, provides, paths, has_install, buildinfo, needed, created_at";
 
@@ -261,6 +269,30 @@ impl Store {
                 row_to_artifact,
             )
             .optional()?)
+        })
+    }
+
+    /// Every publication of a package base's artifacts, newest first, for
+    /// the package history view.
+    pub fn artifact_history(&self, pkgbase: &str) -> Result<Vec<ArtifactPublication>> {
+        self.with(|c| {
+            let mut st = c.prepare(&format!(
+                "SELECT {}, p.repo, p.published_at, p.retired_at FROM artifact a
+                 JOIN publication p ON p.artifact_sha = a.sha256
+                 WHERE a.pkgbase = ?1 ORDER BY p.published_at DESC, a.pkgname",
+                COLS.split(", ").map(|col| format!("a.{col}")).collect::<Vec<_>>().join(", ")
+            ))?;
+            let n = COLS.split(", ").count();
+            Ok(st
+                .query_map(params![pkgbase], |r| {
+                    Ok(ArtifactPublication {
+                        artifact: row_to_artifact(r)?,
+                        repo: r.get(n)?,
+                        published_at: r.get(n + 1)?,
+                        retired_at: r.get(n + 2)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?)
         })
     }
 

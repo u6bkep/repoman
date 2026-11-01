@@ -11,6 +11,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use repoman_common::proto::{JobKind, LogLine};
 use repoman_store::{BaselineRow, CandidateRow, JobRow, MembershipRow, PackageRow, SnapshotRow, StageRow, WorkerRow};
+use repoman_store::artifacts::ArtifactPublication;
 use serde::{Deserialize, Serialize};
 use tower_http::services::ServeDir;
 
@@ -30,16 +31,24 @@ pub fn router(state: AppState) -> Router {
         .route("/api/packages", get(list_packages).post(add_package))
         .route("/api/packages/{pkgbase}", get(get_package).delete(remove_package))
         .route("/api/packages/{pkgbase}/policy", post(set_policy))
+        .route("/api/packages/{pkgbase}/history", get(package_history))
         .route("/api/packages/{pkgbase}/streams/{stream}", axum::routing::delete(remove_membership))
         .route("/api/runs", get(list_runs).post(start_run))
         .route("/api/runs/{id}", get(get_run))
         .route("/api/candidates", get(list_candidates))
         .route("/api/candidates/{id}", get(get_candidate))
         .route("/api/candidates/{id}/decide", post(decide_candidate))
+        .route("/api/candidates/{id}/diff", get(candidate_diff))
+        .route("/api/events", get(list_events))
         .route("/api/images", get(list_images))
         .route("/api/signing-key", post(generate_signing_key))
         .route("/repos/repoman.asc", get(public_key))
         .route("/ws/worker", get(worker_ws))
+        .route("/", get(|| async { axum::response::Redirect::permanent("/ui/") }))
+        .route("/ui", get(|| async { axum::response::Redirect::permanent("/ui/") }))
+        .route("/ui/", get(|| async { ui_file("text/html; charset=utf-8", include_str!("../ui/index.html")) }))
+        .route("/ui/app.js", get(|| async { ui_file("text/javascript; charset=utf-8", include_str!("../ui/app.js")) }))
+        .route("/ui/app.css", get(|| async { ui_file("text/css; charset=utf-8", include_str!("../ui/app.css")) }))
         .nest_service("/store", ServeDir::new(bulk.join("store")))
         .nest_service("/staging", ServeDir::new(bulk.join("staging")))
         .nest_service("/repos", ServeDir::new(bulk.join("repos")))
@@ -47,6 +56,11 @@ pub fn router(state: AppState) -> Router {
 }
 
 type ApiError = (StatusCode, String);
+
+/// The operator UI is three files compiled into the binary.
+fn ui_file(content_type: &'static str, body: &'static str) -> Response {
+    ([(header::CONTENT_TYPE, content_type), (header::CACHE_CONTROL, "no-cache")], body).into_response()
+}
 
 fn internal(e: anyhow::Error) -> ApiError {
     tracing::error!(error = %format!("{e:#}"), "api error");
@@ -109,6 +123,9 @@ async fn list_workers(State(st): State<AppState>) -> Result<axum::Json<Vec<Worke
 struct ListJobsQuery {
     #[serde(default = "default_limit")]
     limit: u32,
+    /// Only jobs that built this candidate.
+    #[serde(default)]
+    candidate: Option<String>,
 }
 
 fn default_limit() -> u32 {
@@ -116,7 +133,20 @@ fn default_limit() -> u32 {
 }
 
 async fn list_jobs(State(st): State<AppState>, Query(q): Query<ListJobsQuery>) -> Result<axum::Json<Vec<JobRow>>, ApiError> {
+    if let Some(c) = &q.candidate {
+        return Ok(axum::Json(st.store.jobs_for_candidate(c).map_err(internal)?));
+    }
     Ok(axum::Json(st.store.list_jobs(q.limit.min(1000)).map_err(internal)?))
+}
+
+#[derive(Deserialize)]
+struct EventsQuery {
+    #[serde(default = "default_limit")]
+    limit: u32,
+}
+
+async fn list_events(State(st): State<AppState>, Query(q): Query<EventsQuery>) -> Result<axum::Json<Vec<repoman_store::EventRow>>, ApiError> {
+    Ok(axum::Json(st.store.recent_events(q.limit.min(1000)).map_err(internal)?))
 }
 
 #[derive(Deserialize)]
@@ -407,6 +437,92 @@ async fn list_candidates(State(st): State<AppState>, Query(q): Query<CandidatesQ
 
 async fn get_candidate(State(st): State<AppState>, Path(id): Path<String>) -> Result<axum::Json<CandidateRow>, ApiError> {
     Ok(axum::Json(st.store.get_candidate(&id).map_err(internal)?.ok_or(not_found("no such candidate"))?))
+}
+
+#[derive(Serialize)]
+struct FileDiff {
+    name: String,
+    /// new | changed | removed | unchanged
+    status: &'static str,
+    /// Unified diff when both sides exist, else None.
+    diff: Option<String>,
+    /// Full text for new files (nothing to diff against).
+    text: Option<String>,
+}
+
+#[derive(Serialize)]
+struct CandidateDiff {
+    from: Option<String>,
+    to: String,
+    /// Unified diff of the PKGBUILD, or its full text when there is no baseline.
+    pkgbuild: String,
+    files: Vec<FileDiff>,
+}
+
+/// `GET /api/candidates/{id}/diff`: what changed in the packaging between
+/// the commit the review ran from and the candidate's commit. Computed from
+/// the mirror on demand; nothing is stored.
+async fn candidate_diff(State(st): State<AppState>, Path(id): Path<String>) -> Result<axum::Json<CandidateDiff>, ApiError> {
+    let c = st.store.get_candidate(&id).map_err(internal)?.ok_or(not_found("no such candidate"))?;
+    let to = c.aur_commit.clone().ok_or(not_found("candidate has no commit"))?;
+    let from = c.review["from"].as_str().map(str::to_string);
+    let show = |commit: &str, file: &str| {
+        let aur = st.aur.clone();
+        let (pkgbase, commit, file) = (c.pkgbase.clone(), commit.to_string(), file.to_string());
+        async move { aur.show(&pkgbase, &commit, &file).await.ok().flatten() }
+    };
+    let new_pkgbuild = show(&to, "PKGBUILD").await.unwrap_or_default();
+    let unified = |name: &str, a: &str, b: &str| {
+        similar::TextDiff::from_lines(a, b)
+            .unified_diff()
+            .context_radius(3)
+            .header(&format!("{name}@baseline"), &format!("{name}@head"))
+            .to_string()
+    };
+    let pkgbuild = match &from {
+        Some(f) => unified("PKGBUILD", &show(f, "PKGBUILD").await.unwrap_or_default(), &new_pkgbuild),
+        None => new_pkgbuild,
+    };
+    // Install scripts, hooks, patches: every non-PKGBUILD file in either tree.
+    let new_files = st.aur.ls(&c.pkgbase, &to).await.unwrap_or_default();
+    let old_files = match &from {
+        Some(f) => st.aur.ls(&c.pkgbase, f).await.unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let interesting = |n: &str| n != "PKGBUILD" && n != ".SRCINFO" && !n.starts_with(".git") && !n.contains('/');
+    let mut names: Vec<&String> = new_files.iter().chain(old_files.iter()).filter(|n| interesting(n)).collect();
+    names.sort();
+    names.dedup();
+    let mut files = Vec::new();
+    for name in names {
+        let after = if new_files.contains(name) { show(&to, name).await } else { None };
+        let before = match &from {
+            Some(f) if old_files.contains(name) => show(f, name).await,
+            _ => None,
+        };
+        let entry = match (before, after) {
+            (None, Some(t)) => FileDiff { name: name.clone(), status: if from.is_some() { "new" } else { "present" }, diff: None, text: Some(t) },
+            (Some(_), None) => FileDiff { name: name.clone(), status: "removed", diff: None, text: None },
+            (Some(a), Some(b)) if a == b => FileDiff { name: name.clone(), status: "unchanged", diff: None, text: None },
+            (Some(a), Some(b)) => FileDiff { name: name.clone(), status: "changed", diff: Some(unified(name, &a, &b)), text: None },
+            (None, None) => continue,
+        };
+        files.push(entry);
+    }
+    Ok(axum::Json(CandidateDiff { from, to, pkgbuild, files }))
+}
+
+#[derive(Serialize)]
+struct PackageHistory {
+    candidates: Vec<CandidateRow>,
+    publications: Vec<ArtifactPublication>,
+}
+
+async fn package_history(State(st): State<AppState>, Path(pkgbase): Path<String>) -> Result<axum::Json<PackageHistory>, ApiError> {
+    Ok(axum::Json(PackageHistory {
+        candidates: st.store.candidates_of(&pkgbase).map_err(internal)?,
+        publications: st.store.artifact_history(&pkgbase).map_err(internal)?,
+    }))
 }
 
 #[derive(Deserialize)]

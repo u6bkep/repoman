@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>repoman</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header>
+  <a class="brand" href="#/queue">repoman</a>
+  <nav>
+    <a href="#/queue" data-nav="queue">Queue <span class="badge" id="queue-count"></span></a>
+    <a href="#/runs" data-nav="runs">Runs</a>
+    <a href="#/packages" data-nav="packages">Packages</a>
+    <a href="#/system" data-nav="system">System</a>
+  </nav>
+  <div class="status" id="status"></div>
+</header>
+<main id="main"><p class="muted">Loading…</p></main>
+<script src="app.js"></script>
+</body>
+</html>
