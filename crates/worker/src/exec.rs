@@ -199,7 +199,7 @@ pub async fn run_job(spec: JobSpec, config: Arc<WorkerConfig>, state: Arc<Worker
             .user_agent(format!("repoman-worker/{}", repoman_common::VERSION))
             .build()
             .expect("http client"),
-        cgroup: Mutex::new(state.cgroups.create(&spec.id, config.job_memory_limit)),
+        cgroup: Mutex::new(state.cgroups.create(&spec.id, spec.job.memory_limit().or(config.job_memory_limit))),
         config,
         state: state.clone(),
         job_id: spec.id.clone(),

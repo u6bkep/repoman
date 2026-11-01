@@ -118,6 +118,10 @@ pub enum JobKind {
         #[serde(default)]
         allow_network: bool,
         upload_url: String,
+        /// cgroup memory.max for this build, predicted by the coordinator
+        /// from recorded peaks; the worker's configured default when unset.
+        #[serde(default)]
+        memory_limit: Option<u64>,
     },
     /// Regenerate SRCINFO from the PKGBUILD in a sandbox.
     Inspect {
@@ -135,6 +139,14 @@ pub enum JobKind {
 }
 
 impl JobKind {
+    /// Memory the coordinator predicted for this job, if it is a build.
+    pub fn memory_limit(&self) -> Option<u64> {
+        match self {
+            JobKind::Build { memory_limit, .. } => *memory_limit,
+            _ => None,
+        }
+    }
+
     pub fn name(&self) -> &'static str {
         match self {
             JobKind::Noop { .. } => "noop",

@@ -20,6 +20,16 @@ quarantine_days = 3
 auto_approve = true
 auto_approve_metadata = true
 
+# Scheduling: a build's cgroup memory limit is predicted from its recorded
+# peaks (largest peak x headroom), or the default for a first build; a retry
+# after an OOM kill doubles it. Workers admit jobs by predicted memory.
+default_build_memory_bytes = 4294967296
+build_memory_headroom = 1.5
+
+# aur-security.cretezy.com assessments become signals on candidates; a
+# dangerous or suspicious verdict blocks auto-approval. Unset to disable.
+aur_security_url = "https://aur-security.cretezy.com"
+
 # Pull-through cache for upstream packages at /cache (pacman CacheServer).
 # Build roots use it automatically; clients add a CacheServer line.
 cache_enabled = true

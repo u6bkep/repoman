@@ -272,6 +272,23 @@ impl Store {
         })
     }
 
+    /// (peak RSS, peak scratch) of the newest successful builds of a package
+    /// base, newest first, for footprint prediction.
+    pub fn recent_build_peaks(&self, pkgbase: &str, limit: u32) -> Result<Vec<(Option<u64>, Option<u64>)>> {
+        self.with(|c| {
+            let mut st = c.prepare(
+                "SELECT peak_rss_bytes, peak_scratch_bytes FROM job
+                 WHERE kind = 'build' AND pkgbase = ?1 AND state = 'done' AND finished_at IS NOT NULL
+                 ORDER BY finished_at DESC LIMIT ?2",
+            )?;
+            Ok(st
+                .query_map(params![pkgbase, limit], |r| {
+                    Ok((r.get::<_, Option<i64>>(0)?.map(|v| v as u64), r.get::<_, Option<i64>>(1)?.map(|v| v as u64)))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+    }
+
     /// Oldest first, so dispatch is FIFO.
     pub fn queued_jobs(&self) -> Result<Vec<JobRow>> {
         self.with(|c| {

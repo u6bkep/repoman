@@ -632,6 +632,10 @@ Laptop as a second worker, admission by predicted footprint, aur-security
 signal integration, `soname_rebuild` candidates when a stream's sync DB
 changes a soname that a published artifact needs, VCS probe scheduling
 policy.
+Done 2026-11-01: admission (`hub::fits`, per-job `memory_limit` predicted in
+`engine::predict_memory` from the last five peaks, doubled per retry) and the
+aur-security signal (`coordinator::aursec`, `POST /api/v1/checks/lookup`,
+verdict → severity, blocks auto-approval across the candidate's commit range).
 Exit: a soname bump in a stream produces rebuild candidates on the next run
 without operator input; two workers share a run without duplicate jobs.
 Review focus: scheduler fairness, duplicate-job suppression, footprint

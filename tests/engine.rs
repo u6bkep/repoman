@@ -139,6 +139,35 @@ struct StubState {
     /// Package files the fake mirror serves, by filename.
     files: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     mirror_requests: Arc<Mutex<Vec<String>>>,
+    /// Package bases the fake aur-security service calls dangerous.
+    dangerous: Arc<Mutex<Vec<String>>>,
+}
+
+async fn aursec_lookup(State(st): State<StubState>, axum::Json(body): axum::Json<Value>) -> axum::Json<Value> {
+    let dangerous = st.dangerous.lock().unwrap();
+    let results: Vec<Value> = body["packages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|p| {
+            let base = p["package_base"].as_str().unwrap_or("");
+            let commits: Vec<Value> = p["commits"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|c| {
+                    let assessment = if dangerous.iter().any(|d| d == base) {
+                        json!({"verdict": "dangerous", "explanation": "install script downloads a second stage", "model": "fake"})
+                    } else {
+                        Value::Null
+                    };
+                    json!({"commit": c, "assessment": assessment})
+                })
+                .collect();
+            json!({"package_base": base, "commits": commits})
+        })
+        .collect();
+    axum::Json(json!({"results": results}))
 }
 
 async fn rpc_info(State(st): State<StubState>, Query(q): Query<Vec<(String, String)>>) -> axum::Json<Value> {
@@ -180,6 +209,7 @@ async fn start_stub(st: StubState) -> String {
         .route("/rpc/v5/info", get(rpc_info))
         .route("/rpc/v5/search/{name}", get(rpc_search))
         .route("/mirror/{repo}/{arch}/{file}", get(mirror_db))
+        .route("/api/v1/checks/lookup", axum::routing::post(aursec_lookup))
         .with_state(st);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -317,6 +347,7 @@ fn extract_srcinfo(tar_bytes: &[u8], pkgbase: &str) -> anyhow::Result<String> {
 struct Harness {
     base: String,
     mirror_requests: Arc<Mutex<Vec<String>>>,
+    dangerous: Arc<Mutex<Vec<String>>>,
     specs: Arc<Mutex<Vec<JobSpec>>>,
     aur: FakeAur,
     versions: Arc<Mutex<HashMap<String, String>>>,
@@ -349,12 +380,14 @@ async fn start_with(tweak: impl FnOnce(&mut CoordinatorConfig)) -> Harness {
     files.insert(python.filename.clone(), b"not what the database says".to_vec());
     let core_db = build_db(&[glibc, cmake, python], false);
     let mirror_requests = Arc::new(Mutex::new(Vec::new()));
+    let dangerous: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let stub = start_stub(StubState {
         stamps: aur.stamps.clone(),
         versions: versions.clone(),
         core_db: Arc::new(core_db),
         files: Arc::new(Mutex::new(files)),
         mirror_requests: mirror_requests.clone(),
+        dangerous: dangerous.clone(),
     })
     .await;
 
@@ -381,6 +414,7 @@ async fn start_with(tweak: impl FnOnce(&mut CoordinatorConfig)) -> Harness {
         aur_git_url: aur.git_url(),
         auto_approve: false,
         forge_checks: false,
+        aur_security_url: Some(stub.clone()),
         ..Default::default()
     };
     let mut config = config;
@@ -409,6 +443,7 @@ async fn start_with(tweak: impl FnOnce(&mut CoordinatorConfig)) -> Harness {
     let h = Harness {
         base: format!("http://{addr}"),
         mirror_requests,
+        dangerous,
         specs,
         aur,
         versions,
@@ -604,6 +639,8 @@ async fn onboarding_build_publish_update_cycle() {
     let kinds: Vec<&str> = c["review"]["gate"]["reasons"].as_array().unwrap().iter().map(|r| r["kind"].as_str().unwrap()).collect();
     assert!(kinds.contains(&"version_bump") && !kinds.contains(&"srcinfo_mismatch"), "{kinds:?}");
     assert!(h.specs.lock().unwrap().iter().any(|s| matches!(s.job, JobKind::Inspect { .. })), "inspect job ran");
+    // Builds carry a predicted memory limit: the default for a package with no recorded peaks.
+    assert!(h.specs.lock().unwrap().iter().any(|s| matches!(&s.job, JobKind::Build { memory_limit: Some(l), .. } if *l == 4 << 30)), "default footprint");
     // The UI's supporting endpoints: on-demand packaging diff, package history, static files.
     let diff = h.get(&format!("/api/candidates/{}/diff", c["id"].as_str().unwrap())).await;
     assert!(diff["pkgbuild"].as_str().unwrap().contains("-pkgver=1.0\n+pkgver=1.1"), "{}", diff["pkgbuild"]);
@@ -854,4 +891,29 @@ async fn cache_serves_verified_upstream_files() {
     let specs = h.specs.lock().unwrap();
     let conf = specs.iter().find_map(|s| match &s.job { JobKind::Image { pacman_conf, .. } => Some(pacman_conf.clone()), _ => None }).expect("image job");
     assert!(conf.contains(&format!("CacheServer = {}/cache", h.base)), "{conf}");
+}
+
+#[tokio::test]
+async fn aur_security_signal_blocks_auto_approval() {
+    let h = start_with(|c| c.auto_approve = true).await;
+    h.post("/api/packages", json!({"pkgbase": "foo", "streams": ["s1"], "class": "upstream-source"})).await;
+    h.publish_pkg("foo", "1.0", &["glibc"], &[]);
+    assert_eq!(h.run().await["state"], "needs_input");
+    let c = h.get("/api/candidates").await.as_array().unwrap()[0].clone();
+    h.post(&format!("/api/candidates/{}/decide", c["id"].as_str().unwrap()), json!({"decision": "approve"})).await;
+    assert_eq!(h.run().await["state"], "done");
+
+    // A routine bump, long past quarantine, that aur-security calls dangerous.
+    h.dangerous.lock().unwrap().push("foo".into());
+    h.publish_pkg("foo", "1.1", &["glibc"], &[]);
+    let r = h.run().await;
+    assert_eq!(r["state"], "needs_input", "{r}");
+    let c = h.get("/api/candidates").await.as_array().unwrap()[0].clone();
+    assert_eq!(c["review"]["gate"]["diff_class"], "routine");
+    assert!(c["decided_by"].is_null(), "not auto-approved: {c}");
+    let signals = c["review"]["signals"].as_array().unwrap();
+    assert_eq!(signals.len(), 1, "{signals:?}");
+    assert_eq!(signals[0]["source"], "aur-security");
+    assert_eq!(signals[0]["severity"], "high");
+    assert_eq!(signals[0]["payload"]["verdict"], "dangerous");
 }

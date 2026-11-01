@@ -8,6 +8,7 @@ use repoman_store::Store;
 use tokio::net::TcpListener;
 
 pub mod api;
+pub mod aursec;
 pub mod aur;
 pub mod blobs;
 pub mod cache;
@@ -34,6 +35,7 @@ pub struct AppState {
     pub reviewer: Arc<reviewer::Reviewer>,
     pub forge: Arc<forge::ForgeClient>,
     pub cache: Arc<cache::Cache>,
+    pub aursec: Option<Arc<aursec::AurSecurity>>,
     pub engine: Arc<engine::Engine>,
 }
 
@@ -51,6 +53,7 @@ impl AppState {
         let reviewer = Arc::new(reviewer::Reviewer::new(config.reviewer.clone()));
         let forge = Arc::new(forge::ForgeClient::new(std::env::var(&config.github_token_env).ok().filter(|t| !t.is_empty())));
         let cache = Arc::new(cache::Cache::new(config.clone(), streams.clone(), store.clone())?);
+        let aursec = config.aur_security_url.as_deref().filter(|u| !u.is_empty()).map(|u| Arc::new(aursec::AurSecurity::new(u)));
         if reviewer.enabled() && !reviewer.is_configured() {
             tracing::warn!(env = %config.reviewer.api_key_env, "reviewer enabled but no API key in the environment; candidates will record no verdict");
         }
@@ -66,6 +69,7 @@ impl AppState {
             reviewer,
             forge,
             cache,
+            aursec,
             engine: engine::Engine::new(),
         })
     }

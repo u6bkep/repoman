@@ -83,6 +83,28 @@ pub struct CoordinatorConfig {
     /// least recently served first. Unset means no cap.
     #[serde(default)]
     pub cache_max_bytes: Option<u64>,
+    /// Memory assumed for a build with no recorded peaks.
+    #[serde(default = "default_build_memory")]
+    pub default_build_memory_bytes: u64,
+    /// Multiplier on the largest recorded peak when predicting a build's
+    /// memory limit.
+    #[serde(default = "default_memory_headroom")]
+    pub build_memory_headroom: f64,
+    /// aur-security (cretezy) lookup service; unset disables the signal.
+    #[serde(default = "default_aur_security_url")]
+    pub aur_security_url: Option<String>,
+}
+
+fn default_build_memory() -> u64 {
+    4 << 30
+}
+
+fn default_memory_headroom() -> f64 {
+    1.5
+}
+
+fn default_aur_security_url() -> Option<String> {
+    Some("https://aur-security.cretezy.com".to_string())
 }
 
 fn default_cache_grace_days() -> u64 {
@@ -193,6 +215,9 @@ impl Default for CoordinatorConfig {
             cache_enabled: true,
             cache_grace_days: default_cache_grace_days(),
             cache_max_bytes: None,
+            default_build_memory_bytes: default_build_memory(),
+            build_memory_headroom: default_memory_headroom(),
+            aur_security_url: default_aur_security_url(),
         }
     }
 }

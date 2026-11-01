@@ -451,6 +451,36 @@ async fn create_candidates(app: &AppState, run_id: &str, images: &HashMap<String
                         .unwrap_or_default();
                     let mut review = review;
                     review["commits"] = serde_json::to_value(&commits)?;
+                    if let Some(sec) = &app.aursec {
+                        let mut hashes: Vec<String> = commits.iter().map(|c| c.hash.clone()).collect();
+                        if !hashes.contains(&head) {
+                            hashes.push(head.clone());
+                        }
+                        match sec.lookup(&p.pkgbase, &hashes).await {
+                            Ok(found) => {
+                                for a in found.into_iter().filter(|a| a.assessment.is_some()) {
+                                    let payload = a.assessment.unwrap();
+                                    let sev = crate::aursec::severity(&payload);
+                                    let existing = app.store.signals_for(&p.pkgbase, Some(&a.commit))?;
+                                    if !existing.iter().any(|s| s.source == "aur-security" && s.aur_commit.as_deref() == Some(a.commit.as_str())) {
+                                        app.store.add_signal(&p.pkgbase, Some(&a.commit), "aur-security", sev, &payload)?;
+                                    }
+                                }
+                            }
+                            Err(e) => tracing::warn!(pkgbase = %p.pkgbase, error = %format!("{e:#}"), "aur-security lookup failed"),
+                        }
+                        let mut signals = Vec::new();
+                        for h in &hashes {
+                            for s in app.store.signals_for(&p.pkgbase, Some(h))? {
+                                if !signals.iter().any(|x: &repoman_store::signals::SignalRow| x.id == s.id) {
+                                    signals.push(s);
+                                }
+                            }
+                        }
+                        if !signals.is_empty() {
+                            review["signals"] = serde_json::to_value(&signals)?;
+                        }
+                    }
                     let (floor_risk, llm_risk) = match srcinfo_at(app, &p.pkgbase, &head).await {
                         Ok(si) => review_change(app, p, Some(b), &head, &si, images, &commits, &mut review).await?,
                         Err(e) => {
@@ -656,6 +686,18 @@ fn auto_approve(app: &AppState) -> Result<usize> {
             continue;
         }
         if app.store.has_negative_signal(&c.pkgbase, c.aur_commit.as_deref())? {
+            continue;
+        }
+        let range: Vec<String> = c.review["commits"].as_array().into_iter().flatten().filter_map(|k| k["hash"].as_str().map(str::to_string)).collect();
+        let mut blocked = false;
+        for h in &range {
+            if app.store.has_negative_signal(&c.pkgbase, Some(h))? {
+                blocked = true;
+                break;
+            }
+        }
+        if blocked {
+            tracing::info!(pkgbase = %c.pkgbase, "negative signal on an intermediate commit; not auto-approving");
             continue;
         }
         app.store.decide_candidate(
@@ -1146,7 +1188,7 @@ async fn build_all(app: &AppState, run_id: &str, planned: &Planned, images: &Has
                 still.push(item);
                 continue;
             }
-            match submit_build(app, run_id, &item, images).await {
+            match submit_build(app, run_id, &item, images, 0).await {
                 Ok(job_id) => {
                     in_flight.insert(job_id, (key, 1));
                 }
@@ -1272,7 +1314,7 @@ async fn build_all(app: &AppState, run_id: &str, planned: &Planned, images: &Has
                     let err = row.error.unwrap_or_else(|| format!("job ended in state {}", state.as_str()));
                     if attempt < 2 && !err.contains("not found on the AUR") {
                         tracing::warn!(pkgbase = %item.pkgbase, stream = %item.stream, %err, "build failed; retrying once");
-                        match submit_build(app, run_id, item, images).await {
+                        match submit_build(app, run_id, item, images, attempt + 1).await {
                             Ok(job_id) => {
                                 in_flight.insert(job_id, (key, attempt + 1));
                             }
@@ -1296,8 +1338,26 @@ async fn build_all(app: &AppState, run_id: &str, planned: &Planned, images: &Has
     })
 }
 
-async fn submit_build(app: &AppState, run_id: &str, item: &BuildItem, images: &HashMap<String, ImageRef>) -> Result<String> {
+/// Memory limit for a build: the largest recorded peak times the headroom
+/// factor, rounded up to 256 MiB and never under 1 GiB; the configured
+/// default when the package has never built here. Each retry doubles it.
+fn predict_memory(app: &AppState, pkgbase: &str, attempt: u32) -> u64 {
+    let peaks = app.store.recent_build_peaks(pkgbase, 5).unwrap_or_default();
+    let max_rss = peaks.iter().filter_map(|(rss, _)| *rss).max();
+    let base = match max_rss {
+        Some(rss) => {
+            let predicted = (rss as f64 * app.config.build_memory_headroom) as u64;
+            let step = 256u64 << 20;
+            (predicted.div_ceil(step) * step).max(1 << 30)
+        }
+        None => app.config.default_build_memory_bytes,
+    };
+    base.saturating_mul(1u64 << attempt.min(4))
+}
+
+async fn submit_build(app: &AppState, run_id: &str, item: &BuildItem, images: &HashMap<String, ImageRef>, attempt: u32) -> Result<String> {
     let stream = app.config.stream(&item.stream).context("unknown stream")?;
+    let memory_limit = predict_memory(app, &item.pkgbase, attempt);
     let image = images.get(&item.stream).context("no image for stream")?.clone();
     let mut extra = vec![Repo {
         name: Publisher::staging_repo_name().to_string(),
@@ -1335,6 +1395,7 @@ async fn submit_build(app: &AppState, run_id: &str, item: &BuildItem, images: &H
             skip_pgp: item.skip_pgp,
             allow_network: item.allow_network,
             upload_url: format!("{}/api/blobs", app.config.public_url),
+            memory_limit: Some(memory_limit),
         },
         Some(&item.pkgbase),
         Some(&item.stream),

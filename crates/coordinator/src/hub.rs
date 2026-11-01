@@ -7,7 +7,7 @@
 //! Connections are identified by a counter so that a stale connection's
 //! cleanup never removes its replacement.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -41,8 +41,28 @@ struct Connected {
     arch: String,
     slots: u32,
     capabilities: Vec<String>,
-    running: HashSet<JobId>,
+    /// Running jobs with the memory reserved for each (0 when unknown).
+    running: HashMap<JobId, u64>,
+    mem_bytes: Option<u64>,
     since: String,
+}
+
+/// Memory a worker keeps for itself and the host: a tenth, at least 1 GiB.
+fn host_reserve(mem: u64) -> u64 {
+    (mem / 10).max(1 << 30)
+}
+
+/// Can a worker with `mem` bytes, `reserved` already promised to `running`
+/// jobs, take a job needing `needed`? A job too big for the machine still
+/// runs when nothing else does, alone, rather than never.
+pub fn fits(mem: Option<u64>, reserved: u64, running: usize, needed: u64) -> bool {
+    match mem {
+        None => true,
+        Some(m) => {
+            let avail = m.saturating_sub(host_reserve(m)).saturating_sub(reserved);
+            avail >= needed || running == 0
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -82,7 +102,7 @@ impl Hub {
         let mut map = self.connected.lock().unwrap();
         for c in map.values_mut() {
             for id in ids {
-                if c.running.remove(id) {
+                if c.running.remove(id).is_some() {
                     let _ = c.tx.send(CoordMsg::Cancel { job_id: id.clone() });
                 }
             }
@@ -105,7 +125,7 @@ impl Hub {
                 arch: c.arch.clone(),
                 slots: c.slots,
                 capabilities: c.capabilities.clone(),
-                running: c.running.iter().cloned().collect(),
+                running: c.running.keys().cloned().collect(),
                 since: c.since.clone(),
             })
             .collect();
@@ -133,8 +153,8 @@ impl Hub {
             self.store.event("job.requeued", Some(&id), serde_json::json!({"reason": "orphan_grace"}))?;
         }
         for job in self.store.queued_jobs()? {
-            let Some((worker, tx)) = self.reserve_slot(&job.id, required_capability(&job.job)) else {
-                continue; // no connected worker with a free slot can run this kind
+            let Some((worker, tx)) = self.reserve_slot(&job.id, required_capability(&job.job), job.job.memory_limit().unwrap_or(0)) else {
+                continue; // no connected worker with a free slot and enough memory can run this kind
             };
             if !self.store.set_assigned(&job.id, &worker)? {
                 self.release_slot(&worker, &job.id);
@@ -159,16 +179,21 @@ impl Hub {
         Ok(())
     }
 
-    /// Pick the capable connected worker with the most free slots and
-    /// reserve one.
-    fn reserve_slot(&self, job: &JobId, capability: Option<&str>) -> Option<(String, mpsc::UnboundedSender<CoordMsg>)> {
+    /// Pick the capable connected worker with a free slot and room for
+    /// `needed` bytes beside what its running jobs were promised; prefer the
+    /// one with the most memory left, then the most free slots.
+    fn reserve_slot(&self, job: &JobId, capability: Option<&str>, needed: u64) -> Option<(String, mpsc::UnboundedSender<CoordMsg>)> {
         let mut map = self.connected.lock().unwrap();
         let (name, c) = map
             .iter_mut()
             .filter(|(_, c)| (c.running.len() as u32) < c.slots)
             .filter(|(_, c)| capability.is_none_or(|cap| c.capabilities.iter().any(|x| x == cap)))
-            .max_by_key(|(_, c)| c.slots - c.running.len() as u32)?;
-        c.running.insert(job.clone());
+            .filter(|(_, c)| fits(c.mem_bytes, c.running.values().sum(), c.running.len(), needed))
+            .max_by_key(|(_, c)| {
+                let left = c.mem_bytes.map(|m| m.saturating_sub(c.running.values().sum::<u64>())).unwrap_or(u64::MAX);
+                (left, c.slots - c.running.len() as u32)
+            })?;
+        c.running.insert(job.clone(), needed);
         Some((name.clone(), c.tx.clone()))
     }
 
@@ -258,7 +283,8 @@ impl Hub {
                     arch: arch.clone(),
                     slots,
                     capabilities: capabilities.clone(),
-                    running: rec.resumed.iter().cloned().collect(),
+                    running: rec.resumed.iter().cloned().map(|j| (j, 0)).collect(),
+                    mem_bytes,
                     since: repoman_common::clock::now(),
                 },
             ) {
@@ -391,5 +417,24 @@ pub fn required_capability(job: &repoman_common::proto::JobKind) -> Option<&'sta
         JobKind::Image { .. } => Some("image"),
         JobKind::Build { .. } | JobKind::Inspect { .. } => Some("build"),
         JobKind::Probe { .. } => Some("probe"),
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::fits;
+
+    #[test]
+    fn memory_admission() {
+        let gib = 1u64 << 30;
+        assert!(fits(None, 0, 0, 100 * gib), "unknown memory never blocks");
+        // 64 GiB machine keeps 6.4 GiB; two 4 GiB jobs leave room for a third 4 GiB job.
+        assert!(fits(Some(64 * gib), 8 * gib, 2, 4 * gib));
+        // but not for a 50 GiB one...
+        assert!(!fits(Some(64 * gib), 8 * gib, 2, 50 * gib));
+        // ...which runs alone.
+        assert!(fits(Some(64 * gib), 0, 0, 50 * gib));
+        assert!(fits(Some(8 * gib), 0, 0, 100 * gib), "oversized job still runs on an idle worker");
+        assert!(!fits(Some(8 * gib), 4 * gib, 1, 4 * gib), "8 GiB minus 1 GiB reserve minus 4 reserved leaves 3");
     }
 }

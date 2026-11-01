@@ -226,6 +226,7 @@ async function viewCandidate(id) {
       ${r.note ? `<dt>note</dt><dd>${esc(r.note)}</dd>` : ""}
     </dl></div>
     ${publishFlags ? `<h2>Built artifacts raised flags</h2><div class="panel"><p class="muted">The build succeeded but the artifacts differ from what the stream serves in ways that matter on the installing system. Approve to rebuild and publish; reject to drop this commit.</p><ul class="findings">${publishFlags}</ul></div>` : ""}
+    ${(r.signals || []).length ? `<h2>External signals</h2><ul class="findings">${r.signals.map((s) => `<li>${pill(s.severity === "high" ? "high" : s.severity === "medium" ? "medium" : "low")} <b>${esc(s.source)}</b> <span class="mono">${short(s.aur_commit)}</span> ${esc(s.payload?.verdict || "")} <span class="muted">${esc(s.payload?.explanation || JSON.stringify(s.payload))}</span></li>`).join("")}</ul>` : ""}
     ${reasons ? `<h2>Reasons</h2><ul class="findings">${reasons}</ul>` : ""}
     ${findings ? `<h2>Lint findings</h2><ul class="findings">${findings}</ul>` : ""}
     ${llmHtml}
@@ -315,7 +316,8 @@ async function viewJob(id) {
       <dt>took</dt><dd>${j.started_at ? dur(j.started_at, j.finished_at) : "-"}</dd>
       <dt>exit</dt><dd>${dash(j.exit_code)}</dd>
       ${j.error ? `<dt>error</dt><dd>${esc(j.error)}</dd>` : ""}
-      ${j.peaks?.memory_bytes ? `<dt>peak memory</dt><dd>${bytes(j.peaks.memory_bytes)}</dd>` : ""}
+      ${j.peaks?.peak_rss_bytes ? `<dt>peak memory</dt><dd>${bytes(j.peaks.peak_rss_bytes)}${j.job?.memory_limit ? ` <span class="muted">of ${bytes(j.job.memory_limit)} allowed</span>` : ""}</dd>` : j.job?.memory_limit ? `<dt>memory limit</dt><dd>${bytes(j.job.memory_limit)}</dd>` : ""}
+      ${j.peaks?.cpu_seconds ? `<dt>cpu</dt><dd>${Math.round(j.peaks.cpu_seconds)} s</dd>` : ""}
       ${j.job?.aur_commit ? `<dt>commit</dt><dd class="mono">${short(j.job.aur_commit)}</dd>` : ""}
       ${j.job?.allow_network ? `<dt>network</dt><dd>allowed during build (policy)</dd>` : ""}
     </dl></div>
