@@ -39,7 +39,10 @@ async fn unpack_image(ctx: &JobCtx, tarball: &Path, root: &Path) -> Result<()> {
     let _ = tokio::fs::remove_dir_all(&tmp).await;
     tokio::fs::create_dir_all(&tmp).await?;
     let mut cmd = tokio::process::Command::new("bsdtar");
-    cmd.args(["--numeric-owner", "-xpf"])
+    // -p keeps modes, owners, and xattrs (file capabilities); file flags
+    // are skipped because a real-root unpack onto a filesystem without
+    // chattr support (var/log/journal carries +C) fails otherwise.
+    cmd.args(["--numeric-owner", "--no-fflags", "-xpf"])
         .arg(tarball)
         .arg("-C")
         .arg(&tmp)
