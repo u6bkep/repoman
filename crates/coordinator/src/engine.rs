@@ -386,18 +386,14 @@ async fn create_candidates(app: &AppState, run_id: &str, images: &HashMap<String
                 if !open.iter().any(|c| c.kind == "onboarding" && c.aur_commit.as_deref() == Some(&head)) {
                     app.store.supersede_candidates(&p.pkgbase, &head)?;
                     let mut review = serde_json::json!({"note": "no baseline; first review"});
-                    let mut floor_risk = None;
-                    match srcinfo_at(app, &p.pkgbase, &head).await {
-                        Ok(si) => match crate::gate::assess(app, &p.pkgbase, None, &head, &si, images, p.source_url.is_some()).await {
-                            Ok(v) => {
-                                floor_risk = Some(v.floor_risk.as_str());
-                                review["gate"] = serde_json::to_value(&v)?;
-                            }
-                            Err(e) => review["gate_error"] = serde_json::Value::String(e.to_string()),
-                        },
-                        Err(e) => review["gate_error"] = serde_json::Value::String(e.to_string()),
-                    }
-                    app.store.create_candidate(
+                    let (floor_risk, llm_risk) = match srcinfo_at(app, &p.pkgbase, &head).await {
+                        Ok(si) => review_change(app, p, None, &head, &si, images, &[], &mut review).await?,
+                        Err(e) => {
+                            review["gate_error"] = serde_json::Value::String(e.to_string());
+                            (None, None)
+                        }
+                    };
+                    let c = app.store.create_candidate(
                         run_id,
                         &NewCandidate {
                             pkgbase: &p.pkgbase,
@@ -405,12 +401,15 @@ async fn create_candidates(app: &AppState, run_id: &str, images: &HashMap<String
                             aur_commit: Some(&head),
                             first_seen_last_modified: Some(snap.last_modified),
                             class: p.provenance_class.as_deref(),
-                            floor_risk,
+                            floor_risk: floor_risk.as_deref(),
                             state: "pending",
-                            review,
+                            review: review.clone(),
                             ..Default::default()
                         },
                     )?;
+                    if llm_risk.is_some() {
+                        app.store.set_candidate_review(&c.id, None, None, llm_risk.as_deref(), &review)?;
+                    }
                 }
             }
             Some(b) if b.aur_commit != head => {
@@ -440,18 +439,14 @@ async fn create_candidates(app: &AppState, run_id: &str, images: &HashMap<String
                         .unwrap_or_default();
                     let mut review = review;
                     review["commits"] = serde_json::to_value(&commits)?;
-                    let mut floor_risk = None;
-                    match srcinfo_at(app, &p.pkgbase, &head).await {
-                        Ok(si) => match crate::gate::assess(app, &p.pkgbase, Some(b), &head, &si, images, p.source_url.is_some()).await {
-                            Ok(v) => {
-                                floor_risk = Some(v.floor_risk.as_str());
-                                review["gate"] = serde_json::to_value(&v)?;
-                            }
-                            Err(e) => review["gate_error"] = serde_json::Value::String(e.to_string()),
-                        },
-                        Err(e) => review["gate_error"] = serde_json::Value::String(e.to_string()),
-                    }
-                    app.store.create_candidate(
+                    let (floor_risk, llm_risk) = match srcinfo_at(app, &p.pkgbase, &head).await {
+                        Ok(si) => review_change(app, p, Some(b), &head, &si, images, &commits, &mut review).await?,
+                        Err(e) => {
+                            review["gate_error"] = serde_json::Value::String(e.to_string());
+                            (None, None)
+                        }
+                    };
+                    let c = app.store.create_candidate(
                         run_id,
                         &NewCandidate {
                             pkgbase: &p.pkgbase,
@@ -459,12 +454,15 @@ async fn create_candidates(app: &AppState, run_id: &str, images: &HashMap<String
                             aur_commit: Some(&head),
                             first_seen_last_modified: Some(snap.last_modified),
                             class: p.provenance_class.as_deref(),
-                            floor_risk,
+                            floor_risk: floor_risk.as_deref(),
                             state: "pending",
-                            review,
+                            review: review.clone(),
                             ..Default::default()
                         },
                     )?;
+                    if llm_risk.is_some() {
+                        app.store.set_candidate_review(&c.id, None, None, llm_risk.as_deref(), &review)?;
+                    }
                 }
             }
             Some(_) => {
@@ -546,6 +544,64 @@ async fn create_candidates(app: &AppState, run_id: &str, images: &HashMap<String
 
 // ---- gate -----------------------------------------------------------------------
 
+/// Run the deterministic gate and, when configured, the LLM reviewer on one
+/// change. Writes `gate`, `gate_error`, and `llm` into `review`; returns the
+/// floor and LLM risks for the candidate columns.
+#[allow(clippy::too_many_arguments)]
+async fn review_change(
+    app: &AppState,
+    p: &PackageRow,
+    baseline: Option<&repoman_store::BaselineRow>,
+    head: &str,
+    si: &Srcinfo,
+    images: &HashMap<String, ImageRef>,
+    commits: &[crate::aur::CommitInfo],
+    review: &mut serde_json::Value,
+) -> Result<(Option<String>, Option<String>)> {
+    let a = match crate::gate::assess(app, &p.pkgbase, baseline, head, si, images, p.source_url.is_some()).await {
+        Ok(a) => a,
+        Err(e) => {
+            review["gate_error"] = serde_json::Value::String(e.to_string());
+            return Ok((None, None));
+        }
+    };
+    review["gate"] = serde_json::to_value(&a.verdict)?;
+    let floor = a.verdict.floor_risk.as_str().to_string();
+    let Some(model) = app.reviewer.model_for(&a.verdict) else {
+        return Ok((Some(floor), None));
+    };
+    let version_from = review["version_from"].as_str().map(str::to_string);
+    let outcome = app
+        .reviewer
+        .review(
+            model,
+            &crate::reviewer::ReviewRequest {
+                pkgbase: &p.pkgbase,
+                kind: if baseline.is_some() { "update" } else { "onboarding" },
+                provenance_class: p.provenance_class.as_deref(),
+                source_url: p.source_url.as_deref(),
+                version_from: version_from.as_deref(),
+                version_to: &si.version(),
+                maintainers_before: &a.maintainers_before,
+                maintainers_now: &a.maintainers_now,
+                old_pkgbuild: a.old_pkgbuild.as_deref(),
+                new_pkgbuild: &a.new_pkgbuild,
+                old_scripts: &a.old_scripts,
+                new_scripts: &a.new_scripts,
+                commits,
+                gate: &a.verdict,
+            },
+        )
+        .await;
+    if let Some(e) = &outcome.error {
+        tracing::warn!(pkgbase = %p.pkgbase, model, error = %e, "LLM review recorded no verdict");
+    }
+    tracing::info!(pkgbase = %p.pkgbase, model, risk = ?outcome.risk(), cost_usd = outcome.cost_usd, "LLM review");
+    let llm_risk = outcome.risk().map(|r| r.as_str().to_string());
+    review["llm"] = serde_json::to_value(&outcome)?;
+    Ok((Some(floor), llm_risk))
+}
+
 /// Approve pending `update` candidates the deterministic gate is satisfied
 /// with: routine (or metadata, where allowed) class, low floor risk, past
 /// quarantine by the AUR's own LastModified clock, no negative signal.
@@ -570,6 +626,9 @@ fn auto_approve(app: &AppState) -> Result<usize> {
         let metadata_ok = app.config.auto_approve_metadata && policy.get("auto_metadata").and_then(|v| v.as_bool()).unwrap_or(true);
         let class_ok = class == "routine" || (class == "metadata" && metadata_ok);
         if !class_ok || c.floor_risk.as_deref() != Some("low") {
+            continue;
+        }
+        if c.llm_risk.as_deref().is_some_and(|r| r != "low") {
             continue;
         }
         let days = policy.get("quarantine_days").and_then(|v| v.as_u64()).unwrap_or(app.config.quarantine_days);

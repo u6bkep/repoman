@@ -12,6 +12,7 @@ pub mod aur;
 pub mod blobs;
 pub mod engine;
 pub mod gate;
+pub mod reviewer;
 pub mod hub;
 pub mod keys;
 pub mod planner;
@@ -28,6 +29,7 @@ pub struct AppState {
     pub blobs: Arc<blobs::Blobs>,
     pub publisher: Arc<publisher::Publisher>,
     pub keys: Arc<keys::Keys>,
+    pub reviewer: Arc<reviewer::Reviewer>,
     pub engine: Arc<engine::Engine>,
 }
 
@@ -42,6 +44,10 @@ impl AppState {
         let blobs = Arc::new(blobs::Blobs::new(&config.bulk_dir())?);
         let publisher = Arc::new(publisher::Publisher::new(&config)?);
         let keys = Arc::new(keys::Keys::new(&config.data_dir)?);
+        let reviewer = Arc::new(reviewer::Reviewer::new(config.reviewer.clone()));
+        if reviewer.enabled() && !reviewer.is_configured() {
+            tracing::warn!(env = %config.reviewer.api_key_env, "reviewer enabled but no API key in the environment; candidates will record no verdict");
+        }
         Ok(AppState {
             config,
             store,
@@ -51,6 +57,7 @@ impl AppState {
             blobs,
             publisher,
             keys,
+            reviewer,
             engine: engine::Engine::new(),
         })
     }

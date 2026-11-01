@@ -300,12 +300,12 @@ struct Harness {
 }
 
 async fn start() -> Harness {
-    start_with(false).await
+    start_with(|_| {}).await
 }
 
 /// `auto_approve` is off by default so the lifecycle tests drive every
-/// decision; the quarantine test turns it on.
-async fn start_with(auto_approve: bool) -> Harness {
+/// decision; tests that need it, or the reviewer, adjust the config here.
+async fn start_with(tweak: impl FnOnce(&mut CoordinatorConfig)) -> Harness {
     let tmp = tempfile::tempdir().unwrap();
     let aur = FakeAur::new(tmp.path());
     let versions = Arc::new(Mutex::new(HashMap::new()));
@@ -340,9 +340,11 @@ async fn start_with(auto_approve: bool) -> Harness {
         }],
         aur_rpc_url: format!("{stub}/rpc/v5"),
         aur_git_url: aur.git_url(),
-        auto_approve,
+        auto_approve: false,
         ..Default::default()
     };
+    let mut config = config;
+    tweak(&mut config);
     std::fs::create_dir_all(&config.data_dir).unwrap();
     let store = Arc::new(Store::open(&tmp.path().join("repoman.db")).unwrap());
     tokio::spawn(repoman_coordinator::serve(config, store, listener));
@@ -594,7 +596,7 @@ async fn onboarding_build_publish_update_cycle() {
 
 #[tokio::test]
 async fn routine_update_auto_approves_after_quarantine() {
-    let h = start_with(true).await;
+    let h = start_with(|c| c.auto_approve = true).await;
     h.post("/api/packages", json!({"pkgbase": "foo", "streams": ["s1"], "class": "upstream-source"})).await;
     h.publish_pkg("foo", "1.0", &["glibc"], &[]);
     let r1 = h.run().await;
@@ -643,4 +645,81 @@ async fn routine_update_auto_approves_after_quarantine() {
     let pending = h.get("/api/candidates").await;
     let c = &pending.as_array().unwrap()[0];
     assert_eq!(c["review"]["gate"]["diff_class"], "structural", "{}", c["review"]["gate"]);
+}
+
+/// A stand-in for the Claude Messages API: records request bodies and
+/// answers with a fixed schema-shaped verdict.
+async fn start_fake_claude(requests: Arc<Mutex<Vec<Value>>>) -> String {
+    use axum::routing::post;
+    async fn messages(State(reqs): State<Arc<Mutex<Vec<Value>>>>, headers: axum::http::HeaderMap, axum::Json(body): axum::Json<Value>) -> axum::Json<Value> {
+        assert_eq!(headers.get("anthropic-version").and_then(|v| v.to_str().ok()), Some("2026-10-21"));
+        assert!(headers.get("x-api-key").is_some());
+        reqs.lock().unwrap().push(body);
+        let verdict = json!({
+            "risk": "high",
+            "summary": "A new AUR-only dependency appears with no upstream reason.",
+            "findings": [{"kind": "new_dependency", "evidence": "depends gained libnotinrepos", "severity": "high"}],
+            "questions_for_human": ["Does upstream 1.1 really need libnotinrepos?"]
+        });
+        axum::Json(json!({
+            "id": "msg_test", "type": "message", "role": "assistant", "model": "claude-opus-5-5",
+            "content": [{"type": "text", "text": verdict.to_string()}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1500, "output_tokens": 90}
+        }))
+    }
+    let app = Router::new().route("/v1/messages", post(messages)).with_state(requests);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn structural_update_is_sent_to_the_reviewer() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let api = start_fake_claude(requests.clone()).await;
+    let h = start_with(|c| {
+        c.auto_approve = true;
+        c.reviewer.enabled = true;
+        c.reviewer.api_url = api.clone();
+        c.reviewer.api_key = Some("test-key".into());
+    })
+    .await;
+    h.post("/api/packages", json!({"pkgbase": "foo", "streams": ["s1"], "class": "upstream-source"})).await;
+    h.publish_pkg("foo", "1.0", &["glibc"], &[]);
+    let r1 = h.run().await;
+    assert_eq!(r1["state"], "needs_input", "{r1}");
+    let pending = h.get("/api/candidates").await;
+    let c = &pending.as_array().unwrap()[0];
+    // Onboarding of a clean package: low floor risk, so no API call is spent.
+    assert_eq!(c["floor_risk"], "low");
+    assert!(c["review"]["llm"].is_null(), "{}", c["review"]);
+    assert_eq!(requests.lock().unwrap().len(), 0);
+    h.post(&format!("/api/candidates/{}/decide", c["id"].as_str().unwrap()), json!({"decision": "approve"})).await;
+    assert_eq!(h.run().await["state"], "done");
+
+    // A structural change goes to the model; its verdict lands on the
+    // candidate and the operator sees it in the queue.
+    h.publish_pkg("foo", "1.1", &["glibc", "libnotinrepos"], &[]);
+    let r2 = h.run().await;
+    assert_eq!(r2["state"], "needs_input", "{r2}");
+    let pending = h.get("/api/candidates").await;
+    let c = &pending.as_array().unwrap()[0];
+    assert_eq!(c["review"]["gate"]["diff_class"], "structural");
+    assert_eq!(c["llm_risk"], "high", "{}", c["review"]);
+    let llm = &c["review"]["llm"];
+    assert_eq!(llm["model"], "claude-opus-5-5");
+    assert_eq!(llm["verdict"]["findings"][0]["kind"], "new_dependency");
+    assert!((llm["cost_usd"].as_f64().unwrap() - (1500.0 * 4.0 + 90.0 * 20.0) / 1e6).abs() < 1e-9, "{llm}");
+    let reqs = requests.lock().unwrap();
+    assert_eq!(reqs.len(), 1);
+    let body = &reqs[0];
+    assert_eq!(body["model"], "claude-opus-5-5");
+    assert_eq!(body["output_config"]["format"]["type"], "json_schema");
+    assert_eq!(body["fallbacks"], "default");
+    let prompt = body["messages"][0]["content"].as_str().unwrap();
+    assert!(prompt.contains("libnotinrepos"), "prompt shows the diff");
+    assert!(prompt.contains("new_aur_dependency"), "prompt shows the gate reasons");
+    assert!(prompt.contains("version: 1.0-1 -> 1.1-1"), "{prompt}");
 }

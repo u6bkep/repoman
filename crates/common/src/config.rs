@@ -61,6 +61,84 @@ pub struct CoordinatorConfig {
     /// keeps a package manual.
     #[serde(default = "default_true")]
     pub auto_approve_metadata: bool,
+    /// Claude API reviewer for candidates the deterministic gate does not
+    /// clear on its own.
+    #[serde(default)]
+    pub reviewer: ReviewerConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewerConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Base URL of the Messages API.
+    #[serde(default = "default_api_url")]
+    pub api_url: String,
+    /// Environment variable holding the API key.
+    #[serde(default = "default_api_key_env")]
+    pub api_key_env: String,
+    /// Literal key; prefer the environment variable outside tests.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Model for structural and elevated-risk candidates.
+    #[serde(default = "default_review_model")]
+    pub model: String,
+    /// Model for routine candidates; unset means routine changes are not
+    /// sent to the API at all.
+    #[serde(default)]
+    pub routine_model: Option<String>,
+    /// `output_config.effort`.
+    #[serde(default = "default_effort")]
+    pub effort: String,
+    #[serde(default = "default_review_max_tokens")]
+    pub max_tokens: u32,
+    /// Opt into Anthropic's server-side fallback on a classifier refusal.
+    #[serde(default = "default_true")]
+    pub fallbacks: bool,
+    /// Budget for PKGBUILD text, diff, and scripts in one prompt.
+    #[serde(default = "default_review_max_input")]
+    pub max_input_chars: usize,
+}
+
+impl Default for ReviewerConfig {
+    fn default() -> Self {
+        ReviewerConfig {
+            enabled: false,
+            api_url: default_api_url(),
+            api_key_env: default_api_key_env(),
+            api_key: None,
+            model: default_review_model(),
+            routine_model: None,
+            effort: default_effort(),
+            max_tokens: default_review_max_tokens(),
+            fallbacks: true,
+            max_input_chars: default_review_max_input(),
+        }
+    }
+}
+
+fn default_api_url() -> String {
+    "https://api.anthropic.com".to_string()
+}
+
+fn default_api_key_env() -> String {
+    "ANTHROPIC_API_KEY".to_string()
+}
+
+fn default_review_model() -> String {
+    "claude-opus-5-5".to_string()
+}
+
+fn default_effort() -> String {
+    "high".to_string()
+}
+
+fn default_review_max_tokens() -> u32 {
+    8000
+}
+
+fn default_review_max_input() -> usize {
+    240_000
 }
 
 impl Default for CoordinatorConfig {
@@ -83,6 +161,7 @@ impl Default for CoordinatorConfig {
             quarantine_days: default_quarantine_days(),
             auto_approve: true,
             auto_approve_metadata: true,
+            reviewer: ReviewerConfig::default(),
         }
     }
 }

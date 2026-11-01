@@ -126,6 +126,18 @@ async fn srcinfo_matches(app: &AppState, pkgbase: &str, head: &str, committed: &
     }
 }
 
+/// What the gate read, kept for the LLM reviewer so both see the same
+/// material.
+pub struct Assessment {
+    pub verdict: Verdict,
+    pub old_pkgbuild: Option<String>,
+    pub new_pkgbuild: String,
+    pub old_scripts: Vec<(String, String)>,
+    pub new_scripts: Vec<(String, String)>,
+    pub maintainers_before: Vec<String>,
+    pub maintainers_now: Vec<String>,
+}
+
 /// Assess the change from `baseline` (or, without one, lint the head alone).
 /// `head_si` is the committed SRCINFO at `head`.
 pub async fn assess(
@@ -136,7 +148,7 @@ pub async fn assess(
     head_si: &Srcinfo,
     images: &HashMap<String, ImageRef>,
     self_hosted: bool,
-) -> Result<Verdict> {
+) -> Result<Assessment> {
     let old_si = match baseline {
         Some(b) => {
             let text = app
@@ -182,7 +194,7 @@ pub async fn assess(
         let dep = DepSpec::unversioned(name);
         names.iter().any(|n| streams.get(n).is_some_and(|ix| ix.index.satisfies(&dep)))
     };
-    Ok(evaluate(&GateInput {
+    let verdict = evaluate(&GateInput {
         old: &old_si,
         new: head_si,
         old_pkgbuild: old_pkgbuild.as_deref(),
@@ -194,7 +206,16 @@ pub async fn assess(
         maintainer_changed,
         srcinfo_mismatch,
         is_official: &is_official,
-    }))
+    });
+    Ok(Assessment {
+        verdict,
+        old_pkgbuild,
+        new_pkgbuild,
+        old_scripts,
+        new_scripts,
+        maintainers_before: baseline.map(|b| b.maintainers.clone()).unwrap_or_default(),
+        maintainers_now: maintainer_set(snap.as_ref()),
+    })
 }
 
 #[cfg(test)]

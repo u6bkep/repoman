@@ -28,6 +28,9 @@ services:
       - /media/data/repoman:/var/lib/repoman/bulk
     environment:
       RUST_LOG: info
+      # Claude API key for the reviewer; put ANTHROPIC_API_KEY=... in a
+      # mode-0600 .env file next to this compose file.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
 
 networks:
   lan:

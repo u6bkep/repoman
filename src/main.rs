@@ -557,6 +557,34 @@ fn print_candidate(c: &Value) {
             println!("  [{:<6}] {:<22} {:<34} {}{}", s(&f["severity"]), s(&f["rule"]), where_, s(&f["excerpt"]), note);
         }
     }
+    let llm = &r["llm"];
+    if !llm.is_null() {
+        let served = llm["served_by"].as_str().filter(|m| Some(*m) != llm["model"].as_str()).map(|m| format!(" (served by {m})")).unwrap_or_default();
+        println!(
+            "llm       {}{}  ${:.4}  in {} out {}",
+            s(&llm["model"]),
+            served,
+            llm["cost_usd"].as_f64().unwrap_or(0.0),
+            s(&llm["usage"]["input_tokens"]),
+            s(&llm["usage"]["output_tokens"])
+        );
+        if let Some(e) = llm["error"].as_str() {
+            println!("          no verdict: {e}");
+        }
+        if let Some(cat) = llm["refused"].as_str() {
+            println!("          refused ({cat}); no verdict");
+        }
+        let v = &llm["verdict"];
+        if !v.is_null() {
+            println!("          risk {}: {}", s(&v["risk"]), s(&v["summary"]));
+            for f in v["findings"].as_array().into_iter().flatten() {
+                println!("  [{:<6}] {:<22} {}", s(&f["severity"]), s(&f["kind"]), s(&f["evidence"]));
+            }
+            for q in v["questions_for_human"].as_array().into_iter().flatten() {
+                println!("  ? {}", s(q));
+            }
+        }
+    }
     if let Some(commits) = r["commits"].as_array()
         && !commits.is_empty()
     {
@@ -596,6 +624,11 @@ fn candidate_summary(c: &Value) -> String {
         if n > 0 {
             parts.push(format!("{n} lint finding{}", if n == 1 { "" } else { "s" }));
         }
+    }
+    if let Some(risk) = c["llm_risk"].as_str() {
+        parts.push(format!("llm {risk}"));
+    } else if r["llm"]["error"].is_string() || r["llm"]["refused"].is_string() {
+        parts.push("llm: no verdict".to_string());
     }
     if let Some(n) = r["note"].as_str() {
         parts.push(n.to_string());

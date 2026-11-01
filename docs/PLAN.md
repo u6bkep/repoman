@@ -438,6 +438,9 @@ They raise risk; they never approve.
 
 ### 10.6 LLM reviewer
 
+Implemented in M2 as `coordinator::reviewer` (raw HTTP; no official Rust
+SDK). Runs for structural or elevated-floor candidates when
+`[reviewer] enabled`, and for routine ones only when `routine_model` is set.
 Direct `POST /v1/messages` with:
 
 - Model `claude-opus-5-5` for structural candidates, `claude-sonnet-5-5` for
